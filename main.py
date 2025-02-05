@@ -15,7 +15,7 @@ df = pd.DataFrame(rewards, columns = ["distance", "Speed", "Tilt", "Leg 1", "Leg
 
 
 plt.figure(figsize = (10, 5))
-df.iloc[:-2].plot()
+df.plot()
 plt.savefig("RewardDecom.png")
 
 plt.figure(figsize = (10, 5))

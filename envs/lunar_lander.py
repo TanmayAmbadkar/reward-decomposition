@@ -219,6 +219,7 @@ class LunarLander(gym.Env, EzPickle):
         enable_wind: bool = False,
         wind_power: float = 15.0,
         turbulence_power: float = 1.5,
+        scalar_reward: bool = False
     ):
         EzPickle.__init__(
             self,
@@ -307,6 +308,7 @@ class LunarLander(gym.Env, EzPickle):
             self.action_space = spaces.Discrete(4)
 
         self.render_mode = render_mode
+        self.scalar_reward = scalar_reward
 
     def _destroy(self):
         if not self.moon:
@@ -674,7 +676,11 @@ class LunarLander(gym.Env, EzPickle):
 
         reward_vector = []
 
-        return np.array(state, dtype=np.float32), reward, terminated, False, {}
+        if not self.scalar_reward:
+            return np.array(state, dtype=np.float32), np.array(reward), terminated, False, {}
+        else:
+            return np.array(state, dtype=np.float32), sum(reward), terminated, False, {}
+
 
     def render(self):
         if self.render_mode is None:
@@ -873,7 +879,7 @@ def demo_heuristic_lander(env, seed=None, render=False):
 
         if steps % 20 == 0 or terminated or truncated:
             print("observations:", " ".join([f"{x:+0.2f}" for x in s]))
-            print(f"step {steps} total_reward {total_reward}")
+            print(f"step {steps} total_reward {sum(total_reward):.2f}")
         steps += 1
         if terminated or truncated:
             break
