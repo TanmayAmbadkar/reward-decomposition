@@ -652,10 +652,10 @@ class PPO:
                 minibatch_advantages = computed_advantages[minibatch_indices]
 
                 # In update_policy()
-                if self.normalize_advantages:
-                    # Normalize per objective
-                    minibatch_advantages = (minibatch_advantages - minibatch_advantages.mean(dim=0)) / \
-                                        (minibatch_advantages.std(dim=0) + 1e-8)
+                # if self.normalize_advantages:
+                #     # Normalize per objective
+                #     minibatch_advantages = (minibatch_advantages - minibatch_advantages.mean(dim=0)) / \
+                #                         (minibatch_advantages.std(dim=0) + 1e-8)
 
                 policy_gradient_loss = self.calculate_policy_gradient_loss(
                     collected_observations[minibatch_indices], minibatch_advantages, probability_ratio

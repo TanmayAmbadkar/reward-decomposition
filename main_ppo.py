@@ -12,6 +12,7 @@ from func_to_script import script
 from ppo.agent import ContinuousAgent, DiscreteAgent
 from ppo.ppo import PPO, PPOLogger
 from envs.lunar_lander import LunarLander
+from envs.bipedal_walker import BipedalWalker
 
 
 def set_seed(seed, torch_deterministic=True):
@@ -112,7 +113,7 @@ def load_and_evaluate_model(
 ):
     # Run simple evaluation to demonstrate how to load and use a trained model
     eval_episodes = 10
-    eval_envs = LunarLander(continuous = True, scalar_reward=True)
+    eval_envs = BipedalWalker(scalar_reward=False)
     
     eval_agent = agent_class(eval_envs).to(device)
     eval_agent.load_state_dict(torch.load(model_path, map_location=device))
@@ -140,10 +141,10 @@ def load_and_evaluate_model(
 
 @script
 def run_ppo(
-    env_id: str = "LunarLander-v3",
+    env_id: str = "BipedalWalker",
     env_is_discrete: bool = False,
     num_envs: int = 1,
-    total_timesteps: int = 500000,
+    total_timesteps: int = 1000000,
     num_rollout_steps: int = 2048,
     update_epochs: int = 10,
     num_minibatches: int = 64,
@@ -230,12 +231,12 @@ def run_ppo(
     # device = torch.device("cpu")
 
     # Create environments
-    envs = LunarLander(continuous=True, scalar_reward=True)
+    envs = BipedalWalker(scalar_reward=False)
     # Set up agent
     agent_class = (
         DiscreteAgent
         if env_is_discrete
-        else partial(ContinuousAgent, rpo_alpha=rpo_alpha, reward_size = 1)
+        else partial(ContinuousAgent, rpo_alpha=rpo_alpha, reward_size =7)
     )
     agent = agent_class(envs).to(device)
 
@@ -243,7 +244,7 @@ def run_ppo(
 
     ppo = PPO(
         agent=agent,
-        reward_size=1,
+        reward_size=7,
         optimizer=optimizer,
         learning_rate=learning_rate,
         num_rollout_steps=num_rollout_steps,
