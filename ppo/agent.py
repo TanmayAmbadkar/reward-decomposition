@@ -122,7 +122,7 @@ class ContinuousAgent(BaseAgent):
         self.reward_size = reward_size
         self.critic = nn.Sequential(
             layer_init(
-                nn.Linear(envs.observation_space.shape[0], 64)
+                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
             ),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
@@ -131,17 +131,17 @@ class ContinuousAgent(BaseAgent):
         )
         self.actor_mean = nn.Sequential(
             layer_init(
-                nn.Linear(envs.observation_space.shape[0], 64)
+                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
             ),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
             layer_init(
-                nn.Linear(64, envs.action_space.shape[0]), std=0.01
+                nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01
             ),
         )
         self.actor_logstd = nn.Parameter(
-            torch.zeros(envs.action_space.shape[0])
+            torch.zeros(1, np.prod(envs.single_action_space.shape))
         )
 
     def estimate_value_from_observation(self, observation):
@@ -155,15 +155,18 @@ class ContinuousAgent(BaseAgent):
 
         return action_dist
 
-    def sample_action_and_compute_log_prob(self, observations):
+    def sample_action_and_compute_log_prob(self, observations, deterministic = False):
         action_dist = self.get_action_distribution(observations)
-        action = action_dist.sample()
-        log_prob = action_dist.log_prob(action)
-        return action, log_prob.sum(0)
+
+        if deterministic:
+            action = action_dist.mean
+        else:
+            action = action_dist.sample()
+        log_prob = action_dist.log_prob(action).sum(1)
+        return action, log_prob
 
     def compute_action_log_probabilities_and_entropy(self, observations, actions):
         action_dist = self.get_action_distribution(observations)
-
         if self.rpo_alpha is not None:
             # sample again to add stochasticity to the policy
             action_mean = action_dist.mean

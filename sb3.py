@@ -1,7 +1,20 @@
 from stable_baselines3 import PPO
 from envs.lunar_lander import LunarLander
+from envs.utils import SyncVectorEnv, RecordEpisodeStatistics
 
-env = LunarLander(continuous=True, scalar_reward=True)
+env = SyncVectorEnv(
+    [
+        lambda: LunarLander(continuous = True),
+        lambda: LunarLander(continuous = True),
+        lambda: LunarLander(continuous = True),
+    ],
+    reward_size=8
+)
 
-model = PPO("MlpPolicy", env, verbose=1, device = "cpu")
-model.learn(total_timesteps=100000)
+env = RecordEpisodeStatistics(env)
+
+env.reset()
+for _ in range(1000):
+    # print(state)
+    _, _, _, _, info = env.step(env.action_space.sample())
+    print(info)

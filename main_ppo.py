@@ -13,7 +13,7 @@ from ppo.agent import ContinuousAgent, DiscreteAgent
 from ppo.ppo import PPO, PPOLogger
 from envs.lunar_lander import LunarLander
 from envs.bipedal_walker import BipedalWalker
-
+from envs.utils import SyncVectorEnv, RecordEpisodeStatistics
 
 def set_seed(seed, torch_deterministic=True):
     random.seed(seed)
@@ -21,82 +21,6 @@ def set_seed(seed, torch_deterministic=True):
     torch.manual_seed(seed)
     torch.backends.cudnn.deterministic = torch_deterministic
 
-
-def make_discrete_env(env_id, idx, capture_video, run_name):
-    def create_configured_env():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
-
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        return env
-
-    return create_configured_env
-
-
-def make_continuous_env(env_id, idx, capture_video, run_name, gamma):
-    def create_configured_env():
-        if capture_video and idx == 0:
-            env = LunarLander(continuous=True, render_mode="human")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = LunarLander(continuous=True)
-        env = gym.wrappers.FlattenObservation(
-            env
-        )  # deal with dm_control's Dict observation space
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = gym.wrappers.ClipAction(env)
-        env = gym.wrappers.NormalizeObservation(env)
-        # env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
-        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
-        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
-        return env
-
-    return create_configured_env
-
-
-def get_NormalizeObservation_wrapper(self, env_num=0):
-    return self.gym_sync_vec_env.envs[env_num].env.env.env
-
-
-def get_obs_norm_rms_obj(self, env_num=0):
-    return self.get_NormalizeObservation_wrapper(env_num=env_num).obs_rms
-
-
-def set_obs_norm_rms_obj(self, rms_obj, env_num=0):
-    self.get_NormalizeObservation_wrapper(env_num=env_num).obs_rms = rms_obj
-
-
-def get_obs_norm_rms_vars(self, env_num=0):
-    rms_obj = self.get_obs_norm_rms_obj(env_num)
-    return rms_obj.mean, rms_obj.var, rms_obj.count
-
-
-def create_envs(env_id, num_envs, env_is_discrete, capture_video, run_name, gamma):
-    if env_is_discrete:
-        envs = gym.vector.SyncVectorEnv(
-            [
-                make_discrete_env(env_id, i, capture_video, run_name)
-                for i in range(num_envs)
-            ],
-        )
-        assert isinstance(
-            envs.single_action_space, gym.spaces.Discrete
-        ), "only discrete action space is supported"
-    else:
-        envs = gym.vector.SyncVectorEnv(
-            [
-                make_continuous_env(env_id, i, capture_video, run_name, gamma)
-                for i in range(num_envs)
-            ]
-        )
-        assert isinstance(
-            envs.single_action_space, gym.spaces.Box
-        ), "only continuous action space is supported"
-
-    return envs
 
 
 def load_and_evaluate_model(
@@ -113,37 +37,43 @@ def load_and_evaluate_model(
 ):
     # Run simple evaluation to demonstrate how to load and use a trained model
     eval_episodes = 10
-    eval_envs = BipedalWalker(scalar_reward=False)
-    
+    eval_envs = envs
+
+    # if not env_is_discrete:
+    #     # Update normalization stats for continuous environments
+    #     avg_rms_obj = (
+    #         np.mean([envs.get_obs_norm_rms_obj(i) for i in range(num_envs)]) / num_envs
+    #     )
+    #     eval_envs.set_obs_norm_rms_obj(avg_rms_obj)
+
     eval_agent = agent_class(eval_envs).to(device)
     eval_agent.load_state_dict(torch.load(model_path, map_location=device))
     eval_agent.eval()
 
+    obs, _ = eval_envs.reset()
     episodic_returns = []
-    for i in range(eval_episodes):
-        obs, _ = eval_envs.reset()
-        rewards = 0
-        done, trunc = False, False
-        while not done and not trunc:
-            actions, _ = eval_agent.sample_action_and_compute_log_prob(
-                torch.Tensor(obs).to(device)
-            )
-            obs, reward, done, trunc, _ = eval_envs.step(actions.cpu().numpy())
-            rewards += reward
-        episodic_returns.append(rewards)
-    
-    print("Rewards Average:", np.mean(episodic_returns))
+    while len(episodic_returns) < eval_episodes:
+        actions, _ = eval_agent.sample_action_and_compute_log_prob(
+            torch.Tensor(obs).to(device)
+        )
+        obs, _, _, _, infos = eval_envs.step(actions.cpu().numpy())
 
-        
+        if "episode" in infos:
+            print(
+                    f"Eval episode {len(episodic_returns)}, episodic return: {infos['episode']['r'].sum()}"
+                )
+            episodic_returns.append(infos["episode"]["r"].sum())
+            
+                    
 
     eval_envs.close()
 
-
 @script
 def run_ppo(
-    env_id: str = "BipedalWalker",
+    env_id: str = "LunarLander",
     env_is_discrete: bool = False,
-    num_envs: int = 1,
+    num_envs: int = 4,
+    scalar_reward: bool = False,
     total_timesteps: int = 1000000,
     num_rollout_steps: int = 2048,
     update_epochs: int = 10,
@@ -223,6 +153,7 @@ def run_ppo(
     # Set up run name and logging
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     run_name = f"{env_id}__{exp_name}__{seed}__{int(time.time())}"
+    print(exp_name)
 
     set_seed(seed, torch_deterministic)
 
@@ -231,12 +162,27 @@ def run_ppo(
     # device = torch.device("cpu")
 
     # Create environments
-    envs = BipedalWalker(scalar_reward=False)
-    # Set up agent
+    if env_id == "LunarLander":
+        envs = SyncVectorEnv(
+        [
+            lambda: LunarLander(continuous = True, scalar_reward=scalar_reward),
+        ]*num_envs,
+        reward_size = 1 if scalar_reward else 8
+        )
+    if env_id == "BipedalWalker":
+        envs = SyncVectorEnv(
+        [
+            lambda: BipedalWalker(scalar_reward=scalar_reward),
+        ]*num_envs,
+        reward_size = 1 if scalar_reward else 7
+        )
+    envs = RecordEpisodeStatistics(envs)
+
+# Set up agent
     agent_class = (
         DiscreteAgent
         if env_is_discrete
-        else partial(ContinuousAgent, rpo_alpha=rpo_alpha, reward_size =7)
+        else partial(ContinuousAgent, rpo_alpha=rpo_alpha, reward_size = envs.env.reward_size)
     )
     agent = agent_class(envs).to(device)
 
@@ -244,7 +190,7 @@ def run_ppo(
 
     ppo = PPO(
         agent=agent,
-        reward_size=7,
+        reward_size = envs.env.reward_size,
         optimizer=optimizer,
         learning_rate=learning_rate,
         num_rollout_steps=num_rollout_steps,

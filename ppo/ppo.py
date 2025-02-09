@@ -35,21 +35,19 @@ class PPOLogger:
 
     def log_rollout_step(self, infos, global_step):
         self.global_steps.append(global_step)
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                if info and "episode" in info:
-                    print(
-                        f"global_step={global_step}, episodic_return={info['episode']['r'].sum()}",
-                        flush=True,
-                    )
+        if "episode" in infos:
+            print(
+                f"global_step={global_step}, episodic_return={infos['episode']['r'].sum()}",
+                flush=True,
+            )
 
-                    if self.use_tensorboard:
-                        self.writer.add_scalar(
-                            "charts/episodic_return", info["episode"]["r"].sum(), global_step
-                        )
-                        self.writer.add_scalar(
-                            "charts/episodic_length", info["episode"]["l"], global_step
-                        )
+            if self.use_tensorboard:
+                self.writer.add_scalar(
+                    "charts/episodic_return", infos["episode"]["r"].sum(), global_step
+                )
+                self.writer.add_scalar(
+                    "charts/episodic_length", infos["episode"]["l"], global_step
+                )
 
     def log_policy_update(self, update_results, global_step):
         if self.use_tensorboard:
@@ -288,6 +286,7 @@ class PPO:
             reproducibility of the environment's initial state across different runs.
         """
         initial_observation, _ = self.envs.reset(seed=self.seed)
+        # print(initial_observation)
         initial_observation = torch.Tensor(initial_observation).to(self.device)
         is_initial_observation_terminal = torch.zeros(self.num_envs).to(self.device)
         return initial_observation, is_initial_observation_terminal
@@ -340,12 +339,8 @@ class PPO:
 
         for step in range(self.num_rollout_steps):
             # Store current observation
-            if is_next_observation_terminal == 1:
-                next_observation, is_next_observation_terminal = self._initialize_environment()
-                
             collected_observations[step] = next_observation
             is_episode_terminated[step] = is_next_observation_terminal
-
 
             with torch.no_grad():
                 action, logprob = self.agent.sample_action_and_compute_log_prob(
@@ -362,7 +357,7 @@ class PPO:
                 action.cpu().numpy()
             )
             self._global_step += self.num_envs
-            rewards[step, :] = torch.as_tensor(reward, device=self.device)
+            rewards[step] = torch.as_tensor(reward, device=self.device)
             is_next_observation_terminal = np.logical_or(terminations, truncations)
 
             next_observation, is_next_observation_terminal = (
@@ -383,7 +378,8 @@ class PPO:
         with torch.no_grad():
             next_value = self.agent.estimate_value_from_observation(
                 next_observation
-            ).reshape(1, -1)
+            )
+
             advantages, returns = self.compute_advantages(
                 rewards,
                 observation_values,
@@ -408,6 +404,7 @@ class PPO:
             returns,
             observation_values,
         )
+
 
         # Return the collected and computed data for the policy update step
         return (
@@ -523,10 +520,10 @@ class PPO:
         observation_values,
     ):
         batch_observations = collected_observations.reshape(
-            (-1,) + self.envs.observation_space.shape
+            (-1,) + self.envs.single_observation_space.shape
         )
         batch_log_probabilities = action_log_probabilities.reshape(-1)
-        batch_actions = actions.reshape((-1,) + self.envs.action_space.shape)
+        batch_actions = actions.reshape((-1,) + self.envs.single_action_space.shape)
         batch_advantages = advantages.reshape(-1, self.reward_size)
         batch_returns = returns.reshape(-1, self.reward_size)
         batch_values = observation_values.reshape(-1, self.reward_size)
@@ -623,7 +620,9 @@ class PPO:
                 )
 
                 # Calculate the probability ratio for importance sampling
-                # This allows us to use old trajectories to estimate the new policy's performance
+                # This allows us to use old trajectories to estimate the new policy's performance)
+                # collected_action_log_probs = collected_action_log_probs.reshape(len(minibatch_indices), -1)
+                # print(collected_action_log_probs.shape)
                 log_probability_ratio = (
                     current_policy_log_probs
                     - collected_action_log_probs[minibatch_indices]
@@ -714,22 +713,21 @@ class PPO:
         }
     def calculate_policy_gradient_loss(self, collected_observations, minibatch_advantages, probability_ratio):
         weights = self.advantage_weights_network(collected_observations)
-        scalarized_advantages = (minibatch_advantages * torch.ones_like(weights).to(self.device)).sum(dim=1)
+        scalarized_advantages = (minibatch_advantages * torch.ones(1, self.reward_size).to(self.device)).sum(dim=1)
 
         if self.normalize_advantages:
             # First per-dimension
-            scalarized_advantages = (scalarized_advantages - scalarized_advantages.mean(dim=0)) / (scalarized_advantages.std(dim=0) + 1e-8)
+            minibatch_advantages = (minibatch_advantages - scalarized_advantages.mean(dim=0)) / (minibatch_advantages.std(dim=0) + 1e-8)
             # Then scalarized
             # scalarized = (advantages * weights).sum(dim=1)
             # scalarized = (scalarized - scalarized.mean()) / (scalarized.std() + 1e-8)
-        
-        unclipped_pg_obj = scalarized_advantages * probability_ratio
-        clipped_pg_obj = scalarized_advantages * torch.clamp(
+        unclipped_pg_obj = probability_ratio.reshape(-1, 1) * minibatch_advantages 
+        clipped_pg_obj = torch.clamp(
             probability_ratio,
             1 - self.surrogate_clip_threshold,
             1 + self.surrogate_clip_threshold
-        )
-        return -torch.min(unclipped_pg_obj, clipped_pg_obj).mean()
+        ).reshape(-1, 1) * minibatch_advantages 
+        return torch.sum(-torch.minimum(unclipped_pg_obj, clipped_pg_obj), dim = 1).mean()
 
     def calculate_value_function_loss(self, new_value, computed_returns, previous_value_estimates, minibatch_indices):
         total_v_loss = 0
@@ -749,8 +747,8 @@ class PPO:
                     (clipped_values - obj_returns)**2
                 ).mean()
             else:
-                v_loss = (0.5 * (obj_values - obj_returns)**2).mean()
+                v_loss = (0.5 * (obj_values - obj_returns)**2)
             
             total_v_loss += v_loss
         
-        return total_v_loss / self.reward_size  # Average across objectives
+        return total_v_loss.mean() # Average across objectives
