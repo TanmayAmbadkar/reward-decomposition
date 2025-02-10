@@ -660,14 +660,16 @@ class LunarLander(gym.Env, EzPickle):
         terminated = False
         if self.game_over or abs(state[0]) >= 1.0:
             terminated = True
-            reward = [0]*8
-            reward[-1] = -100
+            # reward = [0]*8
+            # reward[-1] = -100
+            reward.append(-100)
+        elif not self.lander.awake:
+            terminated = True
+            # reward = [0]*8
+            reward.append(100)
         else:
             reward.append(0)
-        if not self.lander.awake:
-            terminated = True
-            reward = [0]*8
-            reward[-1] = 100 
+
             
 
         if self.render_mode == "human":

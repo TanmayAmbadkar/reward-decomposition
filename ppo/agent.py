@@ -116,7 +116,7 @@ class DiscreteAgent(BaseAgent):
 
 
 class ContinuousAgent(BaseAgent):
-    def __init__(self, envs, rpo_alpha=None, reward_size = 1):
+    def __init__(self, envs, rpo_alpha=None, reward_size = 1, shield = None):
         super().__init__()
         self.rpo_alpha = rpo_alpha
         self.reward_size = reward_size
@@ -143,6 +143,7 @@ class ContinuousAgent(BaseAgent):
         self.actor_logstd = nn.Parameter(
             torch.zeros(1, np.prod(envs.single_action_space.shape))
         )
+        self.shield = shield
 
     def estimate_value_from_observation(self, observation):
         return self.critic(observation)
@@ -161,7 +162,9 @@ class ContinuousAgent(BaseAgent):
         if deterministic:
             action = action_dist.mean
         else:
-            action = action_dist.sample()
+            action = action_dist.rsample()
+        if self.shield is not None:
+            action = self.shield(observations, action)
         log_prob = action_dist.log_prob(action).sum(1)
         return action, log_prob
 

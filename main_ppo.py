@@ -153,7 +153,7 @@ def run_ppo(
     # Set up run name and logging
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     run_name = f"{env_id}__{exp_name}__{seed}__{int(time.time())}"
-    print(exp_name)
+    print(exp_name, scalar_reward)
 
     set_seed(seed, torch_deterministic)
 
@@ -209,7 +209,7 @@ def run_ppo(
         anneal_lr=anneal_lr,
         envs=envs,
         seed=seed,
-        logger=PPOLogger(run_name, use_tensorboard),
+        logger=PPOLogger(run_name, use_tensorboard, envs.env.reward_size),
     )
 
     # Train the agent

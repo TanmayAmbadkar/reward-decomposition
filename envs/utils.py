@@ -391,6 +391,10 @@ class RecordEpisodeStatistics(VectorWrapper):
         self.episode_returns: np.ndarray = np.zeros(())
         self.episode_lengths: np.ndarray = np.zeros((), dtype=int)
         self.prev_dones: np.ndarray = np.zeros((), dtype=bool)
+        self.individual_returns = []
+        self.reward_size = env.reward_size
+        for i in range(env.reward_size):
+            self.individual_returns.append(np.zeros(()))
 
         self.time_queue = deque(maxlen=buffer_length)
         self.return_queue = deque(maxlen=buffer_length)
@@ -408,6 +412,8 @@ class RecordEpisodeStatistics(VectorWrapper):
         self.episode_returns = np.zeros(self.num_envs)
         self.episode_lengths = np.zeros(self.num_envs, dtype=int)
         self.prev_dones = np.zeros(self.num_envs, dtype=bool)
+        for i in range(self.reward_size):
+            self.individual_returns[i] = np.zeros(self.num_envs)
 
         return obs, info
 
@@ -432,6 +438,10 @@ class RecordEpisodeStatistics(VectorWrapper):
         self.episode_start_times[self.prev_dones] = time.perf_counter()
         self.episode_returns[~self.prev_dones] += np.sum(rewards, axis = 1)[~self.prev_dones]
         self.episode_lengths[~self.prev_dones] += 1
+        # print(rewards)
+        for i in range(self.reward_size):
+            self.individual_returns[i][self.prev_dones] = 0
+            self.individual_returns[i][~self.prev_dones] += rewards[:, i][~self.prev_dones]
 
         self.prev_dones = dones = np.logical_or(terminations, truncations)
         num_dones = np.sum(dones)
@@ -450,6 +460,8 @@ class RecordEpisodeStatistics(VectorWrapper):
                     "l": np.where(dones, self.episode_lengths, 0),
                     "t": np.where(dones, episode_time_length, 0.0),
                 }
+                for i in range(self.reward_size):
+                    infos[self._stats_key][f'r_{i}'] =  np.where(dones, self.individual_returns[i], 0.0)
                 infos[f"_{self._stats_key}"] = dones
 
             self.episode_count += num_dones
