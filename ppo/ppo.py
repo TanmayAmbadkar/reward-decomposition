@@ -239,7 +239,10 @@ class PPO:
             self.lr_scheduler = self.create_lr_scheduler(num_policy_updates)
 
         next_observation, is_next_observation_terminal = self._initialize_environment()
-
+        if self.reward_size != 1:
+            weights = torch.FloatTensor(self.num_envs, self.reward_size).uniform_(-1, 1).to(self.device)
+        else:
+            weights = torch.ones(self.num_envs).to(self.device)
         # Initialize logging variables
         self._global_step = 0
 
@@ -254,9 +257,10 @@ class PPO:
                 batch_advantages,
                 batch_returns,
                 batch_values,
+                batch_weights,
                 next_observation,
                 is_next_observation_terminal,
-            ) = self.collect_rollouts(next_observation, is_next_observation_terminal)
+            ) = self.collect_rollouts(next_observation, is_next_observation_terminal, weights)
 
             update_results = self.update_policy(
                 batch_observations,
@@ -265,6 +269,7 @@ class PPO:
                 batch_advantages,
                 batch_returns,
                 batch_values,
+                batch_weights,
             )
 
             self.logger.log_policy_update(update_results, self._global_step)
@@ -295,7 +300,7 @@ class PPO:
         is_initial_observation_terminal = torch.zeros(self.num_envs).to(self.device)
         return initial_observation, is_initial_observation_terminal
 
-    def collect_rollouts(self, next_observation, is_next_observation_terminal):
+    def collect_rollouts(self, next_observation, is_next_observation_terminal, weights):
         """
         Collect a set of rollout data by interacting with the environment. A rollout is a sequence of observations,
         actions, and rewards obtained by running the current policy in the environment. The collected data is crucial
@@ -348,7 +353,7 @@ class PPO:
 
             with torch.no_grad():
                 action, logprob = self.agent.sample_action_and_compute_log_prob(
-                    next_observation
+                    next_observation, weights
                 )
                 value = self.agent.estimate_value_from_observation(next_observation)
 
@@ -389,6 +394,7 @@ class PPO:
                 is_episode_terminated,
                 next_value,
                 is_next_observation_terminal,
+                weights,
             )
 
         # Flatten the batch for easier processing in the update step
@@ -399,6 +405,7 @@ class PPO:
             batch_advantages,
             batch_returns,
             batch_values,
+            batch_weights
         ) = self._flatten_rollout_data(
             collected_observations,
             action_log_probabilities,
@@ -406,6 +413,7 @@ class PPO:
             advantages,
             returns,
             observation_values,
+            weights
         )
 
         # Return the collected and computed data for the policy update step
@@ -416,6 +424,7 @@ class PPO:
             batch_advantages,
             batch_returns,
             batch_values,
+            batch_weights,
             next_observation,
             is_next_observation_terminal,
         )
@@ -456,6 +465,7 @@ class PPO:
         is_observation_terminal,
         next_value,
         is_next_observation_terminal,
+        weights
     ):
         """
         Compute advantages using Generalized Advantage Estimation (GAE). The advantage function
@@ -494,11 +504,13 @@ class PPO:
 
         """
         # Initialize advantage estimates
-        advantages = torch.zeros_like(rewards).to(self.device)
+        advantages_policy = torch.zeros_like(rewards).to(self.device)
+        advantages_critic = torch.zeros_like(rewards).to(self.device)
 
         # Initialize the GAE accumulator
         # gae_running_value = torch.zeros((1, self.reward_size))
-        gae_running_value = 0
+        gae_running_value_policy = 0
+        gae_running_value_critic = 0
 
         # Accumulate the GAE values in reverse order, which allows us to efficiently
         # compute multi-step advantages
@@ -506,19 +518,24 @@ class PPO:
             if t == self.num_rollout_steps - 1:
                 # For the last step, use the provided next_value and whether it is terminal
                 episode_continues = 1.0 - is_next_observation_terminal
-                next_values = next_value
+                next_values_policy = weights * next_value
+                next_values_critic = next_value
             else:
                 # For all other steps, use values and terminal flags from the next step
                 episode_continues = 1.0 - is_observation_terminal[t + 1]
-                next_values = values[t + 1]
+                next_values_policy = weights * values[t + 1]
+                next_values_critic = next_value
 
             # Compute TD error: δ_t = r_t + γ * V(s_{t+1}) * (1 - is_terminal_{t+1}) - V(s_t)
             # The TD error represents the difference between
             # the expected value (current reward plus discounted next observation value)
             # and the estimated value of the current observation. It's a measure of
             # how "surprised" we are by the outcome of an action.
-            delta = (
-                rewards[t] + self.gamma * next_values * episode_continues.reshape(self.num_envs, -1) - values[t]
+            delta_policy = (
+                weights * rewards[t] + self.gamma * next_values_policy * episode_continues.reshape(self.num_envs, -1) - weights * values[t]
+            )
+            delta_critic = (
+                rewards[t] + self.gamma * next_values_critic * episode_continues.reshape(self.num_envs, -1) - values[t]
             )
 
             # Compute GAE:  A_t = δ_t + (γλ) * (1 - is_terminal_{t+1}) * A_{t+1}
@@ -528,9 +545,14 @@ class PPO:
             # full return (low variance, biased). The λ parameter controls
             # this trade-off.
 
-            advantages[t] = gae_running_value = (
-                delta
-                + self.gamma * self.gae_lambda * episode_continues.reshape(self.num_envs, -1) * gae_running_value
+            advantages_policy[t] = gae_running_value_policy = (
+                delta_policy
+                + self.gamma * self.gae_lambda * episode_continues.reshape(self.num_envs, -1) * gae_running_value_policy
+            )
+
+            advantages_critic[t] = gae_running_value_critic = (
+                delta_critic
+                + self.gamma * self.gae_lambda * episode_continues.reshape(self.num_envs, -1) * gae_running_value_critic
             )
         # The return is the sum of the advantage (how much better the action was than expected)
         # and the value estimate (what we expected).
@@ -540,9 +562,9 @@ class PPO:
         # 1. Advantage A(s,a) = Q(s,a) - V(s)
         # 2. Q(s,a) represents the expected return from taking action a in state s
         # 3. By adding V(s) back to A(s,a), we reconstruct an estimate of the full return
-        returns = advantages + values
+        returns = advantages_critic + values
 
-        return advantages, returns
+        return advantages_policy, returns
 
     def _flatten_rollout_data(
         self,
@@ -552,6 +574,7 @@ class PPO:
         advantages,
         returns,
         observation_values,
+        weights,
     ):
         batch_observations = collected_observations.reshape(
             (-1,) + self.envs.single_observation_space.shape
@@ -561,6 +584,7 @@ class PPO:
         batch_advantages = advantages.reshape(-1, self.reward_size)
         batch_returns = returns.reshape(-1, self.reward_size)
         batch_values = observation_values.reshape(-1, self.reward_size)
+        batch_weights = torch.vstack([weights]*collected_observations.shape[0])
 
         return (
             batch_observations,
@@ -569,6 +593,7 @@ class PPO:
             batch_advantages,
             batch_returns,
             batch_values,
+            batch_weights
         )
 
     def update_policy(
@@ -578,6 +603,7 @@ class PPO:
         collected_actions,
         computed_advantages,
         computed_returns,
+        collected_weights,
         previous_value_estimates,
     ):
         """
@@ -647,6 +673,7 @@ class PPO:
                     self.agent.compute_action_log_probabilities_and_entropy(
                         collected_observations[minibatch_indices],
                         collected_actions[minibatch_indices],
+                        collected_weights[minibatch_indices]
                     )
                 )
                 new_value = self.agent.estimate_value_from_observation(

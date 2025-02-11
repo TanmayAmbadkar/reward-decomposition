@@ -120,6 +120,7 @@ class ContinuousAgent(BaseAgent):
         super().__init__()
         self.rpo_alpha = rpo_alpha
         self.reward_size = reward_size
+        self.weight_vec_size = 0 if reward_size == 1 else reward_size
         self.critic = nn.Sequential(
             layer_init(
                 nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
@@ -131,7 +132,7 @@ class ContinuousAgent(BaseAgent):
         )
         self.actor_mean = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
+                nn.Linear(np.array(envs.single_observation_space.shape).prod() + self.weight_vec_size, 64)
             ),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
@@ -149,6 +150,16 @@ class ContinuousAgent(BaseAgent):
         self.action_space_high = envs.single_action_space.high
 
     def estimate_value_from_observation(self, observation):
+
+        # assert weights.shape[0] == observation.shape[0]
+
+        # if self.weight_vec_size == 0:
+        #     observation = observation
+        # elif weights is None:
+        #     observation = torch.hstack([observation, 1/self.weight_vec_size * torch.ones((observation.shape[0], self.weight_vec_size))])
+        # else:
+        #     observation =  torch.hstack([observation, weights])
+
         return self.critic(observation)
 
     def get_action_distribution(self, observation):
@@ -174,7 +185,18 @@ class ContinuousAgent(BaseAgent):
         return action.cpu().numpy(), self.estimate_value_from_observation(observation).cpu().numpy()
 
 
-    def sample_action_and_compute_log_prob(self, observations, deterministic = False):
+    def sample_action_and_compute_log_prob(self, observations, weights = None, deterministic = False):
+
+        if weights is not None:
+            assert weights.shape[0] == observations.shape[0]
+
+        if self.weight_vec_size == 0:
+            observation = observations
+        elif weights is None:
+            observations = torch.hstack([observations, 1/self.weight_vec_size * torch.ones((observations.shape[0], self.weight_vec_size))])
+        else:
+            observations =  torch.hstack([observations, weights])
+
         action_dist = self.get_action_distribution(observations)
 
         if deterministic:
@@ -187,7 +209,18 @@ class ContinuousAgent(BaseAgent):
         log_prob = action_dist.log_prob(action).sum(1)
         return action, log_prob
 
-    def compute_action_log_probabilities_and_entropy(self, observations, actions):
+    def compute_action_log_probabilities_and_entropy(self, observations, actions, weights = None):
+
+        if weights is not None:
+            assert weights.shape[0] == observations.shape[0]
+
+        if self.weight_vec_size == 0:
+            observation = observations
+        elif weights is None:
+            observations = torch.hstack([observations, 1/self.weight_vec_size * torch.ones((observation.shape[0], self.weight_vec_size))])
+        else:
+            observations =  torch.hstack([observations, weights])
+
         action_dist = self.get_action_distribution(observations)
         if self.rpo_alpha is not None:
             # sample again to add stochasticity to the policy
