@@ -340,7 +340,7 @@ class PPO:
             is_episode_terminated,
             observation_values,
         ) = self._initialize_storage()
-
+    
         for step in range(self.num_rollout_steps):
             # Store current observation
             collected_observations[step] = next_observation
@@ -374,7 +374,6 @@ class PPO:
                     device=self.device,
                 ),
             )
-
             self.logger.log_rollout_step(infos, self._global_step)
 
         # Estimate the value of the next state (the state after the last collected step) using the current policy

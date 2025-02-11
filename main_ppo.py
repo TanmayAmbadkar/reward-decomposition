@@ -1,6 +1,7 @@
 import os
 import random
 import time
+from datetime import datetime
 from functools import partial
 
 import gymnasium as gym
@@ -153,12 +154,12 @@ def run_ppo(
 
     # Set up run name and logging
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
-    run_name = f"{env_id}__{exp_name}__{seed}__{int(time.time())}"
+    run_name = f"{env_id}__{exp_name}__{datetime.now()}__{seed}"
     print(exp_name, scalar_reward)
 
     set_seed(seed, torch_deterministic)
 
-    # Set up device
+    # Set up device666
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device("cpu")
 
@@ -212,7 +213,7 @@ def run_ppo(
         seed=seed,
         logger=PPOLogger(run_name, use_tensorboard, envs.env.reward_size),
     )
-
+    print(ppo.agent)
     # Train the agent
     trained_agent = ppo.learn(total_timesteps)
 

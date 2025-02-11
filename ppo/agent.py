@@ -158,6 +158,21 @@ class ContinuousAgent(BaseAgent):
         action_dist = Normal(action_mean, action_std)
 
         return action_dist
+    
+    @torch.no_grad
+    def predict(self, observation, deterministic = False):
+        observation = torch.Tensor(observation).reshape(1, -1)
+        action_dist = self.get_action_distribution(observation)
+
+        if deterministic:
+            action = action_dist.mean
+        else:
+            action = action_dist.rsample()
+        if self.shield is not None:
+            action = self.shield(observation, action)
+        action = torch.clamp(action, torch.Tensor(self.action_space_low).to(action.device), torch.Tensor(self.action_space_high).to(action.device))
+        return action.cpu().numpy(), self.estimate_value_from_observation(observation).cpu().numpy()
+
 
     def sample_action_and_compute_log_prob(self, observations, deterministic = False):
         action_dist = self.get_action_distribution(observations)
