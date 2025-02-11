@@ -53,9 +53,10 @@ def load_and_evaluate_model(
     obs, _ = eval_envs.reset()
     episodic_returns = []
     while len(episodic_returns) < eval_episodes:
-        actions, _ = eval_agent.sample_action_and_compute_log_prob(
-            torch.Tensor(obs).to(device)
-        )
+        with torch.no_grad():
+            actions, _ = eval_agent.sample_action_and_compute_log_prob(
+                torch.Tensor(obs).to(device), deterministic = True
+            )
         obs, _, _, _, infos = eval_envs.step(actions.cpu().numpy())
 
         if "episode" in infos:
@@ -77,18 +78,18 @@ def run_ppo(
     total_timesteps: int = 1000000,
     num_rollout_steps: int = 2048,
     update_epochs: int = 10,
-    num_minibatches: int = 64,
-    learning_rate: float = 2.5e-4,
+    num_minibatches: int = 256,
+    learning_rate: float = 0.0003,
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
     surrogate_clip_threshold: float = 0.2,
-    entropy_loss_coefficient: float = 0.01,
+    entropy_loss_coefficient: float = 0.0,
     value_function_loss_coefficient: float = 0.5,
     normalize_advantages: bool = True,
-    clip_value_function_loss: bool = True,
+    clip_value_function_loss: bool = False,
     max_grad_norm: float = 0.5,
     target_kl: float = None,
-    anneal_lr: bool = True,
+    anneal_lr: bool = False,
     rpo_alpha: float = None,
     seed: int = 1,
     torch_deterministic: bool = True,
@@ -158,8 +159,8 @@ def run_ppo(
     set_seed(seed, torch_deterministic)
 
     # Set up device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = torch.device("cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
 
     # Create environments
     if env_id == "LunarLander":

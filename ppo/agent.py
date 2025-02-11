@@ -144,6 +144,9 @@ class ContinuousAgent(BaseAgent):
             torch.zeros(1, np.prod(envs.single_action_space.shape))
         )
         self.shield = shield
+        
+        self.action_space_low = envs.single_action_space.low
+        self.action_space_high = envs.single_action_space.high
 
     def estimate_value_from_observation(self, observation):
         return self.critic(observation)
@@ -165,6 +168,7 @@ class ContinuousAgent(BaseAgent):
             action = action_dist.rsample()
         if self.shield is not None:
             action = self.shield(observations, action)
+        action = torch.clamp(action, torch.Tensor(self.action_space_low).to(action.device), torch.Tensor(self.action_space_high).to(action.device))
         log_prob = action_dist.log_prob(action).sum(1)
         return action, log_prob
 
