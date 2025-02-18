@@ -347,19 +347,19 @@ class PPO:
             rollout_weights
 
         ) = self._initialize_storage()    
-        # if self.reward_size != 1:
-        #     weights = torch.distributions.categorical.Categorical(logits = torch.Tensor([1.0, 1.0, 1.0])).sample((self.num_envs, self.reward_size)).to(self.device) - 1
-        # else:
-        #     weights = torch.ones(self.num_envs, 1).to(self.device)
-        weights = torch.ones((self.num_envs, self.reward_size)).to(self.device)
+        if self.reward_size != 1:
+            weights = torch.distributions.categorical.Categorical(logits = torch.Tensor([1.0, 1.0, 1.0])).sample((self.num_envs, self.reward_size)).to(self.device) - 1
+        else:
+            weights = torch.ones(self.num_envs, 1).to(self.device)
+        # weights = torch.ones((self.num_envs, self.reward_size)).to(self.device)
     
         overall_infos = {}
         for step in range(self.num_rollout_steps):
             # Store current observation
             collected_observations[step] = next_observation
             is_episode_terminated[step] = is_next_observation_terminal
-            # if self.reward_size != 1 and is_next_observation_terminal.type(torch.bool).any():
-            #     weights[is_next_observation_terminal.type(torch.bool)] = torch.distributions.categorical.Categorical(logits = torch.Tensor([1.0, 1.0, 1.0])).sample(weights[is_next_observation_terminal.type(torch.bool)].shape).to(self.device) - 1
+            if self.reward_size != 1 and is_next_observation_terminal.type(torch.bool).any():
+                weights[is_next_observation_terminal.type(torch.bool)] = torch.distributions.categorical.Categorical(logits = torch.Tensor([1.0, 1.0, 1.0])).sample(weights[is_next_observation_terminal.type(torch.bool)].shape).to(self.device) - 1
                 
 
             with torch.no_grad():
@@ -368,7 +368,7 @@ class PPO:
                 )
                 value = self.agent.estimate_value_from_observation(next_observation, weights)
 
-                observation_values[step] = value
+                observation_values[step] = value.reshape(-1, )
             actions[step] = action
             action_log_probabilities[step] = logprob
 
@@ -377,7 +377,7 @@ class PPO:
                 action.cpu().numpy()
             )
             self._global_step += self.num_envs
-            rewards[step] = weights * torch.as_tensor(reward, device=self.device)
+            rewards[step] = torch.sum(weights * torch.as_tensor(reward, device=self.device), dim=1)
             is_next_observation_terminal = np.logical_or(terminations, truncations)
             rollout_weights[step] = weights
 
@@ -406,7 +406,7 @@ class PPO:
         with torch.no_grad():
             next_value = self.agent.estimate_value_from_observation(
                 next_observation, weights
-            ).reshape(self.num_envs, self.reward_size)
+            ).reshape(self.num_envs)
 
             advantages, returns = self.compute_advantages(
                 rewards,
@@ -460,11 +460,11 @@ class PPO:
         action_log_probabilities = torch.zeros(
             (self.num_rollout_steps, self.num_envs)
         ).to(self.device)
-        rewards = torch.zeros((self.num_rollout_steps, self.num_envs, self.reward_size)).to(self.device)
+        rewards = torch.zeros((self.num_rollout_steps, self.num_envs)).to(self.device)
         is_episode_terminated = torch.zeros((self.num_rollout_steps, self.num_envs)).to(
             self.device
         )
-        observation_values = torch.zeros((self.num_rollout_steps, self.num_envs, self.reward_size)).to(
+        observation_values = torch.zeros((self.num_rollout_steps, self.num_envs)).to(
             self.device
         )
         rollout_weights = torch.zeros((self.num_rollout_steps, self.num_envs, self.reward_size)).to(
@@ -549,7 +549,7 @@ class PPO:
             # and the estimated value of the current observation. It's a measure of
             # how "surprised" we are by the outcome of an action.
             delta = (
-                rewards[t] + self.gamma * next_value * episode_continues.reshape(self.num_envs, -1) - values[t]
+                rewards[t] + self.gamma * next_value * episode_continues.reshape(self.num_envs) - values[t]
             )
             
             # Compute GAE:  A_t = δ_t + (γλ) * (1 - is_terminal_{t+1}) * A_{t+1}
@@ -561,7 +561,7 @@ class PPO:
 
             advantages[t] = gae_running_value = (
                 delta
-                + self.gamma * self.gae_lambda * episode_continues.reshape(self.num_envs, -1) * gae_running_value
+                + self.gamma * self.gae_lambda * episode_continues.reshape(self.num_envs) * gae_running_value
             )
 
         # The return is the sum of the advantage (how much better the action was than expected)
@@ -591,9 +591,9 @@ class PPO:
         )
         batch_log_probabilities = action_log_probabilities.reshape(-1)
         batch_actions = actions.reshape((-1,) + self.envs.single_action_space.shape)
-        batch_advantages = advantages.reshape(-1, self.reward_size)
-        batch_returns = returns.reshape(-1, self.reward_size)
-        batch_values = observation_values.reshape(-1, self.reward_size)
+        batch_advantages = advantages.reshape(-1, 1)
+        batch_returns = returns.reshape(-1, 1)
+        batch_values = observation_values.reshape(-1, 1)
         batch_weights = weights.reshape(-1, self.reward_size)
 
         return (
@@ -613,8 +613,8 @@ class PPO:
         collected_actions,
         computed_advantages,
         computed_returns,
-        collected_weights,
         previous_value_estimates,
+        collected_weights,
     ):
         """
         Update the policy and value function using the collected rollout data.

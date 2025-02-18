@@ -82,7 +82,7 @@ def load_and_evaluate_model(
     # Once done, save each environment's frames to an individual GIF
     if capture_video:
         for i in range(num_envs):
-            gif_name = f"{run_name}_env_{i}.gif"
+            gif_name = f"gifs/{run_name}_env_{i}.gif"
             # Only save if we actually have frames
             if len(frames_per_env[i]) > 0:
                 imageio.mimsave(gif_name, frames_per_env[i], fps=30)
