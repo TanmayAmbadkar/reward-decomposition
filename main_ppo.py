@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 from func_to_script import script
+import imageio
 
 from ppo.agent import ContinuousAgent, DiscreteAgent
 from ppo.ppo import PPO, PPOLogger
@@ -50,6 +51,7 @@ def load_and_evaluate_model(
     eval_agent = agent_class(eval_envs).to(device)
     eval_agent.load_state_dict(torch.load(model_path, map_location=device))
     eval_agent.eval()
+    frames_per_env = [[] for _ in range(num_envs)]  # one list of frames per env
 
     obs, _ = eval_envs.reset()
     episodic_returns = []
@@ -65,11 +67,26 @@ def load_and_evaluate_model(
                     f"Eval episode {len(episodic_returns)}, episodic return: {infos['episode']['r'].sum()}"
                 )
             episodic_returns.append(infos["episode"]["r"].sum())
+
+        if capture_video:
+            all_frames = eval_envs.render()
+            # all_frames is a list of length num_envs, each an RGB array
+            for i in range(num_envs):
+                frames_per_env[i].append(all_frames[i])
+
             
                     
 
     eval_envs.close()
 
+    # Once done, save each environment's frames to an individual GIF
+    if capture_video:
+        for i in range(num_envs):
+            gif_name = f"{run_name}_env_{i}.gif"
+            # Only save if we actually have frames
+            if len(frames_per_env[i]) > 0:
+                imageio.mimsave(gif_name, frames_per_env[i], fps=30)
+                print(f"Saved GIF for env {i}: {gif_name}")
 @script
 def run_ppo(
     env_id: str = "LunarLander",
@@ -80,7 +97,7 @@ def run_ppo(
     num_rollout_steps: int = 2048,
     update_epochs: int = 10,
     num_minibatches: int = 256,
-    learning_rate: float = 0.0003,
+    learning_rate: float = 0.00001,
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
     surrogate_clip_threshold: float = 0.2,
@@ -167,7 +184,7 @@ def run_ppo(
     if env_id == "LunarLander":
         envs = SyncVectorEnv(
         [
-            lambda: LunarLander(continuous = True, scalar_reward=scalar_reward),
+            lambda: LunarLander(continuous = True, scalar_reward=scalar_reward, render_mode="rgb_array"),
         ]*num_envs,
         reward_size = 1 if scalar_reward else 8
         )

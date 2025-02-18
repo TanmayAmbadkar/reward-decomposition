@@ -239,10 +239,8 @@ class PPO:
             self.lr_scheduler = self.create_lr_scheduler(num_policy_updates)
 
         next_observation, is_next_observation_terminal = self._initialize_environment()
-        if self.reward_size != 1:
-            weights = torch.FloatTensor(self.num_envs, self.reward_size).uniform_(-1, 1).to(self.device)
-        else:
-            weights = torch.ones(self.num_envs).to(self.device)
+        # weights = torch.ones(self.num_envs, self.reward_size).to(self.device)
+
         # Initialize logging variables
         self._global_step = 0
 
@@ -260,7 +258,7 @@ class PPO:
                 batch_weights,
                 next_observation,
                 is_next_observation_terminal,
-            ) = self.collect_rollouts(next_observation, is_next_observation_terminal, weights)
+            ) = self.collect_rollouts(next_observation, is_next_observation_terminal)
 
             update_results = self.update_policy(
                 batch_observations,
@@ -273,6 +271,8 @@ class PPO:
             )
 
             self.logger.log_policy_update(update_results, self._global_step)
+            print(self.agent.actor_logstd)
+
 
         print(f"Training completed. Total steps: {self._global_step}")
 
@@ -300,7 +300,7 @@ class PPO:
         is_initial_observation_terminal = torch.zeros(self.num_envs).to(self.device)
         return initial_observation, is_initial_observation_terminal
 
-    def collect_rollouts(self, next_observation, is_next_observation_terminal, weights):
+    def collect_rollouts(self, next_observation, is_next_observation_terminal):
         """
         Collect a set of rollout data by interacting with the environment. A rollout is a sequence of observations,
         actions, and rewards obtained by running the current policy in the environment. The collected data is crucial
@@ -344,18 +344,29 @@ class PPO:
             rewards,
             is_episode_terminated,
             observation_values,
-        ) = self._initialize_storage()
+            rollout_weights
+
+        ) = self._initialize_storage()    
+        # if self.reward_size != 1:
+        #     weights = torch.distributions.categorical.Categorical(logits = torch.Tensor([1.0, 1.0, 1.0])).sample((self.num_envs, self.reward_size)).to(self.device) - 1
+        # else:
+        #     weights = torch.ones(self.num_envs, 1).to(self.device)
+        weights = torch.ones((self.num_envs, self.reward_size)).to(self.device)
     
+        overall_infos = {}
         for step in range(self.num_rollout_steps):
             # Store current observation
             collected_observations[step] = next_observation
             is_episode_terminated[step] = is_next_observation_terminal
+            # if self.reward_size != 1 and is_next_observation_terminal.type(torch.bool).any():
+            #     weights[is_next_observation_terminal.type(torch.bool)] = torch.distributions.categorical.Categorical(logits = torch.Tensor([1.0, 1.0, 1.0])).sample(weights[is_next_observation_terminal.type(torch.bool)].shape).to(self.device) - 1
+                
 
             with torch.no_grad():
                 action, logprob = self.agent.sample_action_and_compute_log_prob(
                     next_observation, weights
                 )
-                value = self.agent.estimate_value_from_observation(next_observation)
+                value = self.agent.estimate_value_from_observation(next_observation, weights)
 
                 observation_values[step] = value
             actions[step] = action
@@ -366,8 +377,16 @@ class PPO:
                 action.cpu().numpy()
             )
             self._global_step += self.num_envs
-            rewards[step] = torch.as_tensor(reward, device=self.device)
+            rewards[step] = weights * torch.as_tensor(reward, device=self.device)
             is_next_observation_terminal = np.logical_or(terminations, truncations)
+            rollout_weights[step] = weights
+
+            # if len(overall_infos) == 0 and len(infos) > 0:
+            #     overall_infos = infos
+            #     overall_infos['count'] = is_next_observation_terminal
+            # else:
+            #     for key in infos:
+            #         overall_infos[key]+=infos[key]
 
             next_observation, is_next_observation_terminal = (
                 torch.as_tensor(
@@ -379,13 +398,14 @@ class PPO:
                     device=self.device,
                 ),
             )
+            
             self.logger.log_rollout_step(infos, self._global_step)
 
         # Estimate the value of the next state (the state after the last collected step) using the current policy
         # This value will be used in the GAE calculation to compute advantages
         with torch.no_grad():
             next_value = self.agent.estimate_value_from_observation(
-                next_observation
+                next_observation, weights
             ).reshape(self.num_envs, self.reward_size)
 
             advantages, returns = self.compute_advantages(
@@ -394,7 +414,6 @@ class PPO:
                 is_episode_terminated,
                 next_value,
                 is_next_observation_terminal,
-                weights,
             )
 
         # Flatten the batch for easier processing in the update step
@@ -413,7 +432,7 @@ class PPO:
             advantages,
             returns,
             observation_values,
-            weights
+            rollout_weights
         )
 
         # Return the collected and computed data for the policy update step
@@ -448,6 +467,9 @@ class PPO:
         observation_values = torch.zeros((self.num_rollout_steps, self.num_envs, self.reward_size)).to(
             self.device
         )
+        rollout_weights = torch.zeros((self.num_rollout_steps, self.num_envs, self.reward_size)).to(
+            self.device
+        )
 
         return (
             collected_observations,
@@ -456,6 +478,7 @@ class PPO:
             rewards,
             is_episode_terminated,
             observation_values,
+            rollout_weights
         )
 
     def compute_advantages(
@@ -464,8 +487,7 @@ class PPO:
         values,
         is_observation_terminal,
         next_value,
-        is_next_observation_terminal,
-        weights
+        is_next_observation_terminal
     ):
         """
         Compute advantages using Generalized Advantage Estimation (GAE). The advantage function
@@ -504,40 +526,32 @@ class PPO:
 
         """
         # Initialize advantage estimates
-        advantages_policy = torch.zeros_like(rewards).to(self.device)
-        advantages_critic = torch.zeros_like(rewards).to(self.device)
+        advantages = torch.zeros_like(rewards).to(self.device)
 
         # Initialize the GAE accumulator
         # gae_running_value = torch.zeros((1, self.reward_size))
-        gae_running_value_policy = 0
-        gae_running_value_critic = 0
-
+        gae_running_value = 0
         # Accumulate the GAE values in reverse order, which allows us to efficiently
         # compute multi-step advantages
         for t in reversed(range(self.num_rollout_steps)):
             if t == self.num_rollout_steps - 1:
                 # For the last step, use the provided next_value and whether it is terminal
                 episode_continues = 1.0 - is_next_observation_terminal
-                next_values_policy = weights * next_value
-                next_values_critic = next_value
+                next_value = next_value
             else:
                 # For all other steps, use values and terminal flags from the next step
                 episode_continues = 1.0 - is_observation_terminal[t + 1]
-                next_values_policy = weights * values[t + 1]
-                next_values_critic = next_value
+                next_value = values[t + 1]
 
             # Compute TD error: δ_t = r_t + γ * V(s_{t+1}) * (1 - is_terminal_{t+1}) - V(s_t)
             # The TD error represents the difference between
             # the expected value (current reward plus discounted next observation value)
             # and the estimated value of the current observation. It's a measure of
             # how "surprised" we are by the outcome of an action.
-            delta_policy = (
-                weights * rewards[t] + self.gamma * next_values_policy * episode_continues.reshape(self.num_envs, -1) - weights * values[t]
+            delta = (
+                rewards[t] + self.gamma * next_value * episode_continues.reshape(self.num_envs, -1) - values[t]
             )
-            delta_critic = (
-                rewards[t] + self.gamma * next_values_critic * episode_continues.reshape(self.num_envs, -1) - values[t]
-            )
-
+            
             # Compute GAE:  A_t = δ_t + (γλ) * (1 - is_terminal_{t+1}) * A_{t+1}
             # Intuition: GAE is a weighted sum of TD errors, with more recent
             # errors weighted more heavily. This balances between using only
@@ -545,15 +559,11 @@ class PPO:
             # full return (low variance, biased). The λ parameter controls
             # this trade-off.
 
-            advantages_policy[t] = gae_running_value_policy = (
-                delta_policy
-                + self.gamma * self.gae_lambda * episode_continues.reshape(self.num_envs, -1) * gae_running_value_policy
+            advantages[t] = gae_running_value = (
+                delta
+                + self.gamma * self.gae_lambda * episode_continues.reshape(self.num_envs, -1) * gae_running_value
             )
 
-            advantages_critic[t] = gae_running_value_critic = (
-                delta_critic
-                + self.gamma * self.gae_lambda * episode_continues.reshape(self.num_envs, -1) * gae_running_value_critic
-            )
         # The return is the sum of the advantage (how much better the action was than expected)
         # and the value estimate (what we expected).
         # Combining our value function estimate with the computed advantage gives
@@ -562,9 +572,9 @@ class PPO:
         # 1. Advantage A(s,a) = Q(s,a) - V(s)
         # 2. Q(s,a) represents the expected return from taking action a in state s
         # 3. By adding V(s) back to A(s,a), we reconstruct an estimate of the full return
-        returns = advantages_critic + values
+        returns = advantages + values
 
-        return advantages_policy, returns
+        return advantages, returns
 
     def _flatten_rollout_data(
         self,
@@ -584,7 +594,7 @@ class PPO:
         batch_advantages = advantages.reshape(-1, self.reward_size)
         batch_returns = returns.reshape(-1, self.reward_size)
         batch_values = observation_values.reshape(-1, self.reward_size)
-        batch_weights = torch.vstack([weights]*collected_observations.shape[0])
+        batch_weights = weights.reshape(-1, self.reward_size)
 
         return (
             batch_observations,
@@ -660,8 +670,10 @@ class PPO:
         # Track clipping for monitoring policy update magnitude
         clipping_fractions = []
 
+
         for epoch in range(self.update_epochs):
             np.random.shuffle(batch_indices)
+            kl_div = 0
 
             # Minibatch updates help stabilize training and can be more compute-efficient
             for start in range(0, batch_size, self.minibatch_size):
@@ -677,7 +689,8 @@ class PPO:
                     )
                 )
                 new_value = self.agent.estimate_value_from_observation(
-                    collected_observations[minibatch_indices]
+                    collected_observations[minibatch_indices],
+                    collected_weights[minibatch_indices]
                 )
 
                 # Calculate the probability ratio for importance sampling
@@ -694,6 +707,7 @@ class PPO:
                 with torch.no_grad():
                     old_approx_kl = (-log_probability_ratio).mean()
                     approx_kl = ((probability_ratio - 1) - log_probability_ratio).mean()
+                    kl_div = approx_kl.mean()
 
                     # Track the fraction of updates being clipped
                     # High clipping fraction might indicate too large policy updates
@@ -711,8 +725,9 @@ class PPO:
                 if self.normalize_advantages:
                     # Normalize advantages to reduce variance in updates
                     minibatch_advantages = (
-                        minibatch_advantages - minibatch_advantages.mean()
-                    ) / (minibatch_advantages.std() + 1e-8)
+                        minibatch_advantages - minibatch_advantages.mean(dim = 0)
+                    ) / (minibatch_advantages.std(dim = 0) + 1e-8)
+                
                 policy_gradient_loss = self.calculate_policy_gradient_loss(
                     minibatch_advantages, probability_ratio.reshape(-1, 1)
                 )
@@ -739,11 +754,24 @@ class PPO:
                 # Gradient clipping helps prevent too large policy updates
                 nn.utils.clip_grad_norm_(self.agent.parameters(), self.max_grad_norm)
                 self.optimizer.step()
+                    
+                
+                if self.agent.actor_logstd.isnan().any():
+                    print(policy_gradient_loss
+                    , entropy_loss  # subtraction here to maximise entropy (exploration)
+                    , value_function_loss * self.value_function_loss_coefficient
+                    )
+                    print(minibatch_advantages)
+                    print(probability_ratio)
+                    print(log_probability_ratio)
+                    print(current_policy_log_probs)
+                    print(collected_action_log_probs[minibatch_indices])
+                    self.agent.actor_logstd[self.agent.actor_logstd.isnan()] = 0.01
 
             # Early stopping based on KL divergence, if enabled, done at epoch level for stability
             # This provides an additional safeguard against too large policy updates
             if self.target_kl is not None:
-                if approx_kl > self.target_kl:
+                if kl_div/len(range(0, batch_size, self.minibatch_size)) > self.target_kl:
                     break
 
         predicted_values, actual_returns = (
@@ -859,7 +887,6 @@ class PPO:
         - V_old(s_t) is the old value estimate
         - ε is the surrogate_clip_threshold
         """
-        # new_value = new_value.view(-1)
 
         if self.clip_value_function_loss:
             # L^VF_unclipped = (V_θ(s_t) - R_t)^2
