@@ -61,6 +61,7 @@ def load_and_evaluate_model(
                 torch.Tensor(obs).to(device), deterministic = True
             )
         obs, _, _, _, infos = eval_envs.step(actions.cpu().numpy())
+        print(actions)
 
         if "episode" in infos:
             print(
@@ -85,7 +86,7 @@ def load_and_evaluate_model(
             gif_name = f"{run_name}_env_{i}.gif"
             # Only save if we actually have frames
             if len(frames_per_env[i]) > 0:
-                imageio.mimsave(gif_name, frames_per_env[i], fps=30)
+                imageio.mimsave(gif_name, frames_per_env[i][::3], fps=30)
                 print(f"Saved GIF for env {i}: {gif_name}")
 @script
 def run_ppo(
@@ -184,14 +185,14 @@ def run_ppo(
     if env_id == "LunarLander":
         envs = SyncVectorEnv(
         [
-            lambda: LunarLander(continuous = True, scalar_reward=scalar_reward, render_mode="rgb_array"),
+            lambda: gym.wrappers.TimeLimit(LunarLander(continuous = True, scalar_reward=scalar_reward, render_mode="rgb_array"), max_episode_steps = 500),
         ]*num_envs,
         reward_size = 1 if scalar_reward else 8
         )
     if env_id == "BipedalWalker":
         envs = SyncVectorEnv(
         [
-            lambda: BipedalWalker(scalar_reward=scalar_reward),
+            lambda: gym.wrappers.TimeLimit(BipedalWalker(scalar_reward=scalar_reward, render_mode="rgb_array"), max_episode_steps = 1600),
         ]*num_envs,
         reward_size = 1 if scalar_reward else 7
         )

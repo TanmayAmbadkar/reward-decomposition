@@ -19,7 +19,7 @@ reward_size = 8
 
 
 eval_agent = ContinuousAgent(env, reward_size=8)
-eval_agent.load_state_dict(torch.load("runs/LunarLander__main_ppo__2025-02-11 14:13:33.613197__0/main_ppo.rl_model"))
+eval_agent.load_state_dict(torch.load("runs/LunarLander__main_ppo__2025-02-18 19:33:54.083746__0/main_ppo.rl_model"))
 eval_agent.eval()
 env = LunarLander(continuous = True)
 
@@ -31,7 +31,7 @@ trunc = False
 weight = np.zeros(8)
 weight[[0, 1]] = 1
 while not done and not trunc:
-    action, value = eval_agent.predict(obs, np.ones(8), deterministic=True)
+    action, value = eval_agent.predict(obs, weight, deterministic=True)
     obs, rew, done, trunc, infos = env.step(action[0])
     episodic_returns.append(rew)
     value_function.append(value[0])

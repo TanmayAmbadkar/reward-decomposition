@@ -177,28 +177,28 @@ class ContinuousAgent(BaseAgent):
         self.rpo_alpha = rpo_alpha
         self.reward_size = reward_size
         self.weight_vec_size = 0 if reward_size == 1 else reward_size
-        self.critic = CriticFiLM(np.array(envs.single_observation_space.shape).prod(), self.weight_vec_size, reward_size)
-        self.actor_mean = ActorFiLM(np.array(envs.single_observation_space.shape).prod(), self.weight_vec_size,  np.prod(envs.single_action_space.shape))
-        # self.critic = nn.Sequential(
-        #     layer_init(
-        #         nn.Linear(np.array(envs.single_observation_space.shape).prod() + self.weight_vec_size, 128)
-        #     ),
-        #     nn.Tanh(),
-        #     layer_init(nn.Linear(128, 128)),
-        #     nn.Tanh(),
-        #     layer_init(nn.Linear(128, reward_size), std=1.0),
-        # )
-        # self.actor_mean = nn.Sequential(
-        #     layer_init(
-        #         nn.Linear(np.array(envs.single_observation_space.shape).prod() + self.weight_vec_size, 128)
-        #     ),
-        #     nn.Tanh(),
-        #     layer_init(nn.Linear(128, 128)),
-        #     nn.Tanh(),
-        #     layer_init(
-        #         nn.Linear(128, np.prod(envs.single_action_space.shape)), std=0.01
-        #     ),
-        # )
+        # self.critic = CriticFiLM(np.array(envs.single_observation_space.shape).prod(), self.weight_vec_size, reward_size)
+        # self.actor_mean = ActorFiLM(np.array(envs.single_observation_space.shape).prod(), self.weight_vec_size,  np.prod(envs.single_action_space.shape))
+        self.critic = nn.Sequential(
+            layer_init(
+                nn.Linear(np.array(envs.single_observation_space.shape).prod() + self.weight_vec_size, 128)
+            ),
+            nn.Tanh(),
+            layer_init(nn.Linear(128, 128)),
+            nn.Tanh(),
+            layer_init(nn.Linear(128, reward_size), std=1.0),
+        )
+        self.actor_mean = nn.Sequential(
+            layer_init(
+                nn.Linear(np.array(envs.single_observation_space.shape).prod() + self.weight_vec_size, 128)
+            ),
+            nn.Tanh(),
+            layer_init(nn.Linear(128, 128)),
+            nn.Tanh(),
+            layer_init(
+                nn.Linear(128, np.prod(envs.single_action_space.shape)), std=0.01
+            ),
+        )
         self.actor_logstd = nn.Parameter(
             torch.zeros(1, np.prod(envs.single_action_space.shape))
         )
@@ -207,14 +207,15 @@ class ContinuousAgent(BaseAgent):
         self.action_space_low = envs.single_action_space.low
         self.action_space_high = envs.single_action_space.high
 
-    def estimate_value_from_observation(self, observation, weights):
-
-        assert weights.shape[0] == observation.shape[0]
+    def estimate_value_from_observation(self, observation, weights = None):
+        
+        if weights is not None:
+            assert weights.shape[0] == observation.shape[0]
 
         if self.weight_vec_size == 0:
             observation = observation
         elif weights is None:
-            observation = torch.hstack([observation, 1/self.weight_vec_size * torch.ones((observation.shape[0], self.weight_vec_size))])
+            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size))])
         else:
             observation =  torch.hstack([observation, weights])
 
@@ -233,12 +234,12 @@ class ContinuousAgent(BaseAgent):
 
         observation = torch.Tensor(observation).reshape(1, -1)
         obs_critic = observation.clone()
-        weight = torch.Tensor(weight).reshape(1, -1)
         if self.weight_vec_size == 0:
             observation = observation
         elif weight is None:
-            observation = torch.hstack([observation, 1/self.weight_vec_size * torch.ones((observation.shape[0], self.weight_vec_size))])
+            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size))])
         else:
+            weight = torch.Tensor(weight).reshape(1, -1)
             observation =  torch.hstack([observation, weight])
 
         action_dist = self.get_action_distribution(observation)
@@ -261,7 +262,7 @@ class ContinuousAgent(BaseAgent):
         if self.weight_vec_size == 0:
             observation = observations
         elif weights is None:
-            observations = torch.hstack([observations, 1/self.weight_vec_size * torch.ones((observations.shape[0], self.weight_vec_size))])
+            observations = torch.hstack([observations, torch.ones((observations.shape[0], self.weight_vec_size))])
         else:
             observations =  torch.hstack([observations, weights])
 
