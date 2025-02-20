@@ -12,14 +12,14 @@ import torch
 
 env =SyncVectorEnv(
 [
-    lambda: LunarLander(continuous = True),
+    lambda: gym.wrappers.TimeLimit(LunarLander(continuous = True), max_episode_steps = 500)
 ],
 reward_size = 8
 )
 
 
 eval_agent = ContinuousAgent(env, reward_size=8)
-eval_agent.load_state_dict(torch.load("runs/LunarLander__main_ppo__2025-02-18 19:33:54.083746__0/main_ppo.rl_model"))
+eval_agent.load_state_dict(torch.load("runs/LunarLander__main_ppo__2025-02-19 21:43:35.089738__0/main_ppo.rl_model"))
 eval_agent.eval()
 env = LunarLander(continuous = True)
 
@@ -29,7 +29,7 @@ value_function = []
 done = False
 trunc = False
 weight = np.zeros(8)
-weight[[0, 1]] = 1
+weight[[5, 6]] = 1
 while not done and not trunc:
     action, value = eval_agent.predict(obs, weight, deterministic=True)
     obs, rew, done, trunc, infos = env.step(action[0])
@@ -57,16 +57,16 @@ sns.barplot(df.sum())
 plt.savefig("BarPlot.png")
 
 
-df = pd.DataFrame(np.array(value_function), columns = ["distance", "Speed", "Tilt", "Leg 1", "Leg 2", "main engine", "side engine", "success"])
+# df = pd.DataFrame(np.array(value_function), columns = ["distance", "Speed", "Tilt", "Leg 1", "Leg 2", "main engine", "side engine", "success"])
 
 
-plt.figure(figsize = (10, 5))
-df.iloc[:-1].plot()
-plt.savefig("ValueDecom.png")
+# plt.figure(figsize = (10, 5))
+# df.iloc[:-1].plot()
+# plt.savefig("ValueDecom.png")
 
-plt.figure(figsize = (10, 5))
-sns.barplot(df.sum())
-plt.savefig("ValueBarPlot.png")
+# plt.figure(figsize = (10, 5))
+# sns.barplot(df.sum())
+# plt.savefig("ValueBarPlot.png")
 
 
 

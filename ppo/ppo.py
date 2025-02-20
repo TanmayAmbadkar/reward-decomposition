@@ -92,7 +92,7 @@ class PPOLogger:
     
         frames = frames.reshape(1, *frames.shape)
         frames = torch.Tensor(frames).permute([0, 1, 4, 2, 3])
-        self.writer.add_video(tag = "video", vid_tensor = frames, fps = 24)
+        self.writer.add_video(tag = "video", vid_tensor = frames[:,::3], fps = 24)
 
 class PPO:
     def __init__(
@@ -370,11 +370,11 @@ class PPO:
         for step in range(self.num_rollout_steps):
             # Store current observation
             collected_observations[step] = next_observation
-            collected_observations[step + self.num_rollout_steps] = next_observation
+            # collected_observations[step + self.num_rollout_steps] = next_observation
             is_episode_terminated[step] = is_next_observation_terminal
             is_episode_truncated[step] = is_next_observation_truncated
-            is_episode_terminated[step + self.num_rollout_steps] = is_next_observation_terminal
-            is_episode_truncated[step + self.num_rollout_steps] = is_next_observation_truncated
+            # is_episode_terminated[step + self.num_rollout_steps] = is_next_observation_terminal
+            # is_episode_truncated[step + self.num_rollout_steps] = is_next_observation_truncated
 
             change_weights = torch.logical_or(is_next_observation_terminal.type(torch.bool), is_next_observation_truncated.type(torch.bool))
             if self.reward_size != 1 and change_weights.any():
@@ -390,35 +390,27 @@ class PPO:
                     next_observation, action, unit_weights
                 )
                 value = self.agent.estimate_value_from_observation(next_observation, weights)
-                value_unit = self.agent.estimate_value_from_observation(next_observation, unit_weights)
+                # value_unit = self.agent.estimate_value_from_observation(next_observation, unit_weights)
 
-                observation_values[step] = value.reshape(-1, )
-                observation_values[step + self.num_rollout_steps] = value_unit.reshape(-1, )
+                observation_values[step] = value
+                # observation_values[step + self.num_rollout_steps] = value_unit
             actions[step] = action
             action_log_probabilities[step] = logprob
-            actions[step + self.num_rollout_steps] = action
-            action_log_probabilities[step + self.num_rollout_steps] = logprob_unit
+            # actions[step + self.num_rollout_steps] = action
+            # action_log_probabilities[step + self.num_rollout_steps] = logprob_unit
 
             # Execute the environment and store the data
             next_observation, reward, terminations, truncations, infos = self.envs.step(
                 action.cpu().numpy()
             )
             self._global_step += self.num_envs
-            rewards[step] = torch.sum(weights * torch.as_tensor(reward, device=self.device), dim = 1)
-            rewards[step + self.num_rollout_steps] =torch.sum(unit_weights * torch.as_tensor(reward, device=self.device), dim = 1)
+            rewards[step] = torch.as_tensor(reward, device=self.device)
+            # rewards[step + self.num_rollout_steps] = torch.as_tensor(reward, device=self.device)
 
             is_next_observation_terminal = terminations
             is_next_observation_truncated = truncations
             rollout_weights[step] = weights
-            rollout_weights[step + self.num_rollout_steps] = unit_weights
-
-            # if len(overall_infos) == 0 and len(infos) > 0:
-            #     overall_infos = infos
-            #     overall_infos['count'] = is_next_observation_terminal
-            # else:
-            #     for key in infos:
-            #         overall_infos[key]+=infos[key]
-
+            # rollout_weights[step + self.num_rollout_steps] = unit_weights
             
             next_observation, is_next_observation_terminal, is_next_observation_truncated = (
                 torch.as_tensor(
@@ -443,7 +435,7 @@ class PPO:
         with torch.no_grad():
             next_value = self.agent.estimate_value_from_observation(
                 next_observation, weights
-            ).reshape(self.num_envs, )
+            ).reshape(self.num_envs, self.reward_size)
 
             advantages, returns = self.compute_advantages(
                 rewards[:self.num_rollout_steps],
@@ -456,7 +448,7 @@ class PPO:
             )
             next_value_unit = self.agent.estimate_value_from_observation(
                 next_observation, unit_weights
-            ).reshape(self.num_envs)
+            ).reshape(self.num_envs, self.reward_size)
 
             unit_advantages, unit_returns = self.compute_advantages(
                 rewards[self.num_rollout_steps:],
@@ -467,6 +459,7 @@ class PPO:
                 is_next_observation_terminal,
                 is_next_observation_truncated,
             )
+
 
             advantages = torch.vstack([advantages, unit_advantages])
             returns = torch.vstack([returns, unit_returns])
@@ -518,14 +511,14 @@ class PPO:
         action_log_probabilities = torch.zeros(
             (self.num_rollout_steps*2, self.num_envs)
         ).to(self.device)
-        rewards = torch.zeros((self.num_rollout_steps*2, self.num_envs)).to(self.device)
+        rewards = torch.zeros((self.num_rollout_steps*2, self.num_envs, self.reward_size)).to(self.device)
         is_episode_terminated = torch.zeros((self.num_rollout_steps*2, self.num_envs)).to(
             self.device
         )
         is_episode_truncated = torch.zeros((self.num_rollout_steps*2, self.num_envs)).to(
             self.device
         )
-        observation_values = torch.zeros((self.num_rollout_steps*2, self.num_envs)).to(
+        observation_values = torch.zeros((self.num_rollout_steps*2, self.num_envs, self.reward_size)).to(
             self.device
         )
         rollout_weights = torch.zeros((self.num_rollout_steps*2, self.num_envs, self.reward_size)).to(
@@ -572,38 +565,29 @@ class PPO:
             if t == T - 1:
                 # For the final step, use the provided next_value and flags.
                 # For each environment: if next state is terminal, no bootstrapping.
-                cont = torch.where(
-                    is_next_observation_terminal.bool(),
-                    torch.zeros_like(next_value),
-                    torch.ones_like(next_value)
-                )
+                cont = is_next_observation_terminal
+                # cont[is_next_observation_terminal.bool()] = torch.zeros_like(is_next_observation_terminal)
                 # If truncated (and not terminal), reset gae_running.
                 mask_trunc = is_next_observation_truncated.bool() & (~is_next_observation_terminal.bool())
-                gae_running = torch.where(mask_trunc, torch.zeros_like(gae_running), gae_running)
+                # gae_running = torch.where(mask_trunc, torch.zeros_like(gae_running), gae_running)
+                gae_running[mask_trunc] = 0
                 # Bootstrap value: use next_value if not terminal, else 0.
-                bootstrap = torch.where(
-                    is_next_observation_terminal.bool(),
-                    torch.zeros_like(next_value),
-                    next_value
-                )
+                bootstrap = next_value
+                bootstrap[is_next_observation_terminal.bool()] = 0
             else:
                 # For intermediate steps, use flags from the next time step (t+1).
-                cont = torch.where(
-                    is_observation_terminal[t + 1].bool(),
-                    torch.zeros_like(values[t + 1]),
-                    torch.ones_like(values[t + 1])
-                )
+                # cont = torch.ones_like(is_next_observation_terminal)
+                cont = is_observation_terminal[t + 1]
+                # cont[is_observation_terminal[t + 1].bool()] = torch.zeros_like(is_observation_terminal[t + 1].bool())
+                
                 mask_trunc = is_observation_truncated[t + 1].bool() & (~is_observation_terminal[t + 1].bool())
-                gae_running = torch.where(mask_trunc, torch.zeros_like(gae_running), gae_running)
-                bootstrap = torch.where(
-                    is_observation_terminal[t + 1].bool(),
-                    torch.zeros_like(values[t + 1]),
-                    values[t + 1]
-                )
+                gae_running[mask_trunc] = 0
+                bootstrap = values[t + 1]
+                bootstrap[is_observation_terminal[t + 1].bool()] = 0
             
             # Compute the TD error (delta) elementwise.
-            delta = rewards[t] + self.gamma * bootstrap * cont - values[t]
-            gae_running = delta + self.gamma * self.gae_lambda * cont * gae_running
+            delta = rewards[t] + self.gamma * cont.reshape(-1, 1) * bootstrap  - values[t]
+            gae_running = delta + self.gamma * self.gae_lambda * cont.reshape(-1, 1) * gae_running
             advantages[t] = gae_running
 
         returns = advantages + values
@@ -626,9 +610,9 @@ class PPO:
         )
         batch_log_probabilities = action_log_probabilities.reshape(-1)
         batch_actions = actions.reshape((-1,) + self.envs.single_action_space.shape)
-        batch_advantages = advantages.reshape(-1, 1)
-        batch_returns = returns.reshape(-1, 1)
-        batch_values = observation_values.reshape(-1, 1)
+        batch_advantages = advantages.reshape(-1, self.reward_size)
+        batch_returns = returns.reshape(-1, self.reward_size)
+        batch_values = observation_values.reshape(-1, self.reward_size)
         batch_weights = weights.reshape(-1, self.reward_size)
 
         return (
@@ -699,8 +683,8 @@ class PPO:
         normalization and gradient clipping for further stability.
         """
         # Prepare for minibatch updates
-        batch_size = self.num_rollout_steps * self.num_envs*2
-        assert collected_observations.shape[0] == batch_size
+        batch_size = self.num_rollout_steps * self.num_envs
+        assert collected_observations.shape[0] == batch_size*2
         batch_indices = np.arange(batch_size)
 
         # Track clipping for monitoring policy update magnitude
@@ -756,12 +740,47 @@ class PPO:
                         .item()
                     ]
 
-                minibatch_advantages = computed_advantages[minibatch_indices]
+                # minibatch_advantages = computed_advantages[minibatch_indices]
+                # if self.normalize_advantages:
+                #     # Normalize advantages to reduce variance in updates
+                #     minibatch_advantages = (
+                #         minibatch_advantages - minibatch_advantages.mean(dim = 0)
+                #     ) / (minibatch_advantages.std(dim = 0) + 1e-8)
+                # minibatch_advantages= collected_weights[minibatch_indices] * minibatch_advantages
+
+
+                # Get the raw advantages and corresponding weights for this minibatch.
+                minibatch_advantages = computed_advantages[minibatch_indices]  # shape: [N, d]
+                weights = collected_weights[minibatch_indices]                # shape: [N, d]
+
+                # Multiply raw advantage by the weight to get the weighted advantages.
+                weighted_advantages = weights * minibatch_advantages  # shape: [N, d]
+
                 if self.normalize_advantages:
-                    # Normalize advantages to reduce variance in updates
-                    minibatch_advantages = (
-                        minibatch_advantages - minibatch_advantages.mean()
-                    ) / (minibatch_advantages.std() + 1e-8)
+                    eps = 1e-8  # small constant to avoid division by zero
+                    # Create a mask: 1 where weight is nonzero, 0 otherwise.
+                    mask = (weights != 0).float()  # shape: [N, d]
+
+                    # Compute the number of nonzero entries per reward component.
+                    count = mask.sum(dim=0)  # shape: [d]
+
+                    # Compute per-component masked mean.
+                    mean = (weighted_advantages * mask).sum(dim=0) / (count + eps)  # shape: [d]
+
+                    # Compute the differences and then the masked standard deviation.
+                    diff = (weighted_advantages - mean.unsqueeze(0)) * mask  # shape: [N, d]
+                    std = torch.sqrt((diff ** 2).sum(dim=0) / (count + eps))    # shape: [d]
+
+                    # Apply normalization: subtract mean, divide by std, and multiply by mask to keep zeros.
+                    normalized_advantages = ((weighted_advantages - mean.unsqueeze(0)) /
+                                            (std.unsqueeze(0) + eps)) * mask  # shape: [N, d]
+
+                    minibatch_advantages = normalized_advantages
+                else:
+                    minibatch_advantages = weighted_advantages
+
+                eps = 1e-8  # to avoid division by zero
+
                 policy_gradient_loss = self.calculate_policy_gradient_loss(
                     minibatch_advantages, probability_ratio.reshape(-1, 1)
                 )

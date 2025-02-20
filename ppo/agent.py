@@ -183,12 +183,12 @@ class ContinuousAgent(BaseAgent):
         # self.actor_mean = ActorFiLM(np.array(envs.single_observation_space.shape).prod(), self.weight_vec_size,  np.prod(envs.single_action_space.shape))
         self.critic = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod() + self.weight_vec_size, 128)
+                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 128)
             ),
             nn.Tanh(),
             layer_init(nn.Linear(128, 128)),
             nn.Tanh(),
-            layer_init(nn.Linear(128, 1), std=1.0),
+            layer_init(nn.Linear(128, self.reward_size), std=1.0),
         )
         self.actor_mean = nn.Sequential(
             layer_init(
@@ -211,15 +211,15 @@ class ContinuousAgent(BaseAgent):
 
     def estimate_value_from_observation(self, observation, weights = None):
         
-        if weights is not None:
-            assert weights.shape[0] == observation.shape[0]
+        # if weights is not None:
+        #     assert weights.shape[0] == observation.shape[0]
 
-        if self.weight_vec_size == 0:
-            observation = observation
-        elif weights is None:
-            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size))])
-        else:
-            observation =  torch.hstack([observation, weights])
+        # if self.weight_vec_size == 0:
+        #     observation = observation
+        # elif weights is None:
+        #     observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size))])
+        # else:
+        #     observation =  torch.hstack([observation, weights])
 
         return self.critic(observation)
 
@@ -288,7 +288,7 @@ class ContinuousAgent(BaseAgent):
         if self.weight_vec_size == 0:
             observation = observations
         elif weights is None:
-            observations = torch.hstack([observations, 1/self.weight_vec_size * torch.ones((observation.shape[0], self.weight_vec_size))])
+            observations = torch.hstack([observations, torch.ones((observations.shape[0], self.weight_vec_size))])
         else:
             observations =  torch.hstack([observations, weights])
 
