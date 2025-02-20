@@ -16,6 +16,7 @@ from ppo.ppo import PPO, PPOLogger
 from envs.lunar_lander import LunarLander
 from envs.bipedal_walker import BipedalWalker
 from envs.utils import SyncVectorEnv, RecordEpisodeStatistics
+import torchbnn as bnn
 
 def set_seed(seed, torch_deterministic=True):
     random.seed(seed)
@@ -61,7 +62,7 @@ def load_and_evaluate_model(
                 torch.Tensor(obs).to(device), deterministic = True
             )
         obs, _, _, _, infos = eval_envs.step(actions.cpu().numpy())
-        print(actions)
+        # print(actions)
 
         if "episode" in infos:
             print(
@@ -81,13 +82,15 @@ def load_and_evaluate_model(
     eval_envs.close()
 
     # Once done, save each environment's frames to an individual GIF
-    if capture_video:
-        for i in range(num_envs):
-            gif_name = f"{run_name}_env_{i}.gif"
-            # Only save if we actually have frames
-            if len(frames_per_env[i]) > 0:
-                imageio.mimsave(gif_name, frames_per_env[i][::3], fps=30)
-                print(f"Saved GIF for env {i}: {gif_name}")
+    # if capture_video:
+    #     for i in range(num_envs):
+    #         gif_name = f"{run_name}_env_{i}.gif"
+    #         # Only save if we actually have frames
+    #         if len(frames_per_env[i]) > 0:
+    #             imageio.mimsave(gif_name, frames_per_env[i][::3], fps=30)
+    #             print(f"Saved GIF for env {i}: {gif_name}")
+
+    return np.vstack(frames_per_env)
 @script
 def run_ppo(
     env_id: str = "LunarLander",
@@ -189,13 +192,15 @@ def run_ppo(
         ]*num_envs,
         reward_size = 1 if scalar_reward else 8
         )
-    if env_id == "BipedalWalker":
+    elif env_id == "BipedalWalker":
         envs = SyncVectorEnv(
         [
             lambda: gym.wrappers.TimeLimit(BipedalWalker(scalar_reward=scalar_reward, render_mode="rgb_array"), max_episode_steps = 1600),
         ]*num_envs,
         reward_size = 1 if scalar_reward else 7
         )
+    else:
+        raise "ENV NOT FOUND"
     envs = RecordEpisodeStatistics(envs)
 
 # Set up agent
@@ -208,6 +213,7 @@ def run_ppo(
 
     optimizer = optim.Adam(agent.parameters(), lr=learning_rate, eps=1e-5)
 
+    logger = PPOLogger(run_name, use_tensorboard, envs.env.reward_size)
     ppo = PPO(
         agent=agent,
         reward_size = envs.env.reward_size,
@@ -229,7 +235,7 @@ def run_ppo(
         anneal_lr=anneal_lr,
         envs=envs,
         seed=seed,
-        logger=PPOLogger(run_name, use_tensorboard, envs.env.reward_size),
+        logger=logger
     )
     print(ppo.agent)
     # Train the agent
@@ -242,7 +248,7 @@ def run_ppo(
         torch.save(trained_agent.state_dict(), model_path)
         print(f"Model saved to {model_path}")
 
-        load_and_evaluate_model(
+        frames = load_and_evaluate_model(
             run_name,
             env_id,
             env_is_discrete,
@@ -254,6 +260,9 @@ def run_ppo(
             gamma,
             capture_video,
         )
+
+        if capture_video:
+            logger.write_video(frames)
 
     # Close environments
     envs.close()

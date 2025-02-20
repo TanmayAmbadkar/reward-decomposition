@@ -6,6 +6,8 @@ import torch.nn as nn
 from torch.distributions.categorical import Categorical
 from torch.distributions.normal import Normal
 
+import torchbnn as bnn
+
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -186,7 +188,7 @@ class ContinuousAgent(BaseAgent):
             nn.Tanh(),
             layer_init(nn.Linear(128, 128)),
             nn.Tanh(),
-            layer_init(nn.Linear(128, reward_size), std=1.0),
+            layer_init(nn.Linear(128, 1), std=1.0),
         )
         self.actor_mean = nn.Sequential(
             layer_init(

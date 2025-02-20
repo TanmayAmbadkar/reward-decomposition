@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
+import torchbnn as bnn
 
 
 class LinearLRSchedule:
@@ -86,6 +87,12 @@ class PPOLogger:
                 update_results["explained_variance"],
                 global_step,
             )
+
+    def write_video(self, frames):
+    
+        frames = frames.reshape(1, *frames.shape)
+        frames = torch.Tensor(frames).permute([0, 1, 4, 2, 3])
+        self.writer.add_video(tag = "video", vid_tensor = frames, fps = 24)
 
 class PPO:
     def __init__(
@@ -385,8 +392,8 @@ class PPO:
                 value = self.agent.estimate_value_from_observation(next_observation, weights)
                 value_unit = self.agent.estimate_value_from_observation(next_observation, unit_weights)
 
-                observation_values[step] = value
-                observation_values[step + self.num_rollout_steps] = value_unit
+                observation_values[step] = value.reshape(-1, )
+                observation_values[step + self.num_rollout_steps] = value_unit.reshape(-1, )
             actions[step] = action
             action_log_probabilities[step] = logprob
             actions[step + self.num_rollout_steps] = action
@@ -397,8 +404,8 @@ class PPO:
                 action.cpu().numpy()
             )
             self._global_step += self.num_envs
-            rewards[step] = weights * torch.as_tensor(reward, device=self.device)
-            rewards[step + self.num_rollout_steps] = unit_weights * torch.as_tensor(reward, device=self.device)
+            rewards[step] = torch.sum(weights * torch.as_tensor(reward, device=self.device), dim = 1)
+            rewards[step + self.num_rollout_steps] =torch.sum(unit_weights * torch.as_tensor(reward, device=self.device), dim = 1)
 
             is_next_observation_terminal = terminations
             is_next_observation_truncated = truncations
@@ -436,7 +443,7 @@ class PPO:
         with torch.no_grad():
             next_value = self.agent.estimate_value_from_observation(
                 next_observation, weights
-            ).reshape(self.num_envs, self.reward_size)
+            ).reshape(self.num_envs, )
 
             advantages, returns = self.compute_advantages(
                 rewards[:self.num_rollout_steps],
@@ -449,7 +456,7 @@ class PPO:
             )
             next_value_unit = self.agent.estimate_value_from_observation(
                 next_observation, unit_weights
-            ).reshape(self.num_envs, self.reward_size)
+            ).reshape(self.num_envs)
 
             unit_advantages, unit_returns = self.compute_advantages(
                 rewards[self.num_rollout_steps:],
@@ -511,14 +518,14 @@ class PPO:
         action_log_probabilities = torch.zeros(
             (self.num_rollout_steps*2, self.num_envs)
         ).to(self.device)
-        rewards = torch.zeros((self.num_rollout_steps*2, self.num_envs, self.reward_size)).to(self.device)
+        rewards = torch.zeros((self.num_rollout_steps*2, self.num_envs)).to(self.device)
         is_episode_terminated = torch.zeros((self.num_rollout_steps*2, self.num_envs)).to(
             self.device
         )
         is_episode_truncated = torch.zeros((self.num_rollout_steps*2, self.num_envs)).to(
             self.device
         )
-        observation_values = torch.zeros((self.num_rollout_steps*2, self.num_envs, self.reward_size)).to(
+        observation_values = torch.zeros((self.num_rollout_steps*2, self.num_envs)).to(
             self.device
         )
         rollout_weights = torch.zeros((self.num_rollout_steps*2, self.num_envs, self.reward_size)).to(
@@ -538,63 +545,70 @@ class PPO:
 
     def compute_advantages(
         self,
-        rewards,
-        values,
-        is_observation_terminal,      # shape: [num_steps, num_envs, ...] (already stored)
-        is_observation_truncated,     # NEW: same shape as is_observation_terminal
-        next_value,                   # shape: [num_envs, reward_size]
-        is_next_observation_terminal, # shape: [num_envs, ...] for the step after the rollout
-        is_next_observation_truncated # NEW: same shape as is_next_observation_terminal
+        rewards,                       # shape: [T, num_envs]
+        values,                        # shape: [T, num_envs]
+        is_observation_terminal,       # shape: [T, num_envs]
+        is_observation_truncated,      # shape: [T, num_envs]
+        next_value,                    # shape: [num_envs]
+        is_next_observation_terminal,  # shape: [num_envs]
+        is_next_observation_truncated  # shape: [num_envs]
     ):
         """
-        Compute advantages with a modified treatment for truncated episodes:
-        - If the next state is terminal: do not bootstrap (final state).
-        - If the next state is truncated: bootstrap from its value but reset the running advantage.
+        Compute advantages with an elementwise handling of terminal and truncated states.
+        
+        For each environment and time step:
+        - If the next state is terminal: we set the continuation factor to 0 and use a bootstrap value of 0.
+        - If the next state is truncated (and not terminal): we still bootstrap from the next value but reset
+            the advantage accumulator.
         """
+        T = self.num_rollout_steps
+        # Initialize advantages with the same shape as rewards.
         advantages = torch.zeros_like(rewards).to(self.device)
-        gae_running = 0.0
+        # Initialize gae_running as a tensor with shape [num_envs]
+        gae_running = torch.zeros_like(next_value).to(self.device)
 
-        # Loop backwards over the rollout steps.
-        for t in reversed(range(self.num_rollout_steps)):
-            # For the last step, use the provided next_value and flags.
-            if t == self.num_rollout_steps - 1:
-                # If the rollout ended because of a true terminal state, do not bootstrap.
-                if is_next_observation_terminal.any():
-                    cont = 0.0
-                    bootstrap = 0.0
-                # If the rollout ended due to truncation, then treat it as nonfinal (bootstrap),
-                # but reset the GAE accumulator.
-                elif is_next_observation_truncated.any():
-                    cont = 1.0
-                    bootstrap = next_value
-                    gae_running = 0.0
-                else:
-                    cont = 1.0
-                    bootstrap = next_value
+        # Iterate backwards over the rollout steps.
+        for t in reversed(range(T)):
+            if t == T - 1:
+                # For the final step, use the provided next_value and flags.
+                # For each environment: if next state is terminal, no bootstrapping.
+                cont = torch.where(
+                    is_next_observation_terminal.bool(),
+                    torch.zeros_like(next_value),
+                    torch.ones_like(next_value)
+                )
+                # If truncated (and not terminal), reset gae_running.
+                mask_trunc = is_next_observation_truncated.bool() & (~is_next_observation_terminal.bool())
+                gae_running = torch.where(mask_trunc, torch.zeros_like(gae_running), gae_running)
+                # Bootstrap value: use next_value if not terminal, else 0.
+                bootstrap = torch.where(
+                    is_next_observation_terminal.bool(),
+                    torch.zeros_like(next_value),
+                    next_value
+                )
             else:
-                # For intermediate steps, use the flag from the next time step.
-                # If the next step was a terminal state, do not bootstrap.
-                if is_observation_terminal[t + 1].any():
-                    cont = 0.0
-                    bootstrap = 0.0
-                # If the next step was truncated, then bootstrap normally but reset the advantage accumulator.
-                elif is_observation_truncated[t + 1].any():
-                    cont = 1.0
-                    bootstrap = values[t + 1]
-                    gae_running = 0.0
-                else:
-                    cont = 1.0
-                    bootstrap = values[t + 1]
-
-            # Compute the TD error (delta) for this timestep.
-            # Note: We multiply the bootstrapped value by cont so that if cont==0 (i.e. terminal)
-            # then no bootstrapping occurs.
+                # For intermediate steps, use flags from the next time step (t+1).
+                cont = torch.where(
+                    is_observation_terminal[t + 1].bool(),
+                    torch.zeros_like(values[t + 1]),
+                    torch.ones_like(values[t + 1])
+                )
+                mask_trunc = is_observation_truncated[t + 1].bool() & (~is_observation_terminal[t + 1].bool())
+                gae_running = torch.where(mask_trunc, torch.zeros_like(gae_running), gae_running)
+                bootstrap = torch.where(
+                    is_observation_terminal[t + 1].bool(),
+                    torch.zeros_like(values[t + 1]),
+                    values[t + 1]
+                )
+            
+            # Compute the TD error (delta) elementwise.
             delta = rewards[t] + self.gamma * bootstrap * cont - values[t]
             gae_running = delta + self.gamma * self.gae_lambda * cont * gae_running
             advantages[t] = gae_running
 
         returns = advantages + values
         return advantages, returns
+
 
 
     def _flatten_rollout_data(
@@ -612,9 +626,9 @@ class PPO:
         )
         batch_log_probabilities = action_log_probabilities.reshape(-1)
         batch_actions = actions.reshape((-1,) + self.envs.single_action_space.shape)
-        batch_advantages = advantages.reshape(-1, self.reward_size)
-        batch_returns = returns.reshape(-1, self.reward_size)
-        batch_values = observation_values.reshape(-1, self.reward_size)
+        batch_advantages = advantages.reshape(-1, 1)
+        batch_returns = returns.reshape(-1, 1)
+        batch_values = observation_values.reshape(-1, 1)
         batch_weights = weights.reshape(-1, self.reward_size)
 
         return (
@@ -692,7 +706,6 @@ class PPO:
         # Track clipping for monitoring policy update magnitude
         clipping_fractions = []
 
-
         for epoch in range(self.update_epochs):
             np.random.shuffle(batch_indices)
             kl_div = 0
@@ -747,8 +760,8 @@ class PPO:
                 if self.normalize_advantages:
                     # Normalize advantages to reduce variance in updates
                     minibatch_advantages = (
-                        minibatch_advantages - minibatch_advantages.mean(dim = 0)
-                    ) / (minibatch_advantages.std(dim = 0) + 1e-8)
+                        minibatch_advantages - minibatch_advantages.mean()
+                    ) / (minibatch_advantages.std() + 1e-8)
                 policy_gradient_loss = self.calculate_policy_gradient_loss(
                     minibatch_advantages, probability_ratio.reshape(-1, 1)
                 )
@@ -767,6 +780,7 @@ class PPO:
                     - self.entropy_loss_coefficient
                     * entropy_loss  # subtraction here to maximise entropy (exploration)
                     + value_function_loss * self.value_function_loss_coefficient
+                    # + bnn_kl_loss(self.agent)*0.01
                 )
 
                 # Perform backpropagation and optimization step
