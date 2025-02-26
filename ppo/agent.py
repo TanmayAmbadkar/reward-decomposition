@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torch.distributions.categorical import Categorical
 from torch.distributions.normal import Normal
+from ppo.resnet import WeightFeatureExtractorNet
 
 import torchbnn as bnn
 
@@ -78,9 +79,20 @@ class DiscreteAgent(BaseAgent):
     def __init__(self, envs, reward_size = 1):
         super().__init__()
         self.reward_size = reward_size
+        
+        self.weight_vec_size = 0 if reward_size == 1 else reward_size
+
+        try:
+            action_space = envs.single_observation_space.n
+            observation_space = envs.single_observation_space.shape
+        except:
+            action_space = envs.observation_space.n
+            observation_space = envs.observation_space.shape
+
+
         self.critic = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
+                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 64)
             ),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
@@ -89,88 +101,65 @@ class DiscreteAgent(BaseAgent):
         )
         self.actor = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
+                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 64)
             ),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
+            layer_init(nn.Linear(64, action_space), std=0.01),
         )
 
-    def estimate_value_from_observation(self, observation):
+    def estimate_value_from_observation(self, observation, weights = None):
+        
+        if weights is not None:
+            assert weights.shape[0] == observation.shape[0]
+
+        if self.weight_vec_size == 0:
+            observation = observation
+        elif weights is None:
+            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size))])
+        else:
+            observation =  torch.hstack([observation, weights])
+
         return self.critic(observation)
 
     def get_action_distribution(self, observation):
         logits = self.actor(observation)
         return Categorical(logits=logits)
 
-    def sample_action_and_compute_log_prob(self, observations):
+    def sample_action_and_compute_log_prob(self,weights = None, deterministic = False):
+
+        if weights is not None:
+            assert weights.shape[0] == observations.shape[0]
+
+        if self.weight_vec_size == 0:
+            observations = observations
+        elif weights is None:
+            observations = torch.hstack([observations, torch.ones((observations.shape[0], self.weight_vec_size))])
+        else:
+            observations =  torch.hstack([observations, weights])
+
         action_dist = self.get_action_distribution(observations)
         action = action_dist.sample()
         log_prob = action_dist.log_prob(action)
         return action, log_prob
 
-    def compute_action_log_probabilities_and_entropy(self, observations, actions):
+    def compute_action_log_probabilities_and_entropy(self, observations, actions, weights = None):
+
+        if weights is not None:
+            assert weights.shape[0] == observations.shape[0]
+
+        if self.weight_vec_size == 0:
+            observations = observations
+        elif weights is None:
+            observations = torch.hstack([observations, torch.ones((observations.shape[0], self.weight_vec_size))])
+        else:
+            observations =  torch.hstack([observations, weights])
+
         action_dist = self.get_action_distribution(observations)
         log_prob = action_dist.log_prob(actions)
         entropy = action_dist.entropy()
         return log_prob, entropy
-
-class FiLMBlock(nn.Module):
-    def __init__(self, feature_dim, weight_dim):
-        super().__init__()
-        # Generate scale and bias from the weight vector
-        self.film_scale = nn.Linear(weight_dim, feature_dim)
-        self.film_bias = nn.Linear(weight_dim, feature_dim)
-    
-    def forward(self, x, weight):
-        scale = self.film_scale(weight) # unsqueeze if needed to match x shape
-        bias = self.film_bias(weight)
-        return x * scale + bias
-
-class ActorFiLM(nn.Module):
-    def __init__(self, state_dim, weight_dim, action_dim):
-        super().__init__()
-        self.fc1 = nn.Linear(state_dim, 64)
-        self.film1 = FiLMBlock(64, weight_dim)
-        self.fc2 = nn.Linear(64, 64)
-        self.film2 = FiLMBlock(64, weight_dim)
-        self.actor_head = nn.Linear(64, action_dim)
-        self.weight_dim = weight_dim
-    
-    def forward(self, state):
-        
-        weight = state[:, -self.weight_dim:]
-        state = state[:, :self.weight_dim]
-        x = torch.tanh(self.fc1(state))
-        # x = self.film1(x, weight)
-        x = torch.tanh(self.fc2(x))
-        # x = self.film2(x, weight)
-        mean = self.actor_head(x)
-        return mean
-    
-
-class CriticFiLM(nn.Module):
-    def __init__(self, state_dim, weight_dim, reward_dim):
-        super().__init__()
-        self.fc1 = nn.Linear(state_dim, 64)
-        self.film1 = FiLMBlock(64, weight_dim)
-        self.fc2 = nn.Linear(64, 64)
-        self.film2 = FiLMBlock(64, weight_dim)
-        self.critic_head = nn.Linear(64, reward_dim)
-        self.weight_dim = weight_dim
-    
-    def forward(self, state):
-
-        weight = state[:, -self.weight_dim:]
-        state = state[:, :self.weight_dim]
-        
-        x = torch.tanh(self.fc1(state))
-        # x = self.film1(x, weight)
-        x = torch.tanh(self.fc2(x))
-        # x = self.film2(x, weight)
-        mean = self.critic_head(x)
-        return mean
 
 
 class ContinuousAgent(BaseAgent):
@@ -183,22 +172,26 @@ class ContinuousAgent(BaseAgent):
         # self.actor_mean = ActorFiLM(np.array(envs.single_observation_space.shape).prod(), self.weight_vec_size,  np.prod(envs.single_action_space.shape))
         self.critic = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 128)
+                nn.Linear(np.array(envs.single_observation_space.shape).prod()+ self.weight_vec_size, 256)
             ),
             nn.Tanh(),
-            layer_init(nn.Linear(128, 128)),
+            layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(128, self.reward_size), std=1.0),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, self.reward_size), std=1.0),
         )
         self.actor_mean = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod() + self.weight_vec_size, 128)
+                nn.Linear(np.array(envs.single_observation_space.shape).prod() + self.weight_vec_size, 256)
             ),
             nn.Tanh(),
-            layer_init(nn.Linear(128, 128)),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
             layer_init(
-                nn.Linear(128, np.prod(envs.single_action_space.shape)), std=0.01
+                nn.Linear(256, np.prod(envs.single_action_space.shape)), std=0.01
             ),
         )
         self.actor_logstd = nn.Parameter(
@@ -211,15 +204,15 @@ class ContinuousAgent(BaseAgent):
 
     def estimate_value_from_observation(self, observation, weights = None):
         
-        # if weights is not None:
-        #     assert weights.shape[0] == observation.shape[0]
+        if weights is not None:
+            assert weights.shape[0] == observation.shape[0]
 
-        # if self.weight_vec_size == 0:
-        #     observation = observation
-        # elif weights is None:
-        #     observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size))])
-        # else:
-        #     observation =  torch.hstack([observation, weights])
+        if self.weight_vec_size == 0:
+            observation = observation
+        elif weights is None:
+            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size))])
+        else:
+            observation =  torch.hstack([observation, weights])
 
         return self.critic(observation)
 
@@ -252,8 +245,8 @@ class ContinuousAgent(BaseAgent):
             action = action_dist.rsample()
         if self.shield is not None:
             action = self.shield(observation, action)
-        action = torch.clamp(action, torch.Tensor(self.action_space_low).to(action.device), torch.Tensor(self.action_space_high).to(action.device))
-        return action.cpu().numpy(), self.estimate_value_from_observation(obs_critic).cpu().numpy()
+        # action = torch.clamp(action, torch.Tensor(self.action_space_low).to(action.device), torch.Tensor(self.action_space_high).to(action.device))
+        return action.cpu().numpy(), self.estimate_value_from_observation(obs_critic, weight).cpu().numpy()
 
 
     def sample_action_and_compute_log_prob(self, observations, weights = None, deterministic = False):
@@ -262,7 +255,7 @@ class ContinuousAgent(BaseAgent):
             assert weights.shape[0] == observations.shape[0]
 
         if self.weight_vec_size == 0:
-            observation = observations
+            observations = observations
         elif weights is None:
             observations = torch.hstack([observations, torch.ones((observations.shape[0], self.weight_vec_size))])
         else:
@@ -276,7 +269,7 @@ class ContinuousAgent(BaseAgent):
             action = action_dist.rsample()
         if self.shield is not None:
             action = self.shield(observations, action)
-        action = torch.clamp(action, torch.Tensor(self.action_space_low).to(action.device), torch.Tensor(self.action_space_high).to(action.device))
+        # action = torch.clamp(action, torch.Tensor(self.action_space_low).to(action.device), torch.Tensor(self.action_space_high).to(action.device))
         log_prob = action_dist.log_prob(action).sum(1)
         return action, log_prob
 
@@ -286,7 +279,7 @@ class ContinuousAgent(BaseAgent):
             assert weights.shape[0] == observations.shape[0]
 
         if self.weight_vec_size == 0:
-            observation = observations
+            observations = observations
         elif weights is None:
             observations = torch.hstack([observations, torch.ones((observations.shape[0], self.weight_vec_size))])
         else:
@@ -307,3 +300,107 @@ class ContinuousAgent(BaseAgent):
         log_prob = action_dist.log_prob(actions).sum(1)
         entropy = action_dist.entropy().sum(1)
         return log_prob, entropy
+    
+
+
+class CNNDiscreteAgent(BaseAgent):
+    def __init__(self, envs, reward_size = 1):
+        super().__init__()
+        self.reward_size = reward_size
+        self.weight_vec_size = 0 if reward_size == 1 else reward_size
+
+        try:
+            action_space = envs.single_action_space.n
+            observation_space = envs.single_observation_space.shape
+        except:
+            action_space = envs.action_space.n
+            observation_space = envs.observation_space.shape
+
+        self.feature_extractor = WeightFeatureExtractorNet(self.weight_vec_size)
+        with torch.no_grad():
+            observation_space = 512 + 128
+
+        self.critic = nn.Sequential(
+            layer_init(
+                nn.Linear(observation_space, 128)
+            ),
+            nn.Tanh(),
+            layer_init(nn.Linear(128, 128)),
+            nn.Tanh(),
+            layer_init(nn.Linear(128, reward_size), std=1.0),
+        )
+        self.actor = nn.Sequential(
+            layer_init(
+                nn.Linear(observation_space, 128)
+            ),
+            nn.Tanh(),
+            layer_init(nn.Linear(128, 128)),
+            nn.Tanh(),
+            layer_init(nn.Linear(128, action_space), std=0.01),
+        )
+
+    def estimate_value_from_observation(self, observations, weights = None):
+        
+        
+        if weights is not None:
+            assert weights.shape[0] == observations.shape[0]
+        else:
+            weights = torch.ones((observations.shape[0], self.weight_vec_size))
+
+        
+        features = self.feature_extractor(observations, weights)
+        
+
+        return self.critic(features)
+
+    def get_action_distribution(self, observations, weights):
+
+        features = self.feature_extractor(observations, weights)
+        logits = self.actor(features)
+        return Categorical(logits=logits)
+    
+    @torch.no_grad
+    def predict(self, observation, weight = None, deterministic = False, device = "cpu"):
+        
+        if len(observation.shape) == 3:
+            observation = torch.Tensor(observation).reshape(1, *observation.shape)
+            weight.reshape(1, *weight.shape)
+        if weight is not None:
+            assert weight.shape[0] == observation.shape[0]
+        else:
+            weight = torch.ones((observation.shape[0], self.weight_vec_size)).to(device)
+        
+        action_dist = self.get_action_distribution(observation, weight)
+        if deterministic:
+            action = torch.argmax(action_dist.logits, dim = 1)
+        else:
+            action = action_dist.rsample()
+        # action = torch.clamp(action, torch.Tensor(self.action_space_low).to(action.device), torch.Tensor(self.action_space_high).to(action.device))
+        return action.cpu().numpy().astype(int).tolist(), self.estimate_value_from_observation(observation, weight).cpu().numpy()
+
+
+    def sample_action_and_compute_log_prob(self, observations, weights = None, deterministic = False):
+
+        if weights is not None:
+            assert weights.shape[0] == observations.shape[0]
+        else:
+            weights = torch.ones((observations.shape[0], self.weight_vec_size))
+        
+        action_dist = self.get_action_distribution(observations, weights)
+        action = action_dist.sample()
+        log_prob = action_dist.log_prob(action)
+        return action, log_prob
+
+    def compute_action_log_probabilities_and_entropy(self, observations, actions, weights = None):
+
+       
+        if weights is not None:
+            assert weights.shape[0] == observations.shape[0]
+        else:
+            weights = torch.ones((observations.shape[0], self.weight_vec_size))
+        
+        action_dist = self.get_action_distribution(observations, weights)
+        log_prob = action_dist.log_prob(actions)
+        entropy = action_dist.entropy()
+        return log_prob, entropy
+

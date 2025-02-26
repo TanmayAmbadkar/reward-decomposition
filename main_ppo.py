@@ -11,10 +11,11 @@ import torch.optim as optim
 from func_to_script import script
 import imageio
 
-from ppo.agent import ContinuousAgent, DiscreteAgent
+from ppo.agent import ContinuousAgent, DiscreteAgent, CNNDiscreteAgent
 from ppo.ppo import PPO, PPOLogger
 from envs.lunar_lander import LunarLander
 from envs.bipedal_walker import BipedalWalker
+from envs.crafter_env import CrafterEnv
 from envs.utils import SyncVectorEnv, RecordEpisodeStatistics
 import torchbnn as bnn
 
@@ -56,12 +57,13 @@ def load_and_evaluate_model(
 
     obs, _ = eval_envs.reset()
     episodic_returns = []
+
     while len(episodic_returns) < eval_episodes:
         with torch.no_grad():
-            actions, _ = eval_agent.sample_action_and_compute_log_prob(
-                torch.Tensor(obs).to(device), deterministic = True
+            actions, _ = eval_agent.predict(
+                torch.Tensor(obs).to(device), deterministic = True, device = device
             )
-        obs, _, _, _, infos = eval_envs.step(actions.cpu().numpy())
+        obs, _, _, _, infos = eval_envs.step(actions)
         # print(actions)
 
         if "episode" in infos:
@@ -101,11 +103,11 @@ def run_ppo(
     num_rollout_steps: int = 2048,
     update_epochs: int = 10,
     num_minibatches: int = 256,
-    learning_rate: float = 0.00001,
+    learning_rate: float = 0.0003,
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
     surrogate_clip_threshold: float = 0.2,
-    entropy_loss_coefficient: float = 0.0,
+    entropy_loss_coefficient: float = 0.1,
     value_function_loss_coefficient: float = 0.5,
     normalize_advantages: bool = True,
     clip_value_function_loss: bool = False,
@@ -181,8 +183,8 @@ def run_ppo(
     set_seed(seed, torch_deterministic)
 
     # Set up device666
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cpu")
 
     # Create environments
     if env_id == "LunarLander":
@@ -195,20 +197,42 @@ def run_ppo(
     elif env_id == "BipedalWalker":
         envs = SyncVectorEnv(
         [
-            lambda: gym.wrappers.TimeLimit(BipedalWalker(scalar_reward=scalar_reward, render_mode="rgb_array"), max_episode_steps = 1600),
+            lambda:
+                gym.wrappers.TimeLimit(
+                    BipedalWalker(scalar_reward=scalar_reward, render_mode="rgb_array"), 
+                    max_episode_steps = 1600
+                )
+            
         ]*num_envs,
         reward_size = 1 if scalar_reward else 7
+        )
+    elif env_id == "Crafter":
+        envs = SyncVectorEnv(
+        [
+            lambda:
+                gym.wrappers.TimeLimit(
+                    CrafterEnv(scalar_reward=scalar_reward, render_mode="rgb_array"), 
+                    max_episode_steps = 10000
+                )
+            
+        ]*num_envs,
+        reward_size = 1 if scalar_reward else 39
         )
     else:
         raise "ENV NOT FOUND"
     envs = RecordEpisodeStatistics(envs)
 
+    # envs = gym.wrappers.vector.RescaleObservation(envs, min_obs = -1, max_obs = 1)
 # Set up agent
     agent_class = (
-        DiscreteAgent
+        partial(DiscreteAgent, reward_size = envs.env.reward_size)
         if env_is_discrete
         else partial(ContinuousAgent, rpo_alpha=rpo_alpha, reward_size = envs.env.reward_size)
     )
+
+    if env_id == "Crafter":
+        agent_class = partial(CNNDiscreteAgent, reward_size =  envs.env.reward_size)
+
     agent = agent_class(envs).to(device)
 
     optimizer = optim.Adam(agent.parameters(), lr=learning_rate, eps=1e-5)
@@ -234,6 +258,7 @@ def run_ppo(
         target_kl=target_kl,
         anneal_lr=anneal_lr,
         envs=envs,
+        env_is_discrete=env_is_discrete,
         seed=seed,
         logger=logger
     )

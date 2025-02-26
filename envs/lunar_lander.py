@@ -307,7 +307,7 @@ class LunarLander(gym.Env, EzPickle):
             # Nop, fire left engine, main engine, right engine
             self.action_space = spaces.Discrete(4)
 
-        self.render_mode = render_mode
+        self.render_mode = "rgb_array"
         self.scalar_reward = scalar_reward
 
     def _destroy(self):
