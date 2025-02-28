@@ -446,7 +446,7 @@ class RecordEpisodeStatistics(VectorWrapper):
         self.prev_dones = dones = np.logical_or(terminations, truncations)
         num_dones = np.sum(dones)
 
-        if num_dones:
+        if dones.any():
             if self._stats_key in infos or f"_{self._stats_key}" in infos:
                 raise ValueError(
                     f"Attempted to add episode stats when they already exist, info keys: {list(infos.keys())}"

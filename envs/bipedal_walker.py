@@ -604,12 +604,11 @@ class BipedalWalker(gym.Env, EzPickle):
             # normalized to about -50.0 using heuristic, more optimal agent should spend less
 
         terminated = False
+        reward.append(0)
         if self.game_over or pos[0] < 0:
             terminated = True
             reward = [0]*7
             reward[-1] = -100
-        else:
-            reward.append(0)
         if pos[0] > (TERRAIN_LENGTH - TERRAIN_GRASS) * TERRAIN_STEP:
             terminated = True
 
@@ -891,7 +890,7 @@ def demo_heuristic_walker(env, seed=None, render=False):
 
 
 if __name__ == "__main__":
-    env = BipedalWalker(render_mode="rgb_array")
+    env = BipedalWalker(render_mode="rgb_array", scalar_reward=True)
     env.reset()
     steps = 0
     total_reward = 0
