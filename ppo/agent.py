@@ -202,7 +202,7 @@ class ContinuousAgent(BaseAgent):
         self.action_space_low = envs.single_action_space.low
         self.action_space_high = envs.single_action_space.high
 
-    def estimate_value_from_observation(self, observation, weights = None):
+    def estimate_value_from_observation(self, observation, weights = None, device = "cpu"):
         
         if weights is not None:
             assert weights.shape[0] == observation.shape[0]
@@ -210,7 +210,7 @@ class ContinuousAgent(BaseAgent):
         if self.weight_vec_size == 0:
             observation = observation
         elif weights is None:
-            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size))])
+            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size)).to(device)])
         else:
             observation =  torch.hstack([observation, weights])
 
@@ -225,17 +225,19 @@ class ContinuousAgent(BaseAgent):
         return action_dist
     
     @torch.no_grad
-    def predict(self, observation, weight = None, deterministic = False):
-
-        observation = torch.Tensor(observation).reshape(1, -1)
+    def predict(self, observation, weight = None, deterministic = False, device = "cpu"):
+        
+        observation = torch.Tensor(observation)
+        if len(observation.shape) == 1:
+            observation = observation.reshape(-1, observation.shape[0])
         obs_critic = observation.clone()
         if self.weight_vec_size == 0:
             observation = observation
         elif weight is None:
-            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size))])
+            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size)).to(device)])
         else:
-            weight = torch.Tensor(weight).reshape(1, -1)
-            observation =  torch.hstack([observation, weight])
+            weight = torch.Tensor(weight).reshape(observation.shape[0], -1).to(device)
+            observation =  torch.hstack([observation, weight.to(device)])
 
         action_dist = self.get_action_distribution(observation)
 
@@ -246,7 +248,7 @@ class ContinuousAgent(BaseAgent):
         if self.shield is not None:
             action = self.shield(observation, action)
         # action = torch.clamp(action, torch.Tensor(self.action_space_low).to(action.device), torch.Tensor(self.action_space_high).to(action.device))
-        return action.cpu().numpy(), self.estimate_value_from_observation(obs_critic, weight).cpu().numpy()
+        return action.cpu().numpy(), self.estimate_value_from_observation(obs_critic, weight, device).cpu().numpy()
 
 
     def sample_action_and_compute_log_prob(self, observations, weights = None, deterministic = False):

@@ -108,7 +108,7 @@ def run_ppo(
     gae_lambda: float = 0.95,
     surrogate_clip_threshold: float = 0.2,
     entropy_loss_coefficient: float = 0.1,
-    value_function_loss_coefficient: float = 0.5,
+    value_function_loss_coefficient: float = 50,
     normalize_advantages: bool = True,
     clip_value_function_loss: bool = False,
     max_grad_norm: float = 0.5,

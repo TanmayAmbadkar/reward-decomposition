@@ -20,7 +20,7 @@ env =SyncVectorEnv(
 
 
 eval_agent = ContinuousAgent(env, reward_size=8)
-eval_agent.load_state_dict(torch.load("runs/LunarLander__main_ppo__2025-02-24 20:00:10.501470__100/main_ppo.rl_model"))
+eval_agent.load_state_dict(torch.load("runs/LunarLander__main_ppo__2025-02-26 20:34:33.618312__100/main_ppo.rl_model"))
 eval_agent.eval()
 env = LunarLander(continuous = True)
 
@@ -30,10 +30,10 @@ done = False
 trunc = False
 weight = np.zeros(8)
 # weight[[0, 1]] = 0
-weight[0] = 1
-weight[1] = -1
+weight[0] = 0.9
+weight[1] = 0.7
 weight[2] = 0
-weight[[3, 4]] = 1
+weight[[3, 4]] = 0.5
 weight[[5, 6]] = 1
 weight[-1] = 1
 frames = []

@@ -362,7 +362,7 @@ class PPO:
         ) = self._initialize_storage()    
         if current_weights is None:
             if self.reward_size != 1:
-                weights = torch.distributions.categorical.Categorical(logits = torch.Tensor([1.0, 1.0, 1.0])).sample((self.num_envs, self.reward_size)).to(self.device).type(torch.float32) - 1
+                weights = torch.distributions.uniform.Uniform(low=-1, high=1).sample((self.num_envs, self.reward_size)).to(self.device).type(torch.float32) - 1
             else:
                 weights = torch.ones(self.num_envs, 1).to(self.device).type(torch.float32)
         else:

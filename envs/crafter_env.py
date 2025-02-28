@@ -219,6 +219,6 @@ if __name__ == "__main__":
     state, rew, done, trunc, info = env.step(env.action_space.sample())
     # plt.imshow(state
     # plt.savefig(f"semantic_{i}.png")
-    print(len(rew))
-    print(info)
+    print(rew)
+    # print(info)
     i+=1

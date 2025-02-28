@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lunar Lander Simulation</title>
+  <!-- Bootstrap CSS -->
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+  <style>
+    .value-display {
+      font-weight: bold;
+    }
+    .slider-container {
+      margin-bottom: 1rem;
+    }
+    /* Optionally constrain the plot image height */
+    #plotFeed {
+      max-height: 300px;
+      object-fit: contain;
+    }
+  </style>
+</head>
+<body>
+  <div class="container my-4">
+    <h1 class="text-center mb-4">Lunar Lander Simulation</h1>
+    <div class="row">
+      <!-- Simulation Feed Column -->
+      <div class="col-md-4">
+        <div class="card">
+          <div class="card-header">Simulation Feed</div>
+          <div class="card-body text-center">
+            <img src="{{ url_for('render_feed') }}" class="img-fluid" alt="Simulation Feed">
+          </div>
+        </div>
+      </div>
+      <!-- Accumulated Reward Plot Column -->
+      <div class="col-md-4">
+        <div class="card">
+          <div class="card-header">Accumulated Reward Plot</div>
+          <div class="card-body text-center">
+            <img id="plotFeed" src="{{ url_for('plot_feed') }}" class="img-fluid" alt="Reward Plot">
+          </div>
+        </div>
+      </div>
+      <!-- Weight Sliders Column -->
+      <div class="col-md-4">
+        <div class="card">
+          <div class="card-header">Adjust Weights</div>
+          <div class="card-body">
+            <form id="weightForm" method="POST" action="/update_weights">
+              <div class="form-group slider-container">
+                <div class="d-flex justify-content-between align-items-center">
+                  <label for="w_distance" class="mb-0">Distance:</label>
+                  <span class="value-display" id="display_w_distance">{{ weights[0] }}</span>
+                </div>
+                <input type="range" class="form-control-range" id="w_distance" name="w_distance" min="-1" max="1" step="0.1" value="{{ weights[0] }}">
+              </div>
+              <div class="form-group slider-container">
+                <div class="d-flex justify-content-between align-items-center">
+                  <label for="w_speed" class="mb-0">Speed:</label>
+                  <span class="value-display" id="display_w_speed">{{ weights[1] }}</span>
+                </div>
+                <input type="range" class="form-control-range" id="w_speed" name="w_speed" min="-1" max="1" step="0.1" value="{{ weights[1] }}">
+              </div>
+              <div class="form-group slider-container">
+                <div class="d-flex justify-content-between align-items-center">
+                  <label for="w_tilt" class="mb-0">Tilt:</label>
+                  <span class="value-display" id="display_w_tilt">{{ weights[2] }}</span>
+                </div>
+                <input type="range" class="form-control-range" id="w_tilt" name="w_tilt" min="-1" max="1" step="0.1" value="{{ weights[2] }}">
+              </div>
+              <div class="form-group slider-container">
+                <div class="d-flex justify-content-between align-items-center">
+                  <label for="w_leg1" class="mb-0">Leg 1:</label>
+                  <span class="value-display" id="display_w_leg1">{{ weights[3] }}</span>
+                </div>
+                <input type="range" class="form-control-range" id="w_leg1" name="w_leg1" min="-1" max="1" step="0.1" value="{{ weights[3] }}">
+              </div>
+              <div class="form-group slider-container">
+                <div class="d-flex justify-content-between align-items-center">
+                  <label for="w_leg2" class="mb-0">Leg 2:</label>
+                  <span class="value-display" id="display_w_leg2">{{ weights[4] }}</span>
+                </div>
+                <input type="range" class="form-control-range" id="w_leg2" name="w_leg2" min="-1" max="1" step="0.1" value="{{ weights[4] }}">
+              </div>
+              <div class="form-group slider-container">
+                <div class="d-flex justify-content-between align-items-center">
+                  <label for="w_main_engine" class="mb-0">Main Engine:</label>
+                  <span class="value-display" id="display_w_main_engine">{{ weights[5] }}</span>
+                </div>
+                <input type="range" class="form-control-range" id="w_main_engine" name="w_main_engine" min="-1" max="1" step="0.1" value="{{ weights[5] }}">
+              </div>
+              <div class="form-group slider-container">
+                <div class="d-flex justify-content-between align-items-center">
+                  <label for="w_side_engine" class="mb-0">Side Engine:</label>
+                  <span class="value-display" id="display_w_side_engine">{{ weights[6] }}</span>
+                </div>
+                <input type="range" class="form-control-range" id="w_side_engine" name="w_side_engine" min="-1" max="1" step="0.1" value="{{ weights[6] }}">
+              </div>
+              <div class="form-group slider-container">
+                <div class="d-flex justify-content-between align-items-center">
+                  <label for="w_success" class="mb-0">Success:</label>
+                  <span class="value-display" id="display_w_success">{{ weights[7] }}</span>
+                </div>
+                <input type="range" class="form-control-range" id="w_success" name="w_success" min="-1" max="1" step="0.1" value="{{ weights[7] }}">
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+      
+      
+  <!-- JavaScript: AJAX weight updates and auto-refresh plot -->
+  <script>
+    // Attach input event listener to all slider elements.
+    // Attach input event listener to all slider elements.
+    const sliders = document.querySelectorAll('input[type="range"]');
+    sliders.forEach(slider => {
+    slider.addEventListener('input', function() {
+        // Update the corresponding value display using the slider's ID.
+        let display = document.getElementById('display_' + this.id);
+        if (display) {
+        display.innerText = this.value;
+        }
+        // Create FormData from the slider form.
+        const formData = new FormData(document.getElementById('weightForm'));
+        // Send updated weights via AJAX.
+        fetch('/update_weights', {
+        method: 'POST',
+        body: formData
+        })
+        .then(response => response.json())
+        .then(data => console.log('Weights updated:', data))
+        .catch(error => console.error('Error updating weights:', error));
+    });
+    });
+    // Auto-refresh the plot image every second.
+    setInterval(function() {
+      const plotImg = document.getElementById('plotFeed');
+      plotImg.src = "{{ url_for('plot_feed') }}" + "?t=" + new Date().getTime();
+    }, 1000);
+  </script>
+
+  <!-- Bootstrap JS and dependencies -->
+  <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"></script>
+  <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+</body>
+</html>
