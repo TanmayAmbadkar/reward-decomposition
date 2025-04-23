@@ -56,13 +56,13 @@ class ResNet(nn.Module):
         # Build layers. Note: using stride 2 to downsample.
         self.layer1 = self._make_layer(block, 64,  num_blocks[0], stride=1)  # 64x64
         self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)  # 32x32
-        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)  # 16x16
-        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)  # 8x8
+        # self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)  # 16x16
+        # self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)  # 8x8
         
         # Global average pooling to reduce spatial dimensions to 1x1.
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         # Fully connected layer to produce the final flattened output.
-        self.fc = nn.Linear(512 * block.expansion, output_dim)
+        self.fc = nn.Linear(128 * block.expansion, output_dim)
 
     def _make_layer(self, block, planes, num_blocks, stride):
         """
@@ -80,8 +80,8 @@ class ResNet(nn.Module):
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
+        # out = self.layer3(out)
+        # out = self.layer4(out)
         out = self.avgpool(out)           # shape: [batch, 512, 1, 1]
         out = out.view(out.size(0), -1)     # flatten to [batch, 512]
         out = self.fc(out)                # final flattened output vector

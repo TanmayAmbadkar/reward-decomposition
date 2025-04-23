@@ -37,11 +37,11 @@ class PPOLogger:
     def log_rollout_step(self, infos, global_step):
         self.global_steps.append(global_step)
         if "episode" in infos:
-            non_zero_rews = infos['episode']['r'][np.nonzero(infos['episode']['r'])[0]]
-            non_zero_lens = infos['episode']['l'][np.nonzero(infos['episode']['l'])[0]]
+            non_zero_rews = infos['episode']['r'][infos['_episode']]
+            non_zero_lens = infos['episode']['l'][infos['_episode']]
             non_zero_comps = []
             for i in range(self.reward_size):
-                non_zero_comps.append(infos['episode'][f'r_{i}'][np.nonzero(infos['episode'][f'r_{i}'])[0]])
+                non_zero_comps.append(infos['episode'][f'r'][infos['_episode']][:,i].mean())
             print(
                 f"global_step={global_step}, episodic_return={non_zero_rews.mean()}",
                 flush=True,
@@ -109,6 +109,7 @@ class PPO:
         gae_lambda=0.95,
         surrogate_clip_threshold=0.2,
         entropy_loss_coefficient=0.001,
+        policy_gradient_loss_coefficient=2.0,
         value_function_loss_coefficient=0.5,
         max_grad_norm=0.5,
         update_epochs=10,
@@ -195,6 +196,7 @@ class PPO:
         self.gae_lambda = gae_lambda
         self.surrogate_clip_threshold = surrogate_clip_threshold
         self.entropy_loss_coefficient = entropy_loss_coefficient
+        self.policy_gradient_loss_coefficient = policy_gradient_loss_coefficient
         self.value_function_loss_coefficient = value_function_loss_coefficient
         self.max_grad_norm = max_grad_norm
         self.update_epochs = update_epochs
@@ -362,9 +364,11 @@ class PPO:
         ) = self._initialize_storage()    
         if current_weights is None:
             if self.reward_size != 1:
-                weights = torch.distributions.uniform.Uniform(low=-1, high=1).sample((self.num_envs, self.reward_size)).to(self.device).type(torch.float32) - 1
+                weights = torch.distributions.uniform.Uniform(low=0, high=1).sample((self.num_envs, self.reward_size)).to(self.device).type(torch.float32)
+                # weights = torch.softmax(weights, dim = 1)
             else:
                 weights = torch.ones(self.num_envs, 1).to(self.device).type(torch.float32)
+                # weights = torch.softmax(weights, dim = 1)
         else:
             weights = current_weights
 
@@ -383,7 +387,9 @@ class PPO:
             change_weights = torch.logical_or(is_next_observation_terminal.type(torch.bool), is_next_observation_truncated.type(torch.bool))
             if self.reward_size != 1 and change_weights.any():
                 # print(weights)   
-                weights[change_weights] = torch.distributions.categorical.Categorical(logits = torch.Tensor([1.0, 1.0, 1.0])).sample(weights[change_weights].shape).to(self.device).type(torch.float32) - 1   
+                weights[change_weights] = torch.distributions.uniform.Uniform(low=0, high=1).sample(weights[change_weights].shape).to(self.device).type(torch.float32)
+                # weights[change_weights] = torch.softmax(weights[change_weights], dim = 1)
+
                 # weights[:,-1] = 1.0
                 # weights = torch.ones((self.num_envs, self.reward_size)).to(self.device).type(torch.float32)
 
@@ -443,7 +449,7 @@ class PPO:
         with torch.no_grad():
             next_value = self.agent.estimate_value_from_observation(
                 next_observation, weights
-            ).reshape(self.num_envs)
+            ).reshape(self.num_envs, self.reward_size)
 
             advantages, returns = self.compute_advantages(
                 rewards[:self.num_rollout_steps],
@@ -502,7 +508,7 @@ class PPO:
         action_log_probabilities = torch.zeros(
             (self.num_rollout_steps, self.num_envs)
         ).to(self.device)
-        rewards = torch.zeros((self.num_rollout_steps, self.num_envs)).to(self.device)
+        rewards = torch.zeros((self.num_rollout_steps, self.num_envs, self.reward_size)).to(self.device)
         is_episode_terminated = torch.zeros((self.num_rollout_steps, self.num_envs)).to(
             self.device
         )
@@ -739,6 +745,7 @@ class PPO:
                 mask = (weights != 0).type(torch.float32)
                 
                 # minibatch_advantages = mask*minibatch_advantages
+                
 
                 if self.normalize_advantages:
                     # minibatch_advantages = mask * minibatch_advantages
@@ -752,6 +759,7 @@ class PPO:
                 policy_gradient_loss = self.calculate_policy_gradient_loss(
                     minibatch_advantages, probability_ratio.reshape(-1, 1)
                 )
+
                 value_function_loss = self.calculate_value_function_loss(
                     new_value,
                     computed_returns,
@@ -764,7 +772,7 @@ class PPO:
 
                 # Combine losses: minimize policy and value losses, maximize entropy
                 loss = (
-                    policy_gradient_loss
+                    self.policy_gradient_loss_coefficient*policy_gradient_loss
                     - self.entropy_loss_coefficient
                     * entropy_loss  # subtraction here to maximise entropy (exploration)
                     + value_function_loss * self.value_function_loss_coefficient
@@ -915,7 +923,7 @@ class PPO:
             # L^VF_unclipped = (V_θ(s_t) - R_t)^2
             # This is the standard MSE loss, pushing the value estimate
             # towards the actual observed returns.
-            unclipped_vf_loss = (new_value - computed_returns[minibatch_indices]) ** 2
+            unclipped_vf_loss = (new_value - mask * computed_returns[minibatch_indices]) ** 2
 
             # V_clipped = V_old(s_t) + clip(V_θ(s_t) - V_old(s_t), -ε, ε)
             # This limits how much the value estimate can change from its
@@ -931,7 +939,7 @@ class PPO:
 
             # L^VF_clipped = (V_clipped - R_t)^2
             # This loss encourages updates within the clipped range, preventing drastic changes to the value function.
-            clipped_vf_loss = (clipped_value - computed_returns[minibatch_indices]) ** 2
+            clipped_vf_loss = (clipped_value - mask * computed_returns[minibatch_indices]) ** 2
 
             # L^VF = max(L^VF_unclipped, L^VF_clipped)
             # By taking the maximum, we choose the more pessimistic (larger) loss.
@@ -948,7 +956,7 @@ class PPO:
             # Intuition: Without clipping, we directly encourage the value function
             # to predict the observed returns as accurately as possible.
             value_function_loss = (
-                0.5 * ((new_value - computed_returns[minibatch_indices]) ** 2).mean()
+                0.5 * ((new_value - mask * computed_returns[minibatch_indices]) ** 2).mean()
             )
 
         return value_function_loss

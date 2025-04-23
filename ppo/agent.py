@@ -83,10 +83,10 @@ class DiscreteAgent(BaseAgent):
         self.weight_vec_size = 0 if reward_size == 1 else reward_size
 
         try:
-            action_space = envs.single_observation_space.n
+            action_space = envs.single_action_space.n
             observation_space = envs.single_observation_space.shape
         except:
-            action_space = envs.observation_space.n
+            action_space = envs.action_space.n
             observation_space = envs.observation_space.shape
 
 
@@ -109,7 +109,7 @@ class DiscreteAgent(BaseAgent):
             layer_init(nn.Linear(64, action_space), std=0.01),
         )
 
-    def estimate_value_from_observation(self, observation, weights = None):
+    def estimate_value_from_observation(self, observation, weights = None, device = "cpu"):
         
         if weights is not None:
             assert weights.shape[0] == observation.shape[0]
@@ -127,7 +127,7 @@ class DiscreteAgent(BaseAgent):
         logits = self.actor(observation)
         return Categorical(logits=logits)
 
-    def sample_action_and_compute_log_prob(self,weights = None, deterministic = False):
+    def sample_action_and_compute_log_prob(self, observations, weights = None, deterministic = False):
 
         if weights is not None:
             assert weights.shape[0] == observations.shape[0]
@@ -160,6 +160,31 @@ class DiscreteAgent(BaseAgent):
         log_prob = action_dist.log_prob(actions)
         entropy = action_dist.entropy()
         return log_prob, entropy
+    
+    @torch.no_grad
+    def predict(self, observation, weight = None, deterministic = False, device = "cpu"):
+        
+        observation = torch.Tensor(observation).to(device)
+        if len(observation.shape) == 1:
+            observation = observation.reshape(-1, observation.shape[0])
+        obs_critic = observation.clone()
+        if self.weight_vec_size == 0:
+            observation = observation
+        elif weight is None:
+            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size)).to(device)])
+        else:
+            weight = torch.Tensor(weight).reshape(observation.shape[0], -1).to(device)
+            observation =  torch.hstack([observation, weight.to(device)])
+
+        action_dist = self.get_action_distribution(observation)
+
+        if deterministic:
+            action = action_dist.logits.argmax(dim=1)
+        else:
+            action = action_dist.sample()
+        # action = torch.clamp(action, torch.Tensor(self.action_space_low).to(action.device), torch.Tensor(self.action_space_high).to(action.device))
+        return action.cpu().numpy(), self.estimate_value_from_observation(obs_critic, weight, device).cpu().numpy()
+
 
 
 class ContinuousAgent(BaseAgent):
@@ -227,7 +252,7 @@ class ContinuousAgent(BaseAgent):
     @torch.no_grad
     def predict(self, observation, weight = None, deterministic = False, device = "cpu"):
         
-        observation = torch.Tensor(observation)
+        observation = torch.Tensor(observation).to(device)
         if len(observation.shape) == 1:
             observation = observation.reshape(-1, observation.shape[0])
         obs_critic = observation.clone()
@@ -364,9 +389,14 @@ class CNNDiscreteAgent(BaseAgent):
     @torch.no_grad
     def predict(self, observation, weight = None, deterministic = False, device = "cpu"):
         
+        observation = torch.Tensor(observation).to(device)
+        weight = torch.Tensor(weight).to(device)
         if len(observation.shape) == 3:
-            observation = torch.Tensor(observation).reshape(1, *observation.shape)
-            weight.reshape(1, *weight.shape)
+            observation = observation.reshape(1, *observation.shape)
+            weight = weight.reshape(1, *weight.shape)
+        elif len(weight.shape) == 1:   
+            weight = weight.reshape(1, *weight.shape)
+        # print(observation.shape, weight.shape)
         if weight is not None:
             assert weight.shape[0] == observation.shape[0]
         else:
@@ -374,6 +404,7 @@ class CNNDiscreteAgent(BaseAgent):
         
         action_dist = self.get_action_distribution(observation, weight)
         if deterministic:
+            print(action_dist.logits)
             action = torch.argmax(action_dist.logits, dim = 1)
         else:
             action = action_dist.rsample()

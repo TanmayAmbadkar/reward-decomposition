@@ -220,5 +220,5 @@ if __name__ == "__main__":
     # plt.imshow(state
     # plt.savefig(f"semantic_{i}.png")
     print(rew)
-    # print(info)
+    print(info)
     i+=1

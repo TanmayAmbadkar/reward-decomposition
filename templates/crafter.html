@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Crafter Environment Simulation</title>
+  <!-- Bootstrap CSS -->
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+  <style>
+    .value-display {
+      font-weight: bold;
+    }
+    .slider-container {
+      margin-bottom: 1rem;
+    }
+    /* Optionally constrain the plot image height */
+    #plotFeed {
+      max-height: 300px;
+      object-fit: contain;
+    }
+    /* Make sliders scrollable if there are many */
+    #sliderPanel {
+      max-height: 80vh;
+      overflow-y: auto;
+    }
+  </style>
+</head>
+<body>
+  <div class="container my-4">
+    <h1 class="text-center mb-4">Crafter Environment Simulation</h1>
+    <div class="row">
+      <!-- Simulation Feed Column -->
+      <div class="col-md-4">
+        <div class="card">
+          <div class="card-header">Simulation Feed</div>
+          <div class="card-body text-center">
+            <img src="{{ url_for('render_feed') }}" class="img-fluid" alt="Simulation Feed">
+          </div>
+        </div>
+      </div>
+      <!-- Accumulated Reward Plot Column -->
+      <div class="col-md-4">
+        <div class="card">
+          <div class="card-header">Accumulated Reward Plot</div>
+          <div class="card-body text-center">
+            <img src="{{ url_for('reward_plot_stream') }}" class="img-fluid" alt="Reward Plot">
+          </div>
+        </div>
+      </div>
+      <!-- Weight Sliders Column -->
+      <div class="col-md-4">
+        <div class="card">
+          <div class="card-header">Adjust Weights</div>
+          <div class="card-body" id="sliderPanel">
+            <form id="weightForm" method="POST" action="/update_weights">
+              {% for key, value in weights.items() %}
+              <div class="form-group slider-container">
+                <div class="d-flex justify-content-between align-items-center">
+                  <label for="{{ key }}" class="mb-0">{{ key }}:</label>
+                  <span class="value-display" id="display_{{ key }}">{{ value }}</span>
+                </div>
+                <input type="range" class="form-control-range" id="{{ key }}" name="{{ key }}" min="-1" max="1" step="0.1" value="{{ value }}">
+              </div>
+              {% endfor %}
+            </form>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- JavaScript: AJAX weight updates and auto-refresh plot -->
+  <script>
+    // Update slider value display and send AJAX update on input.
+    const sliders = document.querySelectorAll('input[type="range"]');
+    sliders.forEach(slider => {
+      slider.addEventListener('input', function() {
+        let display = document.getElementById('display_' + this.id);
+        if (display) {
+          display.innerText = this.value;
+        }
+        const formData = new FormData(document.getElementById('weightForm'));
+        fetch('/update_weights', {
+          method: 'POST',
+          body: formData
+        })
+        .then(response => response.json())
+        .then(data => console.log('Weights updated:', data))
+        .catch(error => console.error('Error updating weights:', error));
+      });
+    });
+    // Auto-refresh the reward plot image every 500 ms.
+    setInterval(function() {
+      const plotImg = document.getElementById('plotFeed');
+      plotImg.src = "{{ url_for('plot_feed') }}" + "?t=" + new Date().getTime();
+    }, 500);
+  </script>
+
+  <!-- Bootstrap JS and dependencies -->
+  <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"></script>
+  <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+</body>
+</html>

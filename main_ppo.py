@@ -18,6 +18,8 @@ from envs.bipedal_walker import BipedalWalker
 from envs.crafter_env import CrafterEnv
 from envs.utils import SyncVectorEnv, RecordEpisodeStatistics
 import torchbnn as bnn
+import mo_gymnasium as mo_gym
+
 
 def set_seed(seed, torch_deterministic=True):
     random.seed(seed)
@@ -105,8 +107,9 @@ def run_ppo(
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
     surrogate_clip_threshold: float = 0.2,
-    entropy_loss_coefficient: float = 0.1,
-    value_function_loss_coefficient: float = 50,
+    entropy_loss_coefficient: float = 0.01,
+    policy_gradient_loss_coefficient: float = 2.0,
+    value_function_loss_coefficient: float = 0.1,
     normalize_advantages: bool = True,
     clip_value_function_loss: bool = False,
     max_grad_norm: float = 0.5,
@@ -116,7 +119,7 @@ def run_ppo(
     seed: int = 1,
     torch_deterministic: bool = True,
     capture_video: bool = False,
-    use_tensorboard: bool = False,
+    use_tensorboard: bool = True,
     save_model: bool = True,
 ):
     """
@@ -176,8 +179,6 @@ def run_ppo(
     # Set up run name and logging
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     run_name = f"{env_id}__{exp_name}__{datetime.now()}__{seed}"
-    print(exp_name, scalar_reward)
-
     set_seed(seed, torch_deterministic)
 
     # Set up device666
@@ -185,60 +186,63 @@ def run_ppo(
     # device = torch.device("cpu")
 
     # Create environments
-    if env_id == "LunarLander":
-        envs = SyncVectorEnv(
-        [
-            lambda: gym.wrappers.TimeLimit(LunarLander(continuous = True, scalar_reward=scalar_reward, render_mode="rgb_array"), max_episode_steps = 500),
-        ]*num_envs,
-        reward_size = 1 if scalar_reward else 8
-        )
-    elif env_id == "BipedalWalker":
-        envs = SyncVectorEnv(
-        [
-            lambda:
-                gym.wrappers.TimeLimit(
-                    BipedalWalker(scalar_reward=scalar_reward, render_mode="rgb_array"), 
-                    max_episode_steps = 1600
-                )
+    # if env_id == "LunarLander":
+    #     envs = 
+    # elif env_id == "BipedalWalker":
+    #     envs = SyncVectorEnv(
+    #     [
+    #         lambda:
+    #             gym.wrappers.TimeLimit(
+    #                 BipedalWalker(scalar_reward=scalar_reward, render_mode="rgb_array"), 
+    #                 max_episode_steps = 1600
+    #             )
             
-        ]*num_envs,
-        reward_size = 1 if scalar_reward else 7
-        )
-    elif env_id == "Crafter":
-        envs = SyncVectorEnv(
-        [
-            lambda:
-                gym.wrappers.TimeLimit(
-                    CrafterEnv(scalar_reward=scalar_reward, render_mode="rgb_array"), 
-                    max_episode_steps = 10000
-                )
+    #     ]*num_envs,
+    #     reward_size = 1 if scalar_reward else 7
+    #     )
+    # elif env_id == "Crafter":
+    #     envs = SyncVectorEnv(
+    #     [
+    #         lambda:
+    #             gym.wrappers.TimeLimit(
+    #                 CrafterEnv(scalar_reward=scalar_reward, render_mode="rgb_array"), 
+    #                 max_episode_steps = 10000
+    #             )
             
-        ]*num_envs,
-        reward_size = 1 if scalar_reward else 39
-        )
-    else:
-        raise "ENV NOT FOUND"
-    envs = RecordEpisodeStatistics(envs)
+    #     ]*num_envs,
+    #     reward_size = 1 if scalar_reward else 39
+    #     )
+    # else:
+    #     raise "ENV NOT FOUND"
+    # envs = RecordEpisodeStatistics(envs)
+
+    envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+        lambda: mo_gym.make(env_id) for _ in range(num_envs)
+    )
+    envs = mo_gym.wrappers.vector.MORecordEpisodeStatistics(envs)
+
+    print(exp_name, scalar_reward, envs.rewards_shape)
+
 
     # envs = gym.wrappers.vector.RescaleObservation(envs, min_obs = -1, max_obs = 1)
 # Set up agent
     agent_class = (
-        partial(DiscreteAgent, reward_size = envs.env.reward_size)
+        partial(DiscreteAgent, reward_size = envs.rewards_shape[-1])
         if env_is_discrete
-        else partial(ContinuousAgent, rpo_alpha=rpo_alpha, reward_size = envs.env.reward_size)
+        else partial(ContinuousAgent, rpo_alpha=rpo_alpha, reward_size = envs.rewards_shape[-1])
     )
 
-    if env_id == "Crafter":
-        agent_class = partial(CNNDiscreteAgent, reward_size =  envs.env.reward_size)
+    if "mario" in env_id or "rgb" in env_id:
+        agent_class = partial(CNNDiscreteAgent, reward_size = envs.rewards_shape[-1])
 
     agent = agent_class(envs).to(device)
 
     optimizer = optim.Adam(agent.parameters(), lr=learning_rate, eps=1e-5)
 
-    logger = PPOLogger(run_name, use_tensorboard, envs.env.reward_size)
+    logger = PPOLogger(run_name, use_tensorboard, reward_size = envs.rewards_shape[-1])
     ppo = PPO(
         agent=agent,
-        reward_size = envs.env.reward_size,
+        reward_size = envs.rewards_shape[-1],
         optimizer=optimizer,
         learning_rate=learning_rate,
         num_rollout_steps=num_rollout_steps,
@@ -248,6 +252,7 @@ def run_ppo(
         surrogate_clip_threshold=surrogate_clip_threshold,
         entropy_loss_coefficient=entropy_loss_coefficient,
         value_function_loss_coefficient=value_function_loss_coefficient,
+        policy_gradient_loss_coefficient = policy_gradient_loss_coefficient,
         max_grad_norm=max_grad_norm,
         update_epochs=update_epochs,
         num_minibatches=num_minibatches,

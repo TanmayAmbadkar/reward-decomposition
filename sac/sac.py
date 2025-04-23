@@ -7,23 +7,26 @@ from sac.networks import GaussianPolicy, QNetwork, DeterministicPolicy
 
 
 class SAC(object):
-    def __init__(self, num_inputs, action_space, reward_size, gamma, tau, alpha, policy, target_update_interval, cuda, hidden_size, lr):
+    def __init__(self, state_space, action_space, reward_size, gamma, tau, alpha, policy, automatic_entropy_tuning, target_update_interval, cuda, hidden_size, lr):
 
         self.gamma = gamma
         self.tau = tau
         self.alpha = alpha
         self.reward_size = reward_size
+        self.state_space = state_space
+        self.reward_size = reward_size
+        self.action_space = action_space
 
         self.policy_type = policy
         self.target_update_interval = target_update_interval
-        self.automatic_entropy_tuning = target_update_interval
+        self.automatic_entropy_tuning = automatic_entropy_tuning
 
         self.device = torch.device("cuda" if cuda else "cpu")
 
-        self.critic = QNetwork(num_inputs, action_space.shape[0], hidden_size, reward_size).to(device=self.device)
+        self.critic = QNetwork(state_space.shape[0] + self.reward_size, action_space.shape[0], hidden_size, reward_size).to(device=self.device)
         self.critic_optim = Adam(self.critic.parameters(), lr=lr)
 
-        self.critic_target = QNetwork(num_inputs, action_space.shape[0], hidden_size, reward_size).to(self.device)
+        self.critic_target = QNetwork(state_space.shape[0] + self.reward_size, action_space.shape[0], hidden_size, reward_size).to(self.device)
         hard_update(self.critic_target, self.critic)
 
         if self.policy_type == "Gaussian":
@@ -33,22 +36,29 @@ class SAC(object):
                 self.log_alpha = torch.zeros(self.reward_size, requires_grad=True, device=self.device)
                 self.alpha_optim = Adam([self.log_alpha], lr=lr)
 
-            self.policy = GaussianPolicy(num_inputs, action_space.shape[0], hidden_size, action_space).to(self.device)
+            self.policy = GaussianPolicy(state_space.shape[0] + self.reward_size, action_space.shape[0], hidden_size, action_space).to(self.device)
             self.policy_optim = Adam(self.policy.parameters(), lr=lr)
 
         else:
             self.alpha = 0
             self.automatic_entropy_tuning = False
-            self.policy = DeterministicPolicy(num_inputs, action_space.shape[0], hidden_size, action_space).to(self.device)
+            self.policy = DeterministicPolicy(state_space.shape[0] + self.reward_size, action_space.shape[0], hidden_size, action_space).to(self.device)
             self.policy_optim = Adam(self.policy.parameters(), lr=lr)
 
     def select_action(self, state, evaluate=False):
-        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+        ndim = state.ndim
+        if state.ndim == 1:
+            state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+        else:
+            state = torch.FloatTensor(state).to(self.device)    
         if evaluate is False:
             action, _, _ = self.policy.sample(state)
         else:
             _, _, action = self.policy.sample(state)
-        return action.detach().cpu().numpy()[0]
+
+        if ndim == 1:
+            action = action.squeeze(0)
+        return action.detach().cpu().numpy()
 
     def update_parameters(self, memory, batch_size, updates):
         # Sample a batch from memory
@@ -65,7 +75,9 @@ class SAC(object):
             qf1_next_target, qf2_next_target = self.critic_target(next_state_batch, next_state_action)
             # print(torch.minimum(qf1_next_target, qf2_next_target).shape)
             min_qf_next_target = torch.minimum(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
-            next_q_value = reward_batch + mask_batch * self.gamma * (min_qf_next_target)
+            next_q_value = reward_batch + (1 - mask_batch) * self.gamma * (min_qf_next_target)
+        
+
         qf1, qf2 = self.critic(state_batch, action_batch)  # Two Q-functions to mitigate positive bias in the policy improvement step
         qf1_loss = torch.sum(torch.pow(qf1 - next_q_value, 2), dim = 1).mean()  # JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
         qf2_loss = torch.sum(torch.pow(qf2 - next_q_value, 2), dim = 1).mean()   # JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
@@ -79,6 +91,8 @@ class SAC(object):
 
         qf1_pi, qf2_pi = self.critic(state_batch, pi)
         min_qf_pi = torch.minimum(qf1_pi, qf2_pi)
+
+        min_qf_pi = (min_qf_pi - min_qf_pi.mean(dim = 0))/(min_qf_pi.std(dim = 0) + 1e-6) # Normalize the Q-values to have mean 0 and std 1
 
         policy_loss = ((self.alpha * log_pi) - min_qf_pi) # Jπ = 𝔼st∼D,εt∼N[α * logπ(f(εt;st)|st) − Q(st,f(εt;st))]
         

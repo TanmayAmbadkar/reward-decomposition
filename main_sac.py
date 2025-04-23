@@ -1,145 +1,259 @@
-import argparse
+import os
 import datetime
-import gymnasium as gym
-import numpy as np
 import itertools
+import random
+import numpy as np
 import torch
-from sac.sac import SAC
 from torch.utils.tensorboard import SummaryWriter
+import mo_gymnasium as mo_gym
+from ppo.ppo import PPOLogger
+
+# Import your SAC agent and replay buffer
+from sac.sac import SAC
 from sac.replay_memory import ReplayMemory
-from envs import LunarLander, BipedalWalker
 
-parser = argparse.ArgumentParser(description='PyTorch Soft Actor-Critic Args')
-parser.add_argument('--env-name', default="HalfCheetah-v2",
-                    help='Mujoco Gym environment (default: HalfCheetah-v2)')
-parser.add_argument('--policy', default="Gaussian",
-                    help='Policy Type: Gaussian | Deterministic (default: Gaussian)')
-parser.add_argument('--eval', type=bool, default=True,
-                    help='Evaluates a policy a policy every 10 episode (default: True)')
-parser.add_argument('--gamma', type=float, default=0.99, metavar='G',
-                    help='discount factor for reward (default: 0.99)')
-parser.add_argument('--tau', type=float, default=0.005, metavar='G',
-                    help='target smoothing coefficient(τ) (default: 0.005)')
-parser.add_argument('--lr', type=float, default=0.0003, metavar='G',
-                    help='learning rate (default: 0.0003)')
-parser.add_argument('--alpha', type=float, default=0.2, metavar='G',
-                    help='Temperature parameter α determines the relative importance of the entropy\
-                            term against the reward (default: 0.2)')
-parser.add_argument('--automatic_entropy_tuning', type=bool, default=False, metavar='G',
-                    help='Automaically adjust α (default: False)')
-parser.add_argument('--seed', type=int, default=123456, metavar='N',
-                    help='random seed (default: 123456)')
-parser.add_argument('--batch_size', type=int, default=256, metavar='N',
-                    help='batch size (default: 256)')
-parser.add_argument('--num_steps', type=int, default=500000, metavar='N',
-                    help='maximum number of steps (default: 1000000)')
-parser.add_argument('--hidden_size', type=int, default=256, metavar='N',
-                    help='hidden size (default: 256)')
-parser.add_argument('--updates_per_step', type=int, default=10, metavar='N',
-                    help='model updates per simulator step (default: 1)')
-parser.add_argument('--start_steps', type=int, default=10000, metavar='N',
-                    help='Steps sampling random actions (default: 10000)')
-parser.add_argument('--target_update_interval', type=int, default=1, metavar='N',
-                    help='Value target update per no. of updates per step (default: 1)')
-parser.add_argument('--replay_size', type=int, default=1000000, metavar='N',
-                    help='size of replay buffer (default: 10000000)')
-parser.add_argument('--cuda', action="store_true",
-                    help='run on CUDA (default: False)')
-args = parser.parse_args()
+# Import the vectorized environment utilities.
 
-# Environment
-# env = NormalizedActions(gym.make(args.env_name))
-env = LunarLander(continuous=True)
-# env.seed(args.seed)
-# env.action_space.seed(args.seed)
+# Import the decorator for parameterized scripts
+from func_to_script import script
 
-torch.manual_seed(args.seed)
-np.random.seed(args.seed)
 
-# Agent
-agent = SAC(env.observation_space.shape[0], env.action_space, args = args, reward_size=8)
+def set_seed(seed: int) -> None:
+    """Sets seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-#Tesnorboard
-writer = SummaryWriter('runs/{}_SAC_{}_{}_{}'.format(datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"), args.env_name,
-                                                             args.policy, "autotune" if args.automatic_entropy_tuning else ""))
 
-# Memory
-memory = ReplayMemory(args.replay_size, args.seed)
+@script
+def run_sac(
+    env_id: str = "LunarLander",
+    num_envs: int = 4,
+    continuous: bool = True,
+    scalar_reward: bool = False,
+    total_steps: int = 500000,
+    batch_size: int = 256,
+    start_steps: int = 10000,
+    updates_per_step: int = 10,
+    rollout_steps: int = 40,    # Number of steps to collect per rollout batch
+    hidden_size: int = 256,
+    gamma: float = 0.99,
+    tau: float = 0.005,
+    lr: float = 0.0003,
+    alpha: float = 0.2,
+    automatic_entropy_tuning: bool = False,
+    policy: str = "Gaussian",
+    target_update_interval: int = 1,
+    replay_size: int = 1000000,
+    seed: int = 123456,
+    use_cuda: bool = False,
+    evaluate: bool = True,
+    logger: bool = True,
+):
+    """
+    Runs the Soft Actor-Critic (SAC) training loop using vectorized environments.
 
-# Training Loop
-total_numsteps = 0
-updates = 0
-update_steps = 20
+    This version uses a set of parallel environments (via a vectorized environment wrapper)
+    and collects rollouts over all environments in parallel. Observations are augmented with a
+    weight vector (useful for multi-objective tasks) and rewards are scaled elementwise by these weights.
+    Collected transitions are stored in a replay buffer for off-policy updates.
 
-for i_episode in itertools.count(1):
-    episode_reward = 0
-    episode_steps = 0
-    done = False
-    trunc = False
-    state, info = env.reset()
+    Args:
+        env_id (str): Environment identifier ("LunarLander" or "BipedalWalker").
+        num_envs (int): Number of parallel environments.
+        continuous (bool): Whether to use continuous actions.
+        scalar_reward (bool): Whether the reward is a single scalar.
+        total_steps (int): Total number of environment steps (summed over all envs) to run training.
+        batch_size (int): Batch size for training updates.
+        start_steps (int): Number of initial steps to use random actions for exploration.
+        updates_per_step (int): Number of gradient updates per environment step.
+        rollout_steps (int): Number of rollout steps to collect in each batch.
+        hidden_size (int): Hidden units in the SAC networks.
+        gamma (float): Discount factor.
+        tau (float): Soft target network update coefficient.
+        lr (float): Learning rate.
+        alpha (float): Entropy regularization coefficient.
+        automatic_entropy_tuning (bool): Whether to tune α automatically.
+        policy (str): Policy type ("Gaussian" or "Deterministic").
+        target_update_interval (int): Update interval for the target network.
+        replay_size (int): Capacity of the replay buffer.
+        seed (int): Random seed.
+        use_cuda (bool): If True (and available) use CUDA.
+        evaluate (bool): Whether to perform periodic evaluation.
+    """
+    # Set seeds and determine device.
+    set_seed(seed)
+    device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")
 
-    while not done and not trunc:
-        if args.start_steps > total_numsteps:
-            action = env.action_space.sample()  # Sample random action
-        else:
-            action = agent.select_action(state)  # Sample action from policy
+    # Create vectorized environments.
+    
+    envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+        lambda: mo_gym.make(env_id) for _ in range(num_envs)
+    )
+    envs = mo_gym.wrappers.vector.MORecordEpisodeStatistics(envs)
 
-        if len(memory) > args.batch_size and total_numsteps % update_steps == 0:
-            # Number of updates per step in environment
-            for i in range(args.updates_per_step):
-                # Update parameters of all the networks
-                critic_1_loss, critic_2_loss, policy_loss, ent_loss, alpha = agent.update_parameters(memory, args.batch_size, updates)
 
-                writer.add_scalar('loss/critic_1', critic_1_loss, total_numsteps)
-                writer.add_scalar('loss/critic_2', critic_2_loss, total_numsteps)
+    # Get the observation and action spaces from one environment.
+    state_space = envs.single_observation_space
+    action_space = envs.single_action_space
+
+    # Instantiate the SAC agent.
+    agent = SAC(state_space, action_space, envs.rewards_shape, gamma, tau, alpha, policy,
+                automatic_entropy_tuning, target_update_interval, use_cuda, hidden_size, lr)
+
+    # Set up TensorBoard logging.
+    run_id = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    
+    if logger:
+        
+        logger = PPOLogger(f'runs_sac/{run_id}_SAC_{env_id}_{policy}', True, envs.reward_size)
+        writer = SummaryWriter(f'runs_sac/{run_id}_SAC_{env_id}_{policy}')
+
+    # Create the replay memory.
+    memory = ReplayMemory(replay_size, seed)
+
+    total_numsteps = 0
+    updates = 0
+
+    ####################################
+    # Vectorized Rollout Collection    #
+    ####################################
+    def collect_rollouts_vectorized(envs, agent, rollout_steps, reward_size, states, weights, dones, truncs):
+        """
+        Collects a batch of transitions from vectorized environments.
+
+        Each environment receives its own randomly sampled weight vector (of shape [reward_size]).
+        Observations are augmented (concatenated) with these weights. For each step in the rollout,
+        actions are chosen (randomly or using the agent), the environment steps forward, and the reward
+        is scaled elementwise by the corresponding weight. If any environments signal termination,
+        they are reset and assigned new weight vectors.
+
+        Returns:
+            batch_obs: Numpy array of shape [num_steps, obs_dim + reward_size]
+            batch_actions: Numpy array of shape [num_steps, action_dim]
+            batch_rewards: Numpy array of shape [num_steps, reward_size]
+            batch_next_obs: Numpy array of shape [num_steps, obs_dim + reward_size]
+            batch_dones: Numpy array of shape [num_steps]
+        """
+        # Reset all environments.
+        # Initialize weight vectors for each environment.
+        # Containers for collected data.
+        all_obs = []
+        all_actions = []
+        all_rewards = []
+        all_next_obs = []
+        all_dones = []
+
+        for step in range(0, rollout_steps, num_envs):
+            # Augment states by concatenating with the weight vectors.
+            states_aug = np.concatenate((states, weights), axis=1)  # shape: (num_envs, obs_dim+reward_size)
+
+            # Use list comprehension for now; vectorizing the policy call can also be done if supported.
+            actions = agent.select_action(states_aug)
+
+            # Step the vectorized environments.
+            next_states, rewards, dones, truncs, infos = envs.step(actions)
+            # Scale rewards elementwise by the weight vector.
+            # Assume rewards returned has shape (num_envs, reward_size). If scalar, you may need to reshape.
+            rewards_weighted = rewards * weights
+            
+            # Augment next_states.
+            next_states_aug = np.concatenate((next_states, weights), axis=1)
+
+            all_obs.append(states_aug)
+            all_actions.append(np.array(actions))
+            all_rewards.append(rewards_weighted)
+            all_next_obs.append(next_states_aug)
+            all_dones.append(dones)
+
+            # Handle resets for finished environments.
+            if len(infos) != 0:
+                # print("Total Steps:", total_numsteps + rollout_steps, "Reward: ", infos['episode']['r'][infos['_episode']], "Length: ", infos['episode']['l'][infos['_episode']])
+                logger.log_rollout_step(infos, total_numsteps + rollout_steps)
+                
+            change_weights = np.logical_or(dones, truncs)
+            if reward_size != 1 and change_weights.any():
+                # print(weights)  
+                weights[change_weights] = np.random.uniform(-1, 1, size=weights[change_weights].shape)
+                # weights[:,-1] = 1.0
+                # weights = torch.ones((self.num_envs, self.reward_size)).to(self.device).type(torch.float32)
+
+            states = next_states
+            
+        # Flatten the collected data over rollout_steps and num_envs.
+        batch_obs = np.concatenate(all_obs, axis=0)
+        batch_actions = np.concatenate(all_actions, axis=0)
+        batch_rewards = np.concatenate(all_rewards, axis=0)
+        batch_next_obs = np.concatenate(all_next_obs, axis=0)
+        batch_dones = np.concatenate(all_dones, axis=0)
+
+        
+
+        is_last_observation_terminal = dones
+        is_last_observation_truncated = truncs
+        return batch_obs, batch_actions, batch_rewards, batch_next_obs, batch_dones, states[:, :state_space.shape[0]], weights, is_last_observation_terminal, is_last_observation_truncated
+
+    #####################################
+    # Main Training Loop (Vectorized)   #
+    #####################################
+    states, infos = envs.reset()
+    
+    weights = np.random.uniform(-1, 1, size=(num_envs, envs.reward_size))
+    is_last_observation_terminal = np.array([False] * num_envs)
+    is_last_observation_truncated = np.array([False] * num_envs)
+    while total_numsteps < total_steps:
+        # Use random actions during initial exploration.
+
+
+        batch_obs, batch_actions, batch_rewards, batch_next_obs, batch_dones, states, weights, is_last_observation_terminal, is_last_observation_truncated = collect_rollouts_vectorized(
+            envs, agent, rollout_steps, envs.reward_size, states, weights, is_last_observation_terminal, is_last_observation_truncated
+        )
+        num_transitions = batch_obs.shape[0]
+        for i in range(num_transitions):
+            memory.push(batch_obs[i], batch_actions[i], batch_rewards[i], batch_next_obs[i], batch_dones[i])
+        total_numsteps += rollout_steps
+
+            # Perform updates periodically.
+        if len(memory) > batch_size:
+            for _ in range(updates_per_step):
+                qf1_loss, qf2_loss, policy_loss, ent_loss, alpha_val = agent.update_parameters(memory, batch_size, updates)
+                writer.add_scalar('loss/critic_1', qf1_loss, total_numsteps)
+                writer.add_scalar('loss/critic_2', qf2_loss, total_numsteps)
                 writer.add_scalar('loss/policy', policy_loss, total_numsteps)
                 writer.add_scalar('loss/entropy_loss', ent_loss, total_numsteps)
-                writer.add_scalar('entropy_temprature/alpha', alpha, total_numsteps)
+                writer.add_scalar('entropy_temperature/alpha', alpha_val, total_numsteps)
                 updates += 1
 
-        next_state, reward, done, trunc, _ = env.step(action) # Step
-        episode_steps += 1
-        total_numsteps += 1
-        episode_reward += reward
+        # Log aggregated reward from the rollout batch.
+        rollout_reward = np.sum(batch_rewards)
+        writer.add_scalar('reward/train', rollout_reward, total_numsteps)
+        # print(f"Total Steps: {total_numsteps}, Latest Rollout Reward: {rollout_reward:.2f}")
 
-        # Ignore the "done" signal if it comes from hitting the time horizon.
-        # (https://github.com/openai/spinningup/blob/master/spinup/algos/sac/sac.py)
-        # mask = 1 if episode_steps == env._max_episode_steps else float(not done)
+        # # Periodic evaluation.
+        # if evaluate and total_numsteps % (rollout_steps * 2) == 0:
+        #     avg_reward = 0.0
+        #     eval_episodes = 1
+        #     for _ in range(eval_episodes):
+        #         states, infos = envs.reset()
+        #         eval_reward = 0.0
+        #         dones = np.array([False] * num_envs)
+        #         # For evaluation, use a uniform weight vector.
+        #         eval_weights = np.ones((num_envs, envs.reward_size))
+        #         while not np.all(dones):
+        #             states_aug = np.concatenate((states, eval_weights), axis=1)
+        #             eval_actions = [agent.select_action(obs, evaluate=True) for obs in states_aug]
+        #             states, rewards, dones, truncs, infos = envs.step(eval_actions)
+        #             eval_reward += np.sum(rewards)
+        #         avg_reward += eval_reward
+        #     avg_reward /= eval_episodes
+        #     writer.add_scalar('reward/eval', avg_reward, total_numsteps)
+        #     print(f"Evaluation Reward: {avg_reward:.2f}")
 
-        memory.push(state, action, reward, next_state, done) # Append transition to memory
-
-        state = next_state
-
-    if total_numsteps > args.num_steps:
-        break
-
-    writer.add_scalar('reward/train', sum(episode_reward), total_numsteps)
-    print("Episode: {}, total numsteps: {}, episode steps: {}, reward: {}".format(i_episode, total_numsteps, episode_steps, round(sum(episode_reward), 2)))
-
-    if i_episode % 1 == 0 and args.eval is True:
-        avg_reward = 0.
-        episodes = 1
-        for _  in range(episodes):
-            state, info = env.reset()
-            episode_reward = 0
-            done = False
-            trunc = False
-            while not done and not trunc:
-                action = agent.select_action(state, evaluate=True)
-
-                next_state, reward, done, trunc, _ = env.step(action)
-                episode_reward += reward
+    envs.close()
+    writer.close()
 
 
-                state = next_state
-            avg_reward += sum(episode_reward)
-        avg_reward /= episodes
-
-
-        writer.add_scalar('avg_reward/test', avg_reward, total_numsteps)
-
-        print("----------------------------------------")
-        print("Test Episodes: {}, Avg. Reward: {}".format(episodes, round(avg_reward, 2)))
-        print("----------------------------------------")
-
-env.close()
+if __name__ == "__main__":
+    run_sac()
