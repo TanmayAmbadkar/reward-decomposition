@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>{{ env_name }} Simulation</title>
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+  <style>
+    .value-display { font-weight: bold; }
+    .slider-container { margin-bottom: 1rem; }
+    #plotFeed, #feedFrame { max-height: 300px; object-fit: contain; }
+  </style>
+</head>
+<body>
+  <div class="container my-4">
+    <div class="row">
+
+      <!-- Simulation Feed + Scrub -->
+      <div class="col-md-4">
+        <div class="card mb-4">
+          <div class="card-header">Simulation Feed</div>
+          <div class="card-body text-center">
+            <button id="play-btn" class="btn btn-primary mb-3">Play &amp; Record</button>
+            <input type="range"
+                   id="scrub-slider"
+                   class="form-control-range mb-3"
+                   min="0" max="0" value="0"
+                   disabled>
+            <img id="feedFrame" src="" class="img-fluid mb-3" alt="Simulation Feed">
+            <button id="playpause-btn" class="btn btn-secondary mb-3">Play/Pause</button>
+            <div id="scrubInfo" style="display:none; text-align:left; margin-top:1rem;">
+              <p><strong>State:</strong> <span id="stateDisplay"></span></p>
+              <p><strong>Weights:</strong> <span id="weightDisplay"></span></p>
+              <p><strong>Action:</strong> <span id="actionDisplay"></span></p>
+              <p><strong>Value:</strong> <span id="valueDisplay"></span></p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Reward Plots -->
+      <div class="col-md-4">
+        <div class="card mb-4">
+          <div class="card-header">Reward Plots</div>
+          <div class="card-body text-center">
+            <img id="plotFeed"
+                 src="{{ url_for('reward_plot_stream') }}"
+                 class="img-fluid mb-3"
+                 alt="Cumulative Reward Plot">
+            <img id="barPlot"
+                 src=""
+                 class="img-fluid"
+                 alt="Step Reward Bar Plot">
+          </div>
+        </div>
+      </div>
+
+      <!-- Weight Sliders & Recompute -->
+      <div class="col-md-4">
+        <div class="card mb-4">
+          <div class="card-header">Adjust Weights</div>
+          <div class="card-body">
+            <form id="weightForm">
+              {% for i,label in reward_labels %}
+              <div class="form-group slider-container">
+                <div class="d-flex justify-content-between">
+                  <label for="w_{{i}}">{{ label }}:</label>
+                  <span id="display_w_{{i}}" class="value-display">{{ '%.3f'|format(weights[i]) }}</span>
+                </div>
+                <input type="range"
+                       id="w_{{i}}"
+                       name="w_{{i}}"
+                       class="form-control-range"
+                       min="-1" max="1" step="0.01"
+                       value="{{ weights[i] }}">
+              </div>
+              {% endfor %}
+            </form>
+
+            <div id="recomputeInfo" style="display:none; margin-top:1rem;">
+              <p><strong>Recomputed Action:</strong> <span id="recomputeActionValue"></span></p>
+              <p><strong>Recomputed Value:</strong>  <span id="recomputeValue"></span></p>
+            </div>
+            <!-- … inside your Weight Sliders Column, after the recomputeInfo div … -->
+            <div class="mt-3">
+              <button id="tb-btn" class="btn btn-info">Launch TensorBoard</button>
+              <div id="tbStatus" class="mt-2 text-sm text-muted"></div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    // Cache DOM refs
+    const playBtn       = document.getElementById('play-btn');
+    const replayBtn     = document.getElementById('playpause-btn');
+    const scrubSlider   = document.getElementById('scrub-slider');
+    const feedImg       = document.getElementById('feedFrame');
+    const plotImg       = document.getElementById('plotFeed');
+    const barImg        = document.getElementById('barPlot');
+    const stateDisplay  = document.getElementById('stateDisplay');
+    const actionDisplay = document.getElementById('actionDisplay');
+    const weightDisplay = document.getElementById('weightDisplay');
+    const valueDisplay  = document.getElementById('valueDisplay');
+    const recomputeInfo = document.getElementById('recomputeInfo');
+    const recomputeAct  = document.getElementById('recomputeActionValue');
+    const recomputeVal  = document.getElementById('recomputeValue');
+    const sliders       = Array.from(document.querySelectorAll('#weightForm input[type="range"]'));
+
+    // Helper to load a scrubbed step
+    function showStep(n) {
+      fetch(`/scrub?step=${n}`)
+        .then(r => r.ok ? r.json() : Promise.reject(r))
+        .then(data => {
+          feedImg.src    = data.frame;
+          plotImg.src    = data.plot;
+          barImg.src     = data.bar_plot;
+          stateDisplay.innerText  = JSON.stringify(data.state);
+          actionDisplay.innerText = JSON.stringify(data.action);
+          weightDisplay.innerText = JSON.stringify(data.weights);
+          valueDisplay.innerText  = JSON.stringify(data.value.map(w => Number(w.toFixed(3))));
+          document.getElementById('scrubInfo').style.display = 'block';
+          recomputeCurrentAction();
+        }).catch(console.warn);
+    }
+
+    // Recompute action/value for current step + slider weights
+    function recomputeCurrentAction() {
+      if (scrubSlider.disabled) return;
+      const step = +scrubSlider.value;
+      const w = sliders.map(s => parseFloat(s.value));
+      fetch('/recompute_action', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ step, weights: w })
+      })
+      .then(r=>r.ok? r.json():Promise.reject(r))
+      .then(d=>{
+        recomputeAct.innerText = JSON.stringify(d.action);
+        recomputeVal.innerText = JSON.stringify(d.value.map(w => Number(w.toFixed(3))));
+        recomputeInfo.style.display = 'block';
+      })
+      .catch(console.warn);
+    }
+
+    // Scrub handler
+    scrubSlider.addEventListener('input', e => showStep(e.target.value));
+
+    // When any slider changes, update server & recompute
+    sliders.forEach(s => {
+      s.addEventListener('input', function() {
+        document.getElementById('display_'+this.id).innerText = this.value;
+        const form = new FormData();
+        sliders.forEach(sl=> form.append(sl.id, sl.value));
+        fetch('/update_weights', { method:'POST', body: form })
+          .catch(console.error)
+          .finally(recomputeCurrentAction);
+      });
+    });
+
+    // Play & Record
+    playBtn.addEventListener('click', ()=>{
+      if(playBtn.disabled) return;
+      playBtn.disabled = true;
+      scrubSlider.disabled = true;
+      feedImg.src = "{{ url_for('play') }}?t="+Date.now();
+      const poll = setInterval(()=>{
+        fetch('/record_status').then(r=>r.json()).then(s=>{
+          if(!s.recording){
+            clearInterval(poll);
+            const last = s.length - 1;
+            scrubSlider.max = last;
+            scrubSlider.value = last;
+            scrubSlider.disabled = false;
+            showStep(last);
+            playBtn.disabled = false;
+          }
+        });
+      },500);
+    });
+
+        // TensorBoard launcher
+    const tbBtn    = document.getElementById('tb-btn');
+    const tbStatus = document.getElementById('tbStatus');
+
+    tbBtn.addEventListener('click', () => {
+      tbBtn.disabled = true;
+      tbStatus.innerText = 'Starting TensorBoard…';
+      fetch('/launch_tensorboard', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+          if (data.status === 'started' || data.status === 'already_running') {
+            tbStatus.innerHTML = 
+              `<a href="${data.url}" target="_blank">
+                 TensorBoard ${data.status} at ${data.url}
+               </a>`;
+               tbBtn.disabled = true;
+
+          } else {
+            tbStatus.innerText = `Error: ${data.message || data.status}`;
+          }
+          
+        })
+        .catch(err => {
+          console.error(err);
+          tbStatus.innerText = 'Failed to launch TensorBoard';
+        })
+        .finally(() => {
+          tbBtn.disabled = false;
+        });
+    });
+    
+
+    // (Optional) replay recorded trajectory
+    replayBtn.style.display='none';  // show/hide if you add /replay endpoint
+
+  </script>
+  <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"></script>
+  <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+</body>
+</html>

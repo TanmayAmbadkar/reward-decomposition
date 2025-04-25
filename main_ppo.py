@@ -99,7 +99,7 @@ def run_ppo(
     env_is_discrete: bool = False,
     num_envs: int = 4,
     scalar_reward: bool = False,
-    total_timesteps: int = 1000000,
+    total_timesteps: int = 5000000,
     num_rollout_steps: int = 2048,
     update_epochs: int = 10,
     num_minibatches: int = 256,
@@ -182,8 +182,8 @@ def run_ppo(
     set_seed(seed, torch_deterministic)
 
     # Set up device666
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = torch.device("cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
 
     # Create environments
     # if env_id == "LunarLander":

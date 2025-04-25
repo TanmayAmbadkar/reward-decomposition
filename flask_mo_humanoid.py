@@ -8,10 +8,11 @@ import io
 import matplotlib.pyplot as plt
 from flask import Flask, request, render_template, Response, jsonify
 from envs.lunar_lander import LunarLander  # Ensure this is on your PYTHONPATH
-from ppo.agent import DiscreteAgent
+from ppo.agent import DiscreteAgent, ContinuousAgent
 from envs.utils import SyncVectorEnv
 import mo_gymnasium as mo_gym
 import base64
+import traceback
 from io import BytesIO
 
 # Set up paths for templates.
@@ -21,23 +22,23 @@ TEMPLATE_PATH = os.path.join(DIR_PATH, 'templates/')
 app = Flask(__name__, template_folder=TEMPLATE_PATH)
 
 # Global weights vector (initialized as desired) and lock.
-weights = np.array([1, 0, 0 , 0])
+weights = np.array([1, 0])
 weights_lock = threading.Lock()
 
 # Global variable for the accumulated reward for the current episode.
-current_episode_reward = [np.zeros(4), ]
+current_episode_reward = [np.zeros(3), ]
 episode_reward_lock = threading.Lock()
 
 # --- Initialize the agent ---
 # Create a vectorized environment for the agent.
-env_agent = mo_gym.make("mo-lunar-lander-v3", render_mode = "rgb_array")
-eval_agent = DiscreteAgent(env_agent, reward_size=4).to("cuda")
-model_path = "runs/mo-lunar-lander-v3__main_ppo__2025-04-15 15:06:33.790188__1/main_ppo.rl_model"
+env_agent = mo_gym.make("mo-halfcheetah-v5", render_mode = "rgb_array")
+eval_agent = ContinuousAgent(env_agent, reward_size=2).to("cuda")
+model_path = "runs/mo-halfcheetah-v5__main_ppo__2025-04-24 20:54:17.118970__1/main_ppo.rl_model"
 eval_agent.load_state_dict(torch.load(model_path))
 eval_agent.eval()
 
 # Create a separate (non-vectorized) environment for rendering.
-env_render = mo_gym.make("mo-lunar-lander-v3", render_mode = "rgb_array")
+# env_render = mo_gym.make("mo-hopper-v5", render_mode = "rgb_array")
 
 recorded_trajectory = []
 record_lock = threading.Lock()# signal whether a /play episode is currently running
@@ -48,7 +49,7 @@ recording_lock = threading.Lock()
 @app.route('/')
 def index():
     # Pass current weights to the template for slider initialization.
-    return render_template('mo_lander.html', weights=weights.tolist())
+    return render_template('mo_humanoid.html', weights=weights.tolist())
 
 @app.route('/update_weights', methods=['POST'])
 def update_weights():
@@ -57,10 +58,8 @@ def update_weights():
     data = request.form
     try:
         new_weights = np.array([
-            float(data.get("w_landed", 1)),
-            float(data.get("w_shaping", 0)),
-            float(data.get("w_main_engine", 0.0)),
-            float(data.get("w_side_engine", 0.)),
+            float(data.get("w_velocity", 1)),
+            float(data.get("w_energy", 0.0)),
         ])
         print(new_weights)
         with weights_lock:
@@ -69,56 +68,57 @@ def update_weights():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
 
-def simulation_generator():
-    """Generator that steps through the simulation, accumulates weighted rewards,
-    resets the accumulator at the start of each episode, and yields rendered frames."""
-    global weights, current_episode_reward
-    while True:
-        # Reset the accumulated reward at the start of each episode.
-        with episode_reward_lock:
-            current_episode_reward = [np.zeros(4), ]
-        done = False
-        trunc = False
-        obs, _ = env_render.reset()
-        while not (done or trunc):
-            with weights_lock:
-                current_weights = np.copy(weights)
-            # Agent expects a batch; use the first action.
-            action, _ = eval_agent.predict(obs, current_weights, deterministic=True, device = "cuda")
-            obs, rew, done, trunc, infos = env_render.step(action[0])
-            # Compute the weighted reward for this step.
-            step_reward = current_weights * rew
-            with episode_reward_lock:
-                current_episode_reward.append(step_reward)
-            frame = env_render.render()
-            yield frame
-            time.sleep(0.03)
+# def simulation_generator():
+#     """Generator that steps through the simulation, accumulates weighted rewards,
+#     resets the accumulator at the start of each episode, and yields rendered frames."""
+#     global weights, current_episode_reward
+#     while True:
+#         # Reset the accumulated reward at the start of each episode.
+#         with episode_reward_lock:
+#             current_episode_reward = [np.zeros(3), ]
+#         done = False
+#         trunc = False
+#         obs, _ = env_render.reset()
+#         while not (done or trunc):
+#             with weights_lock:
+#                 current_weights = np.copy(weights)
+#             # Agent expects a batch; use the first action.
+#             print(obs, current_weights)
+#             action, _ = eval_agent.predict(obs, current_weights, deterministic=True, device = "cuda")
+#             obs, rew, done, trunc, infos = env_render.step(action[0])
+#             # Compute the weighted reward for this step.
+#             step_reward = current_weights * rew
+#             with episode_reward_lock:
+#                 current_episode_reward.append(step_reward)
+#             frame = env_render.render()
+#             yield frame
+#             time.sleep(0.03)
 
-def frame_gen(generator_func, *args, **kwargs):
-    """Encodes frames from the generator as PNG and yields them in a multipart response."""
-    get_frame = generator_func(*args, **kwargs)
-    while True:
-        frame = next(get_frame, None)
-        if frame is None:
-            continue
-        ret, png = cv2.imencode('.png', frame)
-        if not ret:
-            continue
-        frame_bytes = png.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/png\r\n\r\n' + frame_bytes + b'\r\n')
+# def frame_gen(generator_func, *args, **kwargs):
+#     """Encodes frames from the generator as PNG and yields them in a multipart response."""
+#     get_frame = generator_func(*args, **kwargs)
+#     while True:
+#         frame = next(get_frame, None)
+#         if frame is None:
+#             continue
+#         ret, png = cv2.imencode('.png', frame)
+#         if not ret:
+#             continue
+#         frame_bytes = png.tobytes()
+#         yield (b'--frame\r\n'
+#                b'Content-Type: image/png\r\n\r\n' + frame_bytes + b'\r\n')
 
-@app.route('/render_feed')
-def render_feed():
-    return Response(frame_gen(simulation_generator),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+# @app.route('/render_feed')
+# def render_feed():
+#     return Response(frame_gen(simulation_generator),
+#                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 def generate_plot():
     """Generates a PNG bar plot of the accumulated reward per component for the current episode."""
     with episode_reward_lock:
         data = np.array(current_episode_reward)
     fig, ax = plt.subplots()
-    components = ["Landed", "Shaping", "Main Engine", "Side Engine", ]
+    components = ["Velocity", "Energy", ]
     # for i in range(8):
     ax.plot(data, label = components)
     ax.set_title("Accumulated Reward per Component (Current Episode)")
@@ -162,7 +162,7 @@ def generate_partial_plot_uri(step: int) -> str:
     # cumulative sum along time
     cum = data.cumsum(axis=0)
 
-    labels = ["Landed","Shaping","Main Engine","Side Engine"]
+    labels = ["Velocity", "Energy", ]
     fig, ax = plt.subplots()
     for idx, lbl in enumerate(labels):
         ax.plot(cum[:, idx], label=lbl)
@@ -196,12 +196,15 @@ def play():
             recorded_trajectory = []
 
         try:
+            
+            env_render = mo_gym.make("mo-halfcheetah-v5", render_mode = "rgb_array")
             obs, _ = env_render.reset()
             done = trunc = False
 
             while not (done or trunc):
                 with weights_lock:
                     w = weights.copy()
+                
                 action, _ = eval_agent.predict(obs, w, deterministic=True, device="cuda")
                 next_obs, rew, done, trunc, _ = env_render.step(action[0])
 
@@ -215,8 +218,9 @@ def play():
                 with record_lock:
                     recorded_trajectory.append({
                         'state':            obs.tolist(),
-                        'action':           int(action[0]),
+                        'action':           action[0].tolist(),
                         'reward_components': (w * rew).tolist(),
+                        'weights':         w.tolist(),
                         'frame_b64':        b64
                     })
 
@@ -232,7 +236,7 @@ def play():
                 obs = next_obs
                 
         except Exception as e:
-            print("Error during simulation:", e)
+            print(traceback.format_exc())
             # Handle any exceptions that occur during the simulation
             # You can log the error or take appropriate action here
 
@@ -273,7 +277,8 @@ def scrub():
 
     # 3) per‐step bar plot of reward components
     # ------------------------------------------------
-    labels = ["Landed","Shaping","Main Engine","Side Engine"]
+
+    labels = ["Velocity", "Energy", ]
     values = entry['reward_components']
     fig, ax = plt.subplots()
     ax.bar(labels, values)
@@ -292,6 +297,7 @@ def scrub():
         'state':             entry['state'],
         'action':            entry['action'],
         'reward_components': entry['reward_components'],
+        'weights':           entry['weights'],
         'frame':             frame_uri,
         'plot':              plot_uri,
         'bar_plot':          bar_uri
@@ -320,4 +326,4 @@ def record_status():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5043, debug=False)
+    app.run(host='0.0.0.0', port=5044, debug=False)

@@ -364,7 +364,7 @@ class PPO:
         ) = self._initialize_storage()    
         if current_weights is None:
             if self.reward_size != 1:
-                weights = torch.distributions.uniform.Uniform(low=0, high=1).sample((self.num_envs, self.reward_size)).to(self.device).type(torch.float32)
+                weights = torch.distributions.uniform.Uniform(low=-1, high=1).sample((self.num_envs, self.reward_size)).to(self.device).type(torch.float32)
                 # weights = torch.softmax(weights, dim = 1)
             else:
                 weights = torch.ones(self.num_envs, 1).to(self.device).type(torch.float32)
@@ -387,7 +387,7 @@ class PPO:
             change_weights = torch.logical_or(is_next_observation_terminal.type(torch.bool), is_next_observation_truncated.type(torch.bool))
             if self.reward_size != 1 and change_weights.any():
                 # print(weights)   
-                weights[change_weights] = torch.distributions.uniform.Uniform(low=0, high=1).sample(weights[change_weights].shape).to(self.device).type(torch.float32)
+                weights[change_weights] = torch.distributions.uniform.Uniform(low=-1, high=1).sample(weights[change_weights].shape).to(self.device).type(torch.float32)
                 # weights[change_weights] = torch.softmax(weights[change_weights], dim = 1)
 
                 # weights[:,-1] = 1.0
@@ -750,11 +750,24 @@ class PPO:
                 if self.normalize_advantages:
                     # minibatch_advantages = mask * minibatch_advantages
 
-                    minibatch_advantages = (
-                        minibatch_advantages - minibatch_advantages.mean(dim = 0)
-                        ) / (minibatch_advantages.std(dim = 0) + 1e-8
-                    )
-                    minibatch_advantages = mask * minibatch_advantages
+                                        
+                    # 1) Zero-out invalid dims
+                    masked_adv = minibatch_advantages * mask  
+
+                    # 2) Compute mean & std _only_ over the valid entries in each column
+                    #    (i.e. sum over batch of masked_adv, divide by sum(mask) per dim)
+                    valid_counts = mask.sum(dim=0)                # shape [d]
+                    mean = (masked_adv.sum(dim=0) / valid_counts) # shape [d]
+
+                    #    For std: compute variance over the same entries
+                    var = (((masked_adv - mean)**2 * mask).sum(dim=0) / valid_counts)
+                    std = torch.sqrt(var + 1e-8)
+
+                    # 3) Normalize only the valid entries
+                    normed = (masked_adv - mean) / std
+
+                    # 4) (Optional) re-apply mask to safeguard any numerical drift
+                    minibatch_advantages = normed * mask
 
                 policy_gradient_loss = self.calculate_policy_gradient_loss(
                     minibatch_advantages, probability_ratio.reshape(-1, 1)

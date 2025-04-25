@@ -15,7 +15,7 @@
 </head>
 <body>
   <div class="container my-4">
-    <h1 class="text-center mb-4">Multi-objective Reacher Simulation</h1>
+    <h1 class="text-center mb-4">Hopper Simulation</h1>
     <div class="row">
 
       <!-- Play & Scrub Column -->
@@ -30,13 +30,7 @@
                    min="0" max="0" value="0"
                    disabled>
             <img id="feedFrame" src="" class="img-fluid" alt="Simulation Feed">
-            <button id="playpause-btn" class="btn btn-primary mb-3", >Play/Pause</button>
-            <div id="scrubInfo" style="display:none; text-align:left; margin-top:1rem;">
-              <p><strong>State:</strong> <span id="stateDisplay"></span></p>
-              <p><strong>Weight:</strong> <span id="weightDisplay"></span></p>
-              <p><strong>Action:</strong> <span id="actionDisplay"></span></p>
-              <p><strong>Value:</strong> <span id="valueDisplay"></span></p>
-            </div>
+            <button id="playpause-btn" class="btn btn-primary mb-3">Play/Pause</button>
           </div>
         </div>
       </div>
@@ -69,8 +63,8 @@
           <div class="card-body">
             <form id="weightForm" method="POST" action="/update_weights">
               {% for id,label,val in [
-                  ('w_treasure','Treasure',weights[0]),
-                  ('w_time','Time',weights[1]),
+                  ('w_velocity','Velocity',weights[0]),
+                  ('w_energy','Energy',weights[1]),
                 ] %}
               <div class="form-group slider-container">
                 <div class="d-flex justify-content-between">
@@ -86,14 +80,6 @@
               </div>
               {% endfor %}
             </form>
-            <div id="recomputeInfo" style="display:none; margin-top:1rem;">
-              <p><strong>Recomputed Action:</strong>
-                 <span id="recomputeActionValue"></span>
-              </p>
-              <p><strong>Recomputed Value:</strong>
-                 <span id="recomputeValue"></span>
-              </p>
-            </div>
           </div>
         </div>
       </div>
@@ -119,89 +105,23 @@
     const scrubSlider = document.getElementById('scrub-slider');
     const feedImg     = document.getElementById('feedFrame');
     const plotImg     = document.getElementById('plotFeed');
-    const recomputeInfo      = document.getElementById('recomputeInfo');
-    const recomputeActionVal = document.getElementById('recomputeActionValue');
-    const recomputeVal       = document.getElementById('recomputeValue');
     const play = false;
-    const stateDisplay       = document.getElementById('stateDisplay');
-    const actionDisplay      = document.getElementById('actionDisplay');
-    const weightDisplay      = document.getElementById('weightDisplay');
-    const valueDisplay       = document.getElementById('valueDisplay');
-    const sliders            = Array.from(document.querySelectorAll('#weightForm input[type="range"]'));
-
-    playpauseBtn.style.display = 'none';
 
     // 2) Keep auto‐refreshing the plot until we start playing
     // Helper to fetch and display a scrubbed step
-    // Helper to fetch and display a scrubbed step
-    // helper to fetch & display scrubbed data
     function showStep(n) {
       fetch(`/scrub?step=${n}`)
-        .then(res => res.ok ? res.json() : Promise.reject())
+        .then(res => {
+          if (!res.ok) throw new Error('scrub unavailable');
+          return res.json();
+        })
         .then(data => {
-          // frame + plots
           feedImg.src    = data.frame;
           plotImg.src    = data.plot;
           document.getElementById('barPlot').src = data.bar_plot;
-          // scrub info
-          stateDisplay.innerText  = JSON.stringify(data.state);
-          actionDisplay.innerText = JSON.stringify(data.action);
-          weightDisplay.innerText = JSON.stringify(data.weights);
-          valueDisplay.innerText = JSON.stringify(data.value.map(w => Number(w.toFixed(3))));
-          document.getElementById('scrubInfo').style.display = 'block';
-          recomputeCurrentAction();
         })
         .catch(console.warn);
     }
-
-    // NEW: recompute action for current scrub + weights
-    function recomputeCurrentAction() {
-      // only when scrub is enabled
-      if (scrubSlider.disabled) return;
-
-      const step = parseInt(scrubSlider.value, 10);
-      // gather new weight values
-      const newWeights = sliders.map(s => parseFloat(s.value));
-
-      fetch('/recompute_action', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ step, weights: newWeights })
-      })
-      .then(r => r.ok ? r.json() : Promise.reject())
-      .then(data => {
-        recomputeActionVal.innerText = JSON.stringify(data.action);
-        ;
-        recomputeVal.innerText = JSON.stringify(data.value.map(w => Number(w.toFixed(3))));
-        recomputeInfo.style.display  = 'block';
-      })
-      .catch(console.warn);
-    }
-
-    // 1) Hook scrubbing
-    scrubSlider.addEventListener('input', e => {
-      showStep(e.target.value);
-    });
-
-    // 2) Hook weight sliders: after updating weights, also recompute action
-    sliders.forEach(slider => {
-      slider.addEventListener('input', function() {
-        // update display
-        document.getElementById('display_' + this.id).innerText = this.value;
-
-        // send to server
-        fetch('/update_weights', {
-          method: 'POST',
-          body: new FormData(document.getElementById('weightForm'))
-        })
-        .catch(console.error)
-        .finally(() => {
-          // now recompute action for the current scrub step
-          recomputeCurrentAction();
-        });
-      });
-    });
-
 
     function replay_plot(n){
        for (let i = n; i < scrubSlider.max; i++) {
@@ -261,7 +181,9 @@
     });
 
     // 4) Scrubbing interaction
-    
+    scrubSlider.addEventListener('input', e => {
+      showStep(e.target.value);
+    });
   </script>
 
   <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>

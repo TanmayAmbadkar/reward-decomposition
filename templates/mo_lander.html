@@ -3,17 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <title>Lunar Lander Simulation</title>
-  <!-- Bootstrap CSS -->
   <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
   <style>
-    .value-display {
-      font-weight: bold;
-    }
-    .slider-container {
-      margin-bottom: 1rem;
-    }
-    /* Optionally constrain the plot image height */
-    #plotFeed {
+    .value-display { font-weight: bold; }
+    .slider-container { margin-bottom: 1rem; }
+    #plotFeed, #feedFrame {
       max-height: 300px;
       object-fit: contain;
     }
@@ -23,97 +17,177 @@
   <div class="container my-4">
     <h1 class="text-center mb-4">Lunar Lander Simulation</h1>
     <div class="row">
-      <!-- Simulation Feed Column -->
+
+      <!-- Play & Scrub Column -->
       <div class="col-md-4">
-        <div class="card">
+        <div class="card mb-4">
           <div class="card-header">Simulation Feed</div>
           <div class="card-body text-center">
-            <img src="{{ url_for('render_feed') }}" class="img-fluid" alt="Simulation Feed">
+            <button id="play-btn" class="btn btn-primary mb-3">Play &amp; Record</button>
+            <input type="range"
+                   id="scrub-slider"
+                   class="form-control-range mb-3"
+                   min="0" max="0" value="0"
+                   disabled>
+            <img id="feedFrame" src="" class="img-fluid" alt="Simulation Feed">
+            <button id="playpause-btn" class="btn btn-primary mb-3">Play/Pause</button>
           </div>
         </div>
       </div>
-      <!-- Accumulated Reward Plot Column -->
+
+      <!-- Reward Plot Column -->
       <div class="col-md-4">
-        <div class="card">
-          <div class="card-header">Accumulated Reward Plot</div>
+        <div class="card mb-4">
+          <div class="card-header">Reward Plots</div>
           <div class="card-body text-center">
-            <img src="{{ url_for('reward_plot_stream') }}" class="img-fluid" alt="Reward Plot">
+            <!-- 1) constant cumulative‐reward line plot -->
+            <img 
+              id="plotFeed"
+              src="{{ url_for('reward_plot_stream') }}"
+              class="img-fluid mb-3"
+              alt="Cumulative Reward Plot">
+            <!-- 2) per‐step bar plot, updated on scrub -->
+            <img 
+              id="barPlot"
+              src=""
+              class="img-fluid"
+              alt="Step Reward Bar Plot">
           </div>
         </div>
       </div>
+
       <!-- Weight Sliders Column -->
       <div class="col-md-4">
-        <div class="card">
+        <div class="card mb-4">
           <div class="card-header">Adjust Weights</div>
           <div class="card-body">
             <form id="weightForm" method="POST" action="/update_weights">
+              {% for id,label,val in [
+                  ('w_landed','Landed',weights[0]),
+                  ('w_shaping','Shaping',weights[1]),
+                  ('w_main_engine','Main Engine',weights[2]),
+                  ('w_side_engine','Side Engine',weights[3])
+                ] %}
               <div class="form-group slider-container">
-                <div class="d-flex justify-content-between align-items-center">
-                  <label for="w_landed" class="mb-0">Landed:</label>
-                  <span class="value-display" id="display_w_landed">{{ weights[0] }}</span>
+                <div class="d-flex justify-content-between">
+                  <label for="{{id}}">{{ label }}:</label>
+                  <span id="display_{{id}}" class="value-display">{{ val }}</span>
                 </div>
-                <input type="range" class="form-control-range" id="w_landed" name="w_shaping" min="0" max="1" step="0.1" value="{{ weights[0] }}">
+                <input type="range"
+                       id="{{id}}"
+                       name="{{id}}"
+                       class="form-control-range"
+                       min="0" max="1" step="0.1"
+                       value="{{ val }}">
               </div>
-              <div class="form-group slider-container">
-                <div class="d-flex justify-content-between align-items-center">
-                  <label for="w_shaping" class="mb-0">Shaping:</label>
-                  <span class="value-display" id="display_w_shaping">{{ weights[1] }}</span>
-                </div>
-                <input type="range" class="form-control-range" id="w_shaping" name="w_shaping" min="0" max="1" step="0.1" value="{{ weights[1] }}">
-              </div>
-              <div class="form-group slider-container">
-                <div class="d-flex justify-content-between align-items-center">
-                  <label for="w_main_engine" class="mb-0">Main Engine:</label>
-                  <span class="value-display" id="display_w_main_engine">{{ weights[2] }}</span>
-                </div>
-                <input type="range" class="form-control-range" id="w_main_engine" name="w_main_engine" min="0" max="1" step="0.1" value="{{ weights[2] }}">
-              </div>
-              <div class="form-group slider-container">
-                <div class="d-flex justify-content-between align-items-center">
-                  <label for="w_side_engine" class="mb-0">Side Engine:</label>
-                  <span class="value-display" id="display_w_side_engine">{{ weights[3] }}</span>
-                </div>
-                <input type="range" class="form-control-range" id="w_side_engine" name="w_side_engine" min="0" max="1" step="0.1" value="{{ weights[3] }}">
-              </div>
-              
+              {% endfor %}
             </form>
           </div>
         </div>
       </div>
-      
-      
-  <!-- JavaScript: AJAX weight updates and auto-refresh plot -->
+
+    </div>
+  </div>
+
+  <!-- JavaScript -->
   <script>
-    // Attach input event listener to all slider elements.
-    // Attach input event listener to all slider elements.
-    const sliders = document.querySelectorAll('input[type="range"]');
-    sliders.forEach(slider => {
-    slider.addEventListener('input', function() {
-        // Update the corresponding value display using the slider's ID.
-        let display = document.getElementById('display_' + this.id);
-        if (display) {
-        display.innerText = this.value;
-        }
-        // Create FormData from the slider form.
-        const formData = new FormData(document.getElementById('weightForm'));
-        // Send updated weights via AJAX.
+    // 1) Weight sliders via AJAX
+    document.querySelectorAll('#weightForm input[type="range"]').forEach(slider => {
+      slider.addEventListener('input', function() {
+        document.getElementById('display_' + this.id).innerText = this.value;
         fetch('/update_weights', {
-        method: 'POST',
-        body: formData
+          method: 'POST',
+          body: new FormData(document.getElementById('weightForm'))
+        }).catch(console.error);
+      });
+    });
+
+    const playBtn     = document.getElementById('play-btn');
+    const playpauseBtn     = document.getElementById('playpause-btn');
+    const scrubSlider = document.getElementById('scrub-slider');
+    const feedImg     = document.getElementById('feedFrame');
+    const plotImg     = document.getElementById('plotFeed');
+    const play = false;
+
+    // 2) Keep auto‐refreshing the plot until we start playing
+    // Helper to fetch and display a scrubbed step
+    function showStep(n) {
+      fetch(`/scrub?step=${n}`)
+        .then(res => {
+          if (!res.ok) throw new Error('scrub unavailable');
+          return res.json();
         })
-        .then(response => response.json())
-        .then(data => console.log('Weights updated:', data))
-        .catch(error => console.error('Error updating weights:', error));
+        .then(data => {
+          feedImg.src    = data.frame;
+          plotImg.src    = data.plot;
+          document.getElementById('barPlot').src = data.bar_plot;
+        })
+        .catch(console.warn);
+    }
+
+    function replay_plot(n){
+       for (let i = n; i < scrubSlider.max; i++) {
+          setTimeout(() => {
+            scrubSlider.value = i;
+            showStep(i);
+          }, 500);
+        }
+    }
+
+    // 3) Play & Record — kick off MJPEG stream & polling
+    playpauseBtn.addEventListener('click', () => {
+      
+      if (scrubSlider.value == scrubSlider.max){
+        scrubSlider.value = 0;
+        return;
+      }
+      
+      replay_plot(scrubSlider.value);
+      
     });
+
+    // 3) Play & Record — kick off MJPEG stream & polling
+    playBtn.addEventListener('click', () => {
+      if (playBtn.disabled) return;
+      console.log('Starting recording');
+
+      // Disable controls
+      playBtn.disabled     = true;
+      playpauseBtn.disabled     = true;
+      scrubSlider.disabled = true;
+      // Stop the one‐off plot refresh
+      // Start MJPEG stream from /play
+      
+      feedImg.src = "{{ url_for('play') }}?t=" + Date.now();
+
+      // Poll /record_status until recording completes
+      const statusPoll = setInterval(() => {
+        fetch('/record_status')
+          .then(r => r.json())
+          .then(status => {
+            if (!status.recording) {
+              console.log('Recording complete');
+              clearInterval(statusPoll);
+              const last = status.length - 1;
+              scrubSlider.max   = last;
+              scrubSlider.value = last;
+              scrubSlider.disabled = false;
+              showStep(last);       // display final frame+plot
+              playBtn.disabled   = false;
+              playpauseBtn.disabled   = false;
+              const play = false;
+            }
+          })
+          .catch(console.error);
+      }, 500);
     });
-    // Auto-refresh the plot image every second.
-    setInterval(function() {
-      const plotImg = document.getElementById('plotFeed');
-      plotImg.src = "{{ url_for('plot_feed') }}" + "?t=" + new Date().getTime();
-    }, 1000);
+
+    // 4) Scrubbing interaction
+    scrubSlider.addEventListener('input', e => {
+      showStep(e.target.value);
+    });
   </script>
 
-  <!-- Bootstrap JS and dependencies -->
   <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"></script>
   <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>

@@ -195,9 +195,16 @@ class ContinuousAgent(BaseAgent):
         self.weight_vec_size = 0 if reward_size == 1 else reward_size
         # self.critic = CriticFiLM(np.array(envs.single_observation_space.shape).prod(), self.weight_vec_size, reward_size)
         # self.actor_mean = ActorFiLM(np.array(envs.single_observation_space.shape).prod(), self.weight_vec_size,  np.prod(envs.single_action_space.shape))
+        
+        try:
+            action_space = envs.single_action_space.shape
+            observation_space = envs.single_observation_space.shape
+        except:
+            action_space = envs.action_space.shape
+            observation_space = envs.observation_space.shape
         self.critic = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod()+ self.weight_vec_size, 256)
+                nn.Linear(np.array(observation_space).prod()+ self.weight_vec_size, 256)
             ),
             nn.Tanh(),
             layer_init(nn.Linear(256, 256)),
@@ -208,7 +215,7 @@ class ContinuousAgent(BaseAgent):
         )
         self.actor_mean = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod() + self.weight_vec_size, 256)
+                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 256)
             ),
             nn.Tanh(),
             layer_init(nn.Linear(256, 256)),
@@ -216,16 +223,20 @@ class ContinuousAgent(BaseAgent):
             layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
             layer_init(
-                nn.Linear(256, np.prod(envs.single_action_space.shape)), std=0.01
+                nn.Linear(256, np.prod(action_space)), std=0.01
             ),
         )
         self.actor_logstd = nn.Parameter(
-            torch.zeros(1, np.prod(envs.single_action_space.shape))
+            torch.zeros(1, np.prod(action_space))
         )
         self.shield = shield
         
-        self.action_space_low = envs.single_action_space.low
-        self.action_space_high = envs.single_action_space.high
+        try:
+            self.action_space_low = envs.single_action_space.low
+            self.action_space_high = envs.single_action_space.high
+        except:
+            self.action_space_low = envs.action_space.low
+            self.action_space_high = envs.action_space.high
 
     def estimate_value_from_observation(self, observation, weights = None, device = "cpu"):
         
@@ -251,6 +262,7 @@ class ContinuousAgent(BaseAgent):
     
     @torch.no_grad
     def predict(self, observation, weight = None, deterministic = False, device = "cpu"):
+        
         
         observation = torch.Tensor(observation).to(device)
         if len(observation.shape) == 1:

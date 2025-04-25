@@ -5,70 +5,86 @@ import threading
 import numpy as np
 import torch
 import io
+import json
+import argparse
 import matplotlib.pyplot as plt
 from flask import Flask, request, render_template, Response, jsonify
-from envs.lunar_lander import LunarLander  # Ensure this is on your PYTHONPATH
-from ppo.agent import DiscreteAgent
-from envs.utils import SyncVectorEnv
 import mo_gymnasium as mo_gym
-import base64
 from io import BytesIO
+import base64
+import subprocess
+
+# PPO agent classes
+from ppo.agent import DiscreteAgent, ContinuousAgent
 
 # Set up paths for templates.
 DIR_PATH = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(DIR_PATH, 'templates/')
 
-app = Flask(__name__, template_folder=TEMPLATE_PATH)
+# Parse command‐line for a config JSON
+parser = argparse.ArgumentParser()
+parser.add_argument('--config', required=True,
+                    help="Path to JSON config with env_name, continuous, reward_size, reward_labels, model_path")
+args = parser.parse_args()
 
-# Global weights vector (initialized as desired) and lock.
-weights = np.array([1, 0, 0 , 0])
+# Load config
+with open(args.config) as f:
+    cfg = json.load(f)
+
+ENV_NAME       = cfg['env_name']
+CONTINUOUS     = cfg['continuous']      # True or False
+REWARD_SIZE    = cfg['reward_size']     # int
+REWARD_LABELS  = cfg['reward_labels']   # list of strings, len == REWARD_SIZE
+MODEL_PATH     = cfg['model_path']      # str
+INITIAL_WEIGHTS = cfg.get('initial_weights', [1.0]*REWARD_SIZE)
+# Will hold our TensorBoard subprocess handle
+TB_PROCESS = None
+
+# Flask app
+app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'))
+
+# Global weights & lock
+weights      = np.array(INITIAL_WEIGHTS, dtype=float)
 weights_lock = threading.Lock()
 
-# Global variable for the accumulated reward for the current episode.
-current_episode_reward = [np.zeros(4), ]
-episode_reward_lock = threading.Lock()
+# For live‐plotting the in‐flight episode
+current_episode_reward = [np.zeros(REWARD_SIZE)]
+episode_reward_lock    = threading.Lock()
+
+# Recorded trajectory storage
+recorded_trajectory     = []
+record_lock             = threading.Lock()
+recording_in_progress   = False
+recording_lock          = threading.Lock()
 
 # --- Initialize the agent ---
-# Create a vectorized environment for the agent.
-env_agent = mo_gym.make("mo-lunar-lander-v3", render_mode = "rgb_array")
-eval_agent = DiscreteAgent(env_agent, reward_size=4).to("cuda")
-model_path = "runs/mo-lunar-lander-v3__main_ppo__2025-04-15 15:06:33.790188__1/main_ppo.rl_model"
-eval_agent.load_state_dict(torch.load(model_path))
+# Vectorized environment for inference
+env_agent = mo_gym.make(ENV_NAME, render_mode="rgb_array")
+env_render = mo_gym.make(ENV_NAME, render_mode = "rgb_array")
+AgentClass = ContinuousAgent if CONTINUOUS else DiscreteAgent
+eval_agent = AgentClass(env_agent, reward_size=REWARD_SIZE).to("cuda")
+eval_agent.load_state_dict(torch.load(MODEL_PATH + "main_ppo.rl_model"))
 eval_agent.eval()
 
-# Create a separate (non-vectorized) environment for rendering.
-env_render = mo_gym.make("mo-lunar-lander-v3", render_mode = "rgb_array")
-
-recorded_trajectory = []
-record_lock = threading.Lock()# signal whether a /play episode is currently running
-recording_in_progress = False
-recording_lock = threading.Lock()
-
-
+    # Pass current weights to the template for slider initialization.
 @app.route('/')
 def index():
-    # Pass current weights to the template for slider initialization.
-    return render_template('mo_lander.html', weights=weights.tolist())
+    return render_template('index_main.html', weights=weights.tolist(),
+                           reward_labels=[(i, label) for i, label in enumerate(REWARD_LABELS)])
 
 @app.route('/update_weights', methods=['POST'])
 def update_weights():
     global weights
-    # Get form data sent via AJAX.
     data = request.form
     try:
-        new_weights = np.array([
-            float(data.get("w_landed", 1)),
-            float(data.get("w_shaping", 0)),
-            float(data.get("w_main_engine", 0.0)),
-            float(data.get("w_side_engine", 0.)),
-        ])
-        print(new_weights)
+        new = [float(data.get(f"w_{i}", INITIAL_WEIGHTS[i])) for i in range(REWARD_SIZE)]
         with weights_lock:
-            weights = new_weights
-        return jsonify({"status": "success", "weights": weights.tolist()})
+            weights[:] = new
+        return jsonify(status="success", weights=weights.tolist())
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 400
-
+        return jsonify(status="error", message=str(e)), 400
+    
+    
 def simulation_generator():
     """Generator that steps through the simulation, accumulates weighted rewards,
     resets the accumulator at the start of each episode, and yields rendered frames."""
@@ -76,7 +92,7 @@ def simulation_generator():
     while True:
         # Reset the accumulated reward at the start of each episode.
         with episode_reward_lock:
-            current_episode_reward = [np.zeros(4), ]
+            current_episode_reward = [np.zeros(2), ]
         done = False
         trunc = False
         obs, _ = env_render.reset()
@@ -114,18 +130,15 @@ def render_feed():
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 def generate_plot():
-    """Generates a PNG bar plot of the accumulated reward per component for the current episode."""
     with episode_reward_lock:
         data = np.array(current_episode_reward)
     fig, ax = plt.subplots()
-    components = ["Landed", "Shaping", "Main Engine", "Side Engine", ]
-    # for i in range(8):
-    ax.plot(data, label = components)
+    ax.plot(data, label=REWARD_LABELS)
     ax.set_title("Accumulated Reward per Component (Current Episode)")
     ax.set_ylabel("Accumulated Reward")
-    buf = io.BytesIO()
     ax.legend()
-    fig.savefig(buf, format='png')
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight')
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
@@ -147,37 +160,26 @@ def reward_plot_gen():
 def reward_plot_stream():
     return Response(reward_plot_gen(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
+
 def generate_partial_plot_uri(step: int) -> str:
-    """
-    Build a cumulative-reward line plot up to `step` and return it
-    as a 'data:image/png;base64,…' URI.
-    """
-    
-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
     with record_lock:
-        # gather reward vectors up to and including `step`
-        data = np.array([ e['reward_components'] 
-                          for e in recorded_trajectory ])  # shape (step+1, 4)
-
-    # cumulative sum along time
+        data = np.array([ e['reward_components'] for e in recorded_trajectory ])
     cum = data.cumsum(axis=0)
-
-    labels = ["Landed","Shaping","Main Engine","Side Engine"]
     fig, ax = plt.subplots()
-    for idx, lbl in enumerate(labels):
+    for idx, lbl in enumerate(REWARD_LABELS):
         ax.plot(cum[:, idx], label=lbl)
     ax.plot([step, step], [cum.min(), cum.max()], 'k--', lw=1)
-    ax.set_title("Cumulative Reward up to step {}".format(step))
+    ax.set_title(f"Cumulative Reward up to step {step}")
     ax.set_ylabel("Reward")
     ax.legend(loc="upper left")
-
     buf = BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight")
+    fig.savefig(buf, format='png', bbox_inches='tight')
     plt.close(fig)
     buf.seek(0)
-
     b64 = base64.b64encode(buf.read()).decode("ascii")
     return f"data:image/png;base64,{b64}"
+
+
 @app.route('/play')
 def play():
     """
@@ -196,13 +198,15 @@ def play():
             recorded_trajectory = []
 
         try:
+            
+            env_render = mo_gym.make("deep-sea-treasure-v0", render_mode = "rgb_array")
             obs, _ = env_render.reset()
             done = trunc = False
 
             while not (done or trunc):
                 with weights_lock:
                     w = weights.copy()
-                action, _ = eval_agent.predict(obs, w, deterministic=True, device="cuda")
+                action, value = eval_agent.predict(obs, w, deterministic=True, device="cuda")
                 next_obs, rew, done, trunc, _ = env_render.step(action[0])
 
                 ret, png = cv2.imencode('.png', env_render.render())
@@ -214,9 +218,11 @@ def play():
                 b64 = base64.b64encode(png.tobytes()).decode('ascii')
                 with record_lock:
                     recorded_trajectory.append({
-                        'state':            obs.tolist(),
+                        'state':            np.round(obs, 3).tolist(),
                         'action':           int(action[0]),
                         'reward_components': (w * rew).tolist(),
+                        'weights':          w.tolist(),
+                        'value':            np.round(value[0], 3).tolist(),
                         'frame_b64':        b64
                     })
 
@@ -273,7 +279,7 @@ def scrub():
 
     # 3) per‐step bar plot of reward components
     # ------------------------------------------------
-    labels = ["Landed","Shaping","Main Engine","Side Engine"]
+    labels = ["Treasure", "Time"]
     values = entry['reward_components']
     fig, ax = plt.subplots()
     ax.bar(labels, values)
@@ -292,6 +298,8 @@ def scrub():
         'state':             entry['state'],
         'action':            entry['action'],
         'reward_components': entry['reward_components'],
+        'weights':           entry['weights'],
+        'value':             entry['value'],
         'frame':             frame_uri,
         'plot':              plot_uri,
         'bar_plot':          bar_uri
@@ -317,6 +325,102 @@ def record_status():
         "length":    length
     })
     
+@app.route('/recompute_action', methods=['POST'])
+def recompute_action():
+    """
+    Given a scrub step and a new weight vector, return the action
+    the agent would now take in that recorded state—without stepping
+    the environment.
+    """
+    # 1) Parse JSON body
+    data = request.get_json(force=True)
+    step       = data.get('step')
+    new_weights = data.get('weights')
+
+    # 2) Ensure recording has finished
+    with recording_lock:
+        if recording_in_progress:
+            return jsonify({'error': 'episode still running'}), 409
+
+    # 3) Validate inputs
+    if step is None or new_weights is None:
+        return jsonify({'error': 'must provide "step" and "weights" in JSON'}), 400
+    try:
+        step = int(step)
+        w_arr = np.array(new_weights, dtype=float)
+    except Exception:
+        return jsonify({'error': '"step" must be int and "weights" a list of floats'}), 400
+
+    # 4) Grab the recorded observation
+    with record_lock:
+        if step < 0 or step >= len(recorded_trajectory):
+            return jsonify({'error': 'step out of range'}), 400
+        obs = np.array(recorded_trajectory[step]['state'])
+
+    # 5) Compute the new action
+    #    Note: agent.predict expects a batch, so wrap obs
+    action_batch, value = eval_agent.predict(
+        obs[np.newaxis, ...],
+        w_arr,
+        deterministic=True,
+        device="cuda"
+    )
+    action0 = action_batch[0]
+    # If discrete, convert to int; if continuous, to list
+    try:
+        action_serialized = int(action0)
+    except (TypeError, ValueError):
+        action_serialized = action0.tolist()
+
+    value_seralized = np.round(value[0], 3)
+    return jsonify({'action': action_serialized,
+                    'value':  value_seralized.tolist()})
+    
+@app.route('/launch_tensorboard', methods=['POST'])
+def launch_tensorboard():
+    """
+    Launch (or re‐use) a TensorBoard server pointing at TENSORBOARD_LOGDIR.
+    Returns JSON with status and the port.
+    """
+    global TB_PROCESS
+
+    # 1) If already running and still alive, just return status
+    if TB_PROCESS is not None and TB_PROCESS.poll() is None:
+        return jsonify({
+            "status": "already_running",
+            "port":   6006
+        })
+
+    # 2) Make sure the logdir exists
+    if not os.path.isdir(MODEL_PATH):
+        return jsonify({
+            "status":  "error",
+            "message": f"logdir not found: {MODEL_PATH}"
+        }), 400
+
+    # 3) Start TensorBoard
+    try:
+        TB_PROCESS = subprocess.Popen([
+            "tensorboard",
+            f"--logdir={MODEL_PATH}",
+            f"--port={6006}",
+            "--host=0.0.0.0"
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+        )
+    except Exception as e:
+        return jsonify({
+            "status":  "error",
+            "message": f"failed to launch TensorBoard: {e}"
+        }), 500
+
+    return jsonify({
+        "status": "started",
+        "port":   6006,
+        "url":   "127.0.0.1:6006"
+    })
 
 
 if __name__ == '__main__':

@@ -69,8 +69,10 @@
           <div class="card-body">
             <form id="weightForm" method="POST" action="/update_weights">
               {% for id,label,val in [
-                  ('w_treasure','Treasure',weights[0]),
-                  ('w_time','Time',weights[1]),
+                  ('w_t1','Target 1',weights[0]),
+                  ('w_t2','Target 2',weights[1]),
+                  ('w_t3','Target 3',weights[2]),
+                  ('w_t4','Target 4',weights[3])
                 ] %}
               <div class="form-group slider-container">
                 <div class="d-flex justify-content-between">
@@ -89,8 +91,6 @@
             <div id="recomputeInfo" style="display:none; margin-top:1rem;">
               <p><strong>Recomputed Action:</strong>
                  <span id="recomputeActionValue"></span>
-              </p>
-              <p><strong>Recomputed Value:</strong>
                  <span id="recomputeValue"></span>
               </p>
             </div>

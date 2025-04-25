@@ -11,6 +11,8 @@ from envs.lunar_lander import LunarLander  # Ensure this is on your PYTHONPATH
 from ppo.agent import DiscreteAgent
 from envs.utils import SyncVectorEnv
 import mo_gymnasium as mo_gym
+import base64
+from io import BytesIO
 
 # Set up paths for templates.
 DIR_PATH = os.path.dirname(os.path.abspath(__file__))
@@ -19,23 +21,29 @@ TEMPLATE_PATH = os.path.join(DIR_PATH, 'templates/')
 app = Flask(__name__, template_folder=TEMPLATE_PATH)
 
 # Global weights vector (initialized as desired) and lock.
-weights = np.array([1, 0,])
+weights = np.array([1, 0])
 weights_lock = threading.Lock()
 
 # Global variable for the accumulated reward for the current episode.
-current_episode_reward = [np.zeros(2), ]
+current_episode_reward = [np.zeros(4), ]
 episode_reward_lock = threading.Lock()
 
 # --- Initialize the agent ---
 # Create a vectorized environment for the agent.
-env_agent = mo_gym.make("deep-sea-treasure-concave-v0", render_mode = "rgb_array")
+env_agent = mo_gym.make("deep-sea-treasure-v0", render_mode = "rgb_array")
 eval_agent = DiscreteAgent(env_agent, reward_size=2).to("cuda")
-model_path = "runs/deep-sea-treasure-concave-v0__main_ppo__2025-04-15 20:09:00.273173__1/main_ppo.rl_model"
+model_path = "runs/deep-sea-treasure-v0__main_ppo__2025-04-25 13:27:58.098098__1/main_ppo.rl_model"
 eval_agent.load_state_dict(torch.load(model_path))
 eval_agent.eval()
 
 # Create a separate (non-vectorized) environment for rendering.
-env_render = mo_gym.make("deep-sea-treasure-concave-v0", render_mode = "rgb_array")
+
+env_render = mo_gym.make("deep-sea-treasure-v0", render_mode = "rgb_array")
+recorded_trajectory = []
+record_lock = threading.Lock()# signal whether a /play episode is currently running
+recording_in_progress = False
+recording_lock = threading.Lock()
+
 
 @app.route('/')
 def index():
@@ -49,8 +57,8 @@ def update_weights():
     data = request.form
     try:
         new_weights = np.array([
-            float(data.get("w_treasure", 0.9)),
-            float(data.get("w_time", 0.7)),
+            float(data.get("w_treasure", 1)),
+            float(data.get("w_time", 0)),
         ])
         print(new_weights)
         with weights_lock:
@@ -108,7 +116,7 @@ def generate_plot():
     with episode_reward_lock:
         data = np.array(current_episode_reward)
     fig, ax = plt.subplots()
-    components = ["Treasure", "Time", ]
+    components = ["Treasure", "Time"]
     # for i in range(8):
     ax.plot(data, label = components)
     ax.set_title("Accumulated Reward per Component (Current Episode)")
@@ -137,7 +145,233 @@ def reward_plot_gen():
 def reward_plot_stream():
     return Response(reward_plot_gen(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
+def generate_partial_plot_uri(step: int) -> str:
+    """
+    Build a cumulative-reward line plot up to `step` and return it
+    as a 'data:image/png;base64,…' URI.
+    """
+    
+    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+    with record_lock:
+        # gather reward vectors up to and including `step`
+        data = np.array([ e['reward_components'] 
+                          for e in recorded_trajectory ])  # shape (step+1, 4)
+
+    # cumulative sum along time
+    cum = data.cumsum(axis=0)
+
+    labels =  ["Treasure", "Time"]
+    fig, ax = plt.subplots()
+    for idx, lbl in enumerate(labels):
+        ax.plot(cum[:, idx], label=lbl)
+    ax.plot([step, step], [cum.min(), cum.max()], 'k--', lw=1)
+    ax.set_title("Cumulative Reward up to step {}".format(step))
+    ax.set_ylabel("Reward")
+    ax.legend(loc="upper left")
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+
+    b64 = base64.b64encode(buf.read()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+@app.route('/play')
+def play():
+    """
+    Streams the simulation as MJPEG and records the trajectory.
+    Ensures recording_in_progress is always cleared, even if the client
+    stops the stream early.
+    """
+    def generate():
+        global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+
+        # Prevent two concurrent plays
+        with recording_lock:
+            if recording_in_progress:
+                return
+            recording_in_progress = True
+            recorded_trajectory = []
+
+        try:
+            
+            env_render = mo_gym.make("deep-sea-treasure-v0", render_mode = "rgb_array")
+            obs, _ = env_render.reset()
+            done = trunc = False
+
+            while not (done or trunc):
+                with weights_lock:
+                    w = weights.copy()
+                action, value = eval_agent.predict(obs, w, deterministic=True, device="cuda")
+                next_obs, rew, done, trunc, _ = env_render.step(action[0])
+
+                ret, png = cv2.imencode('.png', env_render.render())
+                if not ret:
+                    obs = next_obs
+                    continue
+
+                # record
+                b64 = base64.b64encode(png.tobytes()).decode('ascii')
+                with record_lock:
+                    recorded_trajectory.append({
+                        'state':            np.round(obs, 3).tolist(),
+                        'action':           int(action[0]),
+                        'reward_components': (w * rew).tolist(),
+                        'weights':          w.tolist(),
+                        'value':            np.round(value[0], 3).tolist(),
+                        'frame_b64':        b64
+                    })
+
+                # stream
+                yield (
+                    b'--frame\r\n'
+                    b'Content-Type: image/png\r\n\r\n' +
+                    png.tobytes() +
+                    b'\r\n'
+                )
+
+                time.sleep(0.03)
+                obs = next_obs
+                
+        except Exception as e:
+            print("Error during simulation:", e)
+            # Handle any exceptions that occur during the simulation
+            # You can log the error or take appropriate action here
+
+        finally :
+            print("In Finally")
+            # ALWAYS clear the flag, even if client aborted
+            with recording_lock:
+                recording_in_progress = False
+
+    return Response(
+        generate(),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
+
+
+@app.route('/scrub')
+def scrub():
+    # block while recording
+    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+    
+    with recording_lock:
+        if recording_in_progress:
+            return jsonify({'error':'episode still running'}), 409
+
+    step = request.args.get('step', type=int)
+    if step is None:
+        return jsonify({'error':'must provide ?step=N'}), 400
+
+    with record_lock:
+        if step < 0 or step >= len(recorded_trajectory):
+            return jsonify({'error':'step out of range'}), 400
+        entry = recorded_trajectory[step]
+
+    # 1) frame data URI
+    frame_uri = f"data:image/png;base64,{entry['frame_b64']}"
+    # 2) cumulative‐reward line plot up to step
+    plot_uri  = generate_partial_plot_uri(step)
+
+    # 3) per‐step bar plot of reward components
+    # ------------------------------------------------
+    labels = ["Treasure", "Time"]
+    values = entry['reward_components']
+    fig, ax = plt.subplots()
+    ax.bar(labels, values)
+    ax.set_title(f"Reward Components at Step {step}")
+    ax.set_ylabel("Reward")
+    buf = BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    bar_b64 = base64.b64encode(buf.read()).decode("ascii")
+    bar_uri = f"data:image/png;base64,{bar_b64}"
+    # ------------------------------------------------
+
+    return jsonify({
+        'step':              step,
+        'state':             entry['state'],
+        'action':            entry['action'],
+        'reward_components': entry['reward_components'],
+        'weights':           entry['weights'],
+        'value':             entry['value'],
+        'frame':             frame_uri,
+        'plot':              plot_uri,
+        'bar_plot':          bar_uri
+    })
+
+@app.route('/record_status')
+def record_status():
+    """
+    Returns whether a recording is in progress, and how many steps have been recorded so far.
+    Front-end polls this to know when to re-enable scrubbing.
+    """
+    # read the “in progress” flag
+    
+    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+    with recording_lock:
+        in_progress = recording_in_progress
+        print("RECORD STATUS", in_progress)
+    # read the current recorded length
+    with record_lock:
+        length = len(recorded_trajectory)
+    return jsonify({
+        "recording": in_progress,
+        "length":    length
+    })
+    
+@app.route('/recompute_action', methods=['POST'])
+def recompute_action():
+    """
+    Given a scrub step and a new weight vector, return the action
+    the agent would now take in that recorded state—without stepping
+    the environment.
+    """
+    # 1) Parse JSON body
+    data = request.get_json(force=True)
+    step       = data.get('step')
+    new_weights = data.get('weights')
+
+    # 2) Ensure recording has finished
+    with recording_lock:
+        if recording_in_progress:
+            return jsonify({'error': 'episode still running'}), 409
+
+    # 3) Validate inputs
+    if step is None or new_weights is None:
+        return jsonify({'error': 'must provide "step" and "weights" in JSON'}), 400
+    try:
+        step = int(step)
+        w_arr = np.array(new_weights, dtype=float)
+    except Exception:
+        return jsonify({'error': '"step" must be int and "weights" a list of floats'}), 400
+
+    # 4) Grab the recorded observation
+    with record_lock:
+        if step < 0 or step >= len(recorded_trajectory):
+            return jsonify({'error': 'step out of range'}), 400
+        obs = np.array(recorded_trajectory[step]['state'])
+
+    # 5) Compute the new action
+    #    Note: agent.predict expects a batch, so wrap obs
+    action_batch, value = eval_agent.predict(
+        obs[np.newaxis, ...],
+        w_arr,
+        deterministic=True,
+        device="cuda"
+    )
+    action0 = action_batch[0]
+    # If discrete, convert to int; if continuous, to list
+    try:
+        action_serialized = int(action0)
+    except (TypeError, ValueError):
+        action_serialized = action0.tolist()
+
+    value_seralized = np.round(value[0], 3)
+    return jsonify({'action': action_serialized,
+                    'value':  value_seralized.tolist()})
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=5043, debug=False)

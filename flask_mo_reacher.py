@@ -30,15 +30,15 @@ episode_reward_lock = threading.Lock()
 
 # --- Initialize the agent ---
 # Create a vectorized environment for the agent.
-env_agent = mo_gym.make("mo-lunar-lander-v3", render_mode = "rgb_array")
+env_agent = mo_gym.make("mo-reacher-v5", render_mode = "rgb_array")
 eval_agent = DiscreteAgent(env_agent, reward_size=4).to("cuda")
-model_path = "runs/mo-lunar-lander-v3__main_ppo__2025-04-15 15:06:33.790188__1/main_ppo.rl_model"
+model_path = "runs/mo-reacher-v5__main_ppo__2025-04-24 22:15:19.024851__1/main_ppo.rl_model"
 eval_agent.load_state_dict(torch.load(model_path))
 eval_agent.eval()
 
 # Create a separate (non-vectorized) environment for rendering.
-env_render = mo_gym.make("mo-lunar-lander-v3", render_mode = "rgb_array")
 
+env_render = mo_gym.make("mo-reacher-v5", render_mode = "rgb_array")
 recorded_trajectory = []
 record_lock = threading.Lock()# signal whether a /play episode is currently running
 recording_in_progress = False
@@ -48,7 +48,7 @@ recording_lock = threading.Lock()
 @app.route('/')
 def index():
     # Pass current weights to the template for slider initialization.
-    return render_template('mo_lander.html', weights=weights.tolist())
+    return render_template('mo_reacher.html', weights=weights.tolist())
 
 @app.route('/update_weights', methods=['POST'])
 def update_weights():
@@ -57,10 +57,10 @@ def update_weights():
     data = request.form
     try:
         new_weights = np.array([
-            float(data.get("w_landed", 1)),
-            float(data.get("w_shaping", 0)),
-            float(data.get("w_main_engine", 0.0)),
-            float(data.get("w_side_engine", 0.)),
+            float(data.get("w_t1", 1)),
+            float(data.get("w_t2", 0)),
+            float(data.get("w_t3", 0.0)),
+            float(data.get("w_t4", 0.)),
         ])
         print(new_weights)
         with weights_lock:
@@ -118,7 +118,7 @@ def generate_plot():
     with episode_reward_lock:
         data = np.array(current_episode_reward)
     fig, ax = plt.subplots()
-    components = ["Landed", "Shaping", "Main Engine", "Side Engine", ]
+    components = ["Target 1", "Target 2", "Target 3", "Target 4" ]
     # for i in range(8):
     ax.plot(data, label = components)
     ax.set_title("Accumulated Reward per Component (Current Episode)")
@@ -162,7 +162,7 @@ def generate_partial_plot_uri(step: int) -> str:
     # cumulative sum along time
     cum = data.cumsum(axis=0)
 
-    labels = ["Landed","Shaping","Main Engine","Side Engine"]
+    labels = ["Target 1", "Target 2", "Target 3", "Target 4" ]
     fig, ax = plt.subplots()
     for idx, lbl in enumerate(labels):
         ax.plot(cum[:, idx], label=lbl)
@@ -196,13 +196,15 @@ def play():
             recorded_trajectory = []
 
         try:
+            
+            env_render = mo_gym.make("mo-reacher-v5", render_mode = "rgb_array")
             obs, _ = env_render.reset()
             done = trunc = False
 
             while not (done or trunc):
                 with weights_lock:
                     w = weights.copy()
-                action, _ = eval_agent.predict(obs, w, deterministic=True, device="cuda")
+                action, value = eval_agent.predict(obs, w, deterministic=True, device="cuda")
                 next_obs, rew, done, trunc, _ = env_render.step(action[0])
 
                 ret, png = cv2.imencode('.png', env_render.render())
@@ -214,9 +216,11 @@ def play():
                 b64 = base64.b64encode(png.tobytes()).decode('ascii')
                 with record_lock:
                     recorded_trajectory.append({
-                        'state':            obs.tolist(),
+                        'state':            np.round(obs, 3).tolist(),
                         'action':           int(action[0]),
                         'reward_components': (w * rew).tolist(),
+                        'weights':          w.tolist(),
+                        'value':            np.round(value[0], 3).tolist(),
                         'frame_b64':        b64
                     })
 
@@ -273,7 +277,7 @@ def scrub():
 
     # 3) per‐step bar plot of reward components
     # ------------------------------------------------
-    labels = ["Landed","Shaping","Main Engine","Side Engine"]
+    labels = ["Target 1", "Target 2", "Target 3", "Target 4" ]
     values = entry['reward_components']
     fig, ax = plt.subplots()
     ax.bar(labels, values)
@@ -292,6 +296,8 @@ def scrub():
         'state':             entry['state'],
         'action':            entry['action'],
         'reward_components': entry['reward_components'],
+        'weights':           entry['weights'],
+        'value':             entry['value'],
         'frame':             frame_uri,
         'plot':              plot_uri,
         'bar_plot':          bar_uri
@@ -317,6 +323,56 @@ def record_status():
         "length":    length
     })
     
+@app.route('/recompute_action', methods=['POST'])
+def recompute_action():
+    """
+    Given a scrub step and a new weight vector, return the action
+    the agent would now take in that recorded state—without stepping
+    the environment.
+    """
+    # 1) Parse JSON body
+    data = request.get_json(force=True)
+    step       = data.get('step')
+    new_weights = data.get('weights')
+
+    # 2) Ensure recording has finished
+    with recording_lock:
+        if recording_in_progress:
+            return jsonify({'error': 'episode still running'}), 409
+
+    # 3) Validate inputs
+    if step is None or new_weights is None:
+        return jsonify({'error': 'must provide "step" and "weights" in JSON'}), 400
+    try:
+        step = int(step)
+        w_arr = np.array(new_weights, dtype=float)
+    except Exception:
+        return jsonify({'error': '"step" must be int and "weights" a list of floats'}), 400
+
+    # 4) Grab the recorded observation
+    with record_lock:
+        if step < 0 or step >= len(recorded_trajectory):
+            return jsonify({'error': 'step out of range'}), 400
+        obs = np.array(recorded_trajectory[step]['state'])
+
+    # 5) Compute the new action
+    #    Note: agent.predict expects a batch, so wrap obs
+    action_batch, value = eval_agent.predict(
+        obs[np.newaxis, ...],
+        w_arr,
+        deterministic=True,
+        device="cuda"
+    )
+    action0 = action_batch[0]
+    # If discrete, convert to int; if continuous, to list
+    try:
+        action_serialized = int(action0)
+    except (TypeError, ValueError):
+        action_serialized = action0.tolist()
+
+    value_seralized = np.round(value[0], 3)
+    return jsonify({'action': action_serialized,
+                    'value':  value_seralized.tolist()})
 
 
 if __name__ == '__main__':
