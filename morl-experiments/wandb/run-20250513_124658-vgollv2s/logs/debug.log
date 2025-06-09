@@ -1,0 +1,32 @@
+2025-05-13 12:46:58,797 INFO    MainThread:3980275 [wandb_setup.py:_flush():68] Current SDK version is 0.19.10
+2025-05-13 12:46:58,798 INFO    MainThread:3980275 [wandb_setup.py:_flush():68] Configure stats pid to 3980275
+2025-05-13 12:46:58,798 INFO    MainThread:3980275 [wandb_setup.py:_flush():68] Loading settings from /home/grads/tsa5252/.config/wandb/settings
+2025-05-13 12:46:58,798 INFO    MainThread:3980275 [wandb_setup.py:_flush():68] Loading settings from /scratch1/tsa5252/reward-decomposition/morl-experiments/wandb/settings
+2025-05-13 12:46:58,798 INFO    MainThread:3980275 [wandb_setup.py:_flush():68] Loading settings from environment variables
+2025-05-13 12:46:58,798 INFO    MainThread:3980275 [wandb_init.py:setup_run_log_directory():724] Logging user logs to /scratch1/tsa5252/reward-decomposition/morl-experiments/wandb/run-20250513_124658-vgollv2s/logs/debug.log
+2025-05-13 12:46:58,798 INFO    MainThread:3980275 [wandb_init.py:setup_run_log_directory():725] Logging internal logs to /scratch1/tsa5252/reward-decomposition/morl-experiments/wandb/run-20250513_124658-vgollv2s/logs/debug-internal.log
+2025-05-13 12:46:58,800 INFO    MainThread:3980275 [wandb_init.py:init():852] calling init triggers
+2025-05-13 12:46:58,800 INFO    MainThread:3980275 [wandb_init.py:init():857] wandb.init called with sweep_config: {}
+config: {'env_id': 'mo-ant-v5', 'scalarization_method': 'ws', 'evaluation_mode': 'ser', 'gamma': 0.99, 'pop_size': 6, 'exchange_every': 50000, 'neighborhood_size': 1, 'shared_buffer': True, 'update_passes': 10, 'transfer': False, 'weight_init_method': 'uniform', 'weight_adapt_method': None, 'delta_adapt': None, 'project_name': 'MORL-Baselines', 'experiment_name': 'MORL-D(MOSAC)-SB', 'seed': 0, 'log': True, 'device': device(type='cuda'), 'policy_name': 'MOSAC', 'buffer_size': 1000000, 'tau': 0.005, 'batch_size': 128, 'learning_starts': 1000, 'net_arch': [256, 256], 'policy_lr': 0.0003, 'q_lr': 0.001, 'policy_freq': 2, 'target_net_freq': 1, 'alpha': 1.0, 'autotune': True, 'algo': 'MORL-D(MOSAC)-SB', '_wandb': {'code_path': 'code/morl-experiments/pcn.py'}}
+2025-05-13 12:46:58,800 INFO    MainThread:3980275 [wandb_init.py:init():893] starting backend
+2025-05-13 12:46:58,800 INFO    MainThread:3980275 [wandb_init.py:init():897] sending inform_init request
+2025-05-13 12:46:58,814 INFO    MainThread:3980275 [backend.py:_multiprocessing_setup():101] multiprocessing start_methods=fork,spawn,forkserver, using: spawn
+2025-05-13 12:46:58,814 INFO    MainThread:3980275 [wandb_init.py:init():907] backend started and connected
+2025-05-13 12:46:58,818 INFO    MainThread:3980275 [wandb_init.py:init():1002] updated telemetry
+2025-05-13 12:46:58,831 INFO    MainThread:3980275 [wandb_init.py:init():1026] communicating run to backend with 90.0 second timeout
+2025-05-13 12:46:59,397 INFO    MainThread:3980275 [wandb_init.py:init():1101] starting run threads in backend
+2025-05-13 12:46:59,614 INFO    MainThread:3980275 [wandb_run.py:_console_start():2566] atexit reg
+2025-05-13 12:46:59,615 INFO    MainThread:3980275 [wandb_run.py:_redirect():2414] redirect: wrap_raw
+2025-05-13 12:46:59,615 INFO    MainThread:3980275 [wandb_run.py:_redirect():2483] Wrapping output streams.
+2025-05-13 12:46:59,615 INFO    MainThread:3980275 [wandb_run.py:_redirect():2506] Redirects installed.
+2025-05-13 12:46:59,620 INFO    MainThread:3980275 [wandb_init.py:init():1147] run started, returning control to user process
+2025-05-13 12:46:59,621 INFO    MainThread:3980275 [wandb_config.py:__setitem__():154] [no run ID] config set total_timesteps = 2000000.0 - <bound method Run._config_callback of <wandb.sdk.wandb_run.Run object at 0x7f47b0366b90>>
+2025-05-13 12:46:59,622 INFO    MainThread:3980275 [wandb_run.py:_config_callback():1429] config_cb total_timesteps 2000000.0 None
+2025-05-13 12:46:59,622 INFO    MainThread:3980275 [wandb_config.py:__setitem__():154] [no run ID] config set ref_point = [-100.0, -100.0, -100.0] - <bound method Run._config_callback of <wandb.sdk.wandb_run.Run object at 0x7f47b0366b90>>
+2025-05-13 12:46:59,622 INFO    MainThread:3980275 [wandb_run.py:_config_callback():1429] config_cb ref_point [-100.0, -100.0, -100.0] None
+2025-05-13 12:46:59,623 INFO    MainThread:3980275 [wandb_config.py:__setitem__():154] [no run ID] config set known_front = None - <bound method Run._config_callback of <wandb.sdk.wandb_run.Run object at 0x7f47b0366b90>>
+2025-05-13 12:46:59,623 INFO    MainThread:3980275 [wandb_run.py:_config_callback():1429] config_cb known_front None None
+2025-05-13 12:46:59,623 INFO    MainThread:3980275 [wandb_config.py:__setitem__():154] [no run ID] config set num_eval_weights_for_eval = 50 - <bound method Run._config_callback of <wandb.sdk.wandb_run.Run object at 0x7f47b0366b90>>
+2025-05-13 12:46:59,623 INFO    MainThread:3980275 [wandb_run.py:_config_callback():1429] config_cb num_eval_weights_for_eval 50 None
+2025-05-13 12:46:59,623 INFO    MainThread:3980275 [wandb_config.py:__setitem__():154] [no run ID] config set num_eval_episodes_for_front = 5 - <bound method Run._config_callback of <wandb.sdk.wandb_run.Run object at 0x7f47b0366b90>>
+2025-05-13 12:46:59,624 INFO    MainThread:3980275 [wandb_run.py:_config_callback():1429] config_cb num_eval_episodes_for_front 5 None

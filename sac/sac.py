@@ -1,155 +1,265 @@
-import os
+import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.optim import Adam
-from sac.utils import soft_update, hard_update
-from sac.networks import GaussianPolicy, QNetwork, DeterministicPolicy
+from sac.agent import VectorizedSACAgent
+from torch.utils.tensorboard import SummaryWriter
+from uuid import uuid4
 
 
-class SAC(object):
-    def __init__(self, state_space, action_space, reward_size, gamma, tau, alpha, policy, automatic_entropy_tuning, target_update_interval, cuda, hidden_size, lr):
 
+class VectorReplayBuffer:
+    """Replay Buffer for vectorized envs (stores experience for each env in batch)."""
+    def __init__(self, obs_dim, act_dim, size, num_envs, reward_size=1):
+        self.num_envs = num_envs
+        self.obs_buf = np.zeros([size, num_envs, obs_dim], dtype=np.float32)
+        self.next_obs_buf = np.zeros([size, num_envs, obs_dim], dtype=np.float32)
+        self.acts_buf = np.zeros([size, num_envs, act_dim], dtype=np.float32)
+        self.rews_buf = np.zeros([size, num_envs, reward_size], dtype=np.float32)
+        self.done_buf = np.zeros([size, num_envs], dtype=np.float32)
+        self.ptr, self.size, self.max_size = 0, 0, size
+
+    def store(self, obs, act, rew, next_obs, done):
+        """All inputs shape: [num_envs, ...]"""
+        self.obs_buf[self.ptr] = obs
+        self.acts_buf[self.ptr] = act
+        self.rews_buf[self.ptr] = rew
+        self.next_obs_buf[self.ptr] = next_obs
+        self.done_buf[self.ptr] = done
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
+
+    def sample_batch(self, batch_size):
+        idxs = np.random.randint(0, self.size, size=batch_size)
+        env_idxs = np.random.randint(0, self.num_envs, size=batch_size)
+        batch = dict(
+            obs=self.obs_buf[idxs, env_idxs],
+            obs2=self.next_obs_buf[idxs, env_idxs],
+            acts=self.acts_buf[idxs, env_idxs],
+            rews=self.rews_buf[idxs, env_idxs],
+            done=self.done_buf[idxs, env_idxs],
+        )
+        return batch
+
+class SACLogger:
+    def __init__(self, run_name=None, use_tensorboard=True, reward_size=1, num_envs=1):
+        self.use_tensorboard = use_tensorboard
+        self.reward_size = reward_size
+        self.num_envs = num_envs
+        if self.use_tensorboard:
+            run_name = str(uuid4()).hex if run_name is None else run_name
+            self.writer = SummaryWriter(f"runs/{run_name}")
+        self._global_step = 0
+
+    def log_rollout_step(self, infos, global_step):
+        if "episode" in infos:
+            non_zero_rews = infos['episode']['r'][infos['_episode']]
+            non_zero_lens = infos['episode']['l'][infos['_episode']]
+            non_zero_comps = []
+            for i in range(self.reward_size):
+                non_zero_comps.append(infos['episode'][f'r'][infos['_episode']][:,i].mean())
+            print(
+                f"global_step={global_step}, episodic_return={non_zero_rews.mean(axis = 0)}",
+                flush=True,
+            )
+
+            if self.use_tensorboard:
+                self.writer.add_scalar(
+                    "charts/episodic_return", non_zero_rews.mean(), global_step
+                )
+                self.writer.add_scalar(
+                    "charts/episodic_length", non_zero_lens.mean(), global_step
+                )
+                for i in range(self.reward_size):
+                    self.writer.add_scalar(
+                        f"charts/episodic_reward_{i}", non_zero_comps[i].mean(), global_step
+                    )
+
+    def log_training(self, update_results, step):
+        """Log all the losses and diagnostics in update_results dict."""
+        if self.use_tensorboard:
+            for k, v in update_results.items():
+                self.writer.add_scalar(k, v, step)
+
+
+class SAC:
+    def __init__(
+        self,
+        agent,
+        env,                # a vectorized environment
+        replay_buffer,
+        optimizer_actor,
+        optimizer_critic,
+        batch_size=256,
+        gamma=0.99,
+        tau=0.005,
+        alpha=0.2,
+        automatic_entropy_tuning=True,
+        target_entropy=None,
+        total_steps=1_000_000,
+        initial_random_steps=10_000,
+        update_after=1_000,
+        update_every=50,
+        logger=None,
+        lr=3e-4,
+        anneal_lr=True,
+    ):
+        self.agent = agent
+        self.env = env
+        self.buffer = replay_buffer
+        self.batch_size = batch_size
         self.gamma = gamma
         self.tau = tau
         self.alpha = alpha
-        self.reward_size = reward_size
-        self.state_space = state_space
-        self.reward_size = reward_size
-        self.action_space = action_space
-
-        self.policy_type = policy
-        self.target_update_interval = target_update_interval
         self.automatic_entropy_tuning = automatic_entropy_tuning
+        self.target_entropy = (
+            target_entropy or -np.prod(env.single_action_space.shape)
+        )
+        self.total_steps = total_steps
+        self.initial_random_steps = initial_random_steps
+        self.update_after = update_after
+        self.update_every = update_every
+        self.device = next(agent.actor.parameters()).device
+        self.optimizer_actor = optimizer_actor
+        self.optimizer_critic = optimizer_critic
+        self.anneal_lr = anneal_lr
+        self.lr = lr
 
-        self.device = torch.device("cuda" if cuda else "cpu")
+        self.lr_scheduler = None
+        self.logger = logger or SACLogger()
+        self._global_step = 0
 
-        self.critic = QNetwork(state_space.shape[0] + self.reward_size, action_space.shape[0], hidden_size, reward_size).to(device=self.device)
-        self.critic_optim = Adam(self.critic.parameters(), lr=lr)
-
-        self.critic_target = QNetwork(state_space.shape[0] + self.reward_size, action_space.shape[0], hidden_size, reward_size).to(self.device)
-        hard_update(self.critic_target, self.critic)
-
-        if self.policy_type == "Gaussian":
-            # Target Entropy = −dim(A) (e.g. , -6 for HalfCheetah-v2) as given in the paper
-            if self.automatic_entropy_tuning is True:
-                self.target_entropy = -torch.prod(torch.Tensor(action_space.shape).to(self.device)).item()
-                self.log_alpha = torch.zeros(self.reward_size, requires_grad=True, device=self.device)
-                self.alpha_optim = Adam([self.log_alpha], lr=lr)
-
-            self.policy = GaussianPolicy(state_space.shape[0] + self.reward_size, action_space.shape[0], hidden_size, action_space).to(self.device)
-            self.policy_optim = Adam(self.policy.parameters(), lr=lr)
-
+        # Automatic entropy tuning
+        if automatic_entropy_tuning:
+            self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+            self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=lr)
         else:
-            self.alpha = 0
-            self.automatic_entropy_tuning = False
-            self.policy = DeterministicPolicy(state_space.shape[0] + self.reward_size, action_space.shape[0], hidden_size, action_space).to(self.device)
-            self.policy_optim = Adam(self.policy.parameters(), lr=lr)
+            self.log_alpha = None
+            self.alpha_optim = None
 
-    def select_action(self, state, evaluate=False):
-        ndim = state.ndim
-        if state.ndim == 1:
-            state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+        self.num_envs = getattr(env, "num_envs", 1)
+        self.reward_size = getattr(env, "rewards_shape", (1,))[-1]  # Last dimension of rewards shape
+
+    def learn(self):
+        obs, _ = self.env.reset(seed=None)
+        episode_rewards = np.zeros((self.num_envs, self.reward_size),  dtype=np.float32)
+        episode_lengths = np.zeros(self.num_envs, dtype=np.int32)
+        episode_counts = np.zeros(self.num_envs, dtype=np.int32)
+        ep_returns_buffer = [[] for _ in range(self.num_envs)]
+        num_updates = self.total_steps // self.update_every
+
+        if self.anneal_lr:
+            self.lr_scheduler = self.create_lr_scheduler(num_updates)
+
+        for t in range(1, self.total_steps + 1):
+            if t < self.initial_random_steps:
+                action = np.array([self.env.single_action_space.sample() for _ in range(self.num_envs)])
+            else:
+                obs_tensor = torch.FloatTensor(obs).to(self.device)
+                with torch.no_grad():
+                    actions, _ = self.agent.actor.sample(obs_tensor)
+                action = actions.cpu().numpy()
+
+            next_obs, rewards, dones, truncs, infos = self.env.step(action)
+            # Each of these is shape [num_envs, ...]
+
+            # Track episodic returns
+            episode_rewards += rewards
+            episode_lengths += 1
+
+            # Log completed episodes
+            for i in range(self.num_envs):
+                if dones[i] or truncs[i]:
+                    ep_return = episode_rewards[i]
+                    self.logger.log_rollout_step(infos, t)
+                    ep_returns_buffer[i].append(ep_return)
+                    episode_rewards[i] = 0
+                    episode_lengths[i] = 0
+                    episode_counts[i] += 1
+
+            # Store transition for all envs in buffer
+            self.buffer.store(obs, action, rewards, next_obs, dones | truncs)
+
+            obs = next_obs
+
+            # Policy/critic updates after enough steps
+            if t >= self.update_after and t % self.update_every == 0:
+                if self.anneal_lr:
+                    self.lr_scheduler.step()
+                for _ in range(self.update_every):
+                    self.update_parameters()
+
+            self._global_step = t
+
+        return self.agent
+
+    def update_parameters(self):
+        batch = self.buffer.sample_batch(self.batch_size)
+        obs = torch.FloatTensor(batch["obs"]).to(self.device)
+        obs2 = torch.FloatTensor(batch["obs2"]).to(self.device)
+        acts = torch.FloatTensor(batch["acts"]).to(self.device)
+        rews = torch.FloatTensor(batch["rews"]).to(self.device)
+        done = torch.FloatTensor(batch["done"]).to(self.device)
+
+        # Handle vector reward
+        reward_size = rews.shape[-1] if rews.ndim > 1 else 1
+        if reward_size == 1:
+            rews = rews.unsqueeze(-1)
+            done = done.unsqueeze(-1)
         else:
-            state = torch.FloatTensor(state).to(self.device)    
-        if evaluate is False:
-            action, _, _ = self.policy.sample(state)
-        else:
-            _, _, action = self.policy.sample(state)
+            # Already shape [batch, reward_size]
+            done = done.unsqueeze(-1).expand(-1, reward_size)
 
-        if ndim == 1:
-            action = action.squeeze(0)
-        return action.detach().cpu().numpy()
-
-    def update_parameters(self, memory, batch_size, updates):
-        # Sample a batch from memory
-        state_batch, action_batch, reward_batch, next_state_batch, mask_batch = memory.sample(batch_size=batch_size)
-
-        state_batch = torch.FloatTensor(state_batch).to(self.device)
-        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
-        action_batch = torch.FloatTensor(action_batch).to(self.device)
-        reward_batch = torch.FloatTensor(reward_batch).to(self.device).reshape(-1, self.reward_size)
-        mask_batch = torch.FloatTensor(mask_batch).to(self.device).unsqueeze(1)
-
+        # === Critic update (PCGrad-style, per-objective) ===
+        critic_loss = 0.0
+        self.optimizer_critic.zero_grad()
+        q1, q2 = self.agent.critic(obs, acts)
         with torch.no_grad():
-            next_state_action, next_state_log_pi, _ = self.policy.sample(next_state_batch)
-            qf1_next_target, qf2_next_target = self.critic_target(next_state_batch, next_state_action)
-            # print(torch.minimum(qf1_next_target, qf2_next_target).shape)
-            min_qf_next_target = torch.minimum(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
-            next_q_value = reward_batch + (1 - mask_batch) * self.gamma * (min_qf_next_target)
-        
+            next_action, next_logp = self.agent.sample_action_and_compute_log_prob(obs2)
+            target_q1, target_q2 = self.agent.critic_target(obs2, next_action)
+            target_q = torch.min(target_q1, target_q2) - self.alpha * next_logp
+            q_target = rews + (1 - done) * self.gamma * target_q
 
-        qf1, qf2 = self.critic(state_batch, action_batch)  # Two Q-functions to mitigate positive bias in the policy improvement step
-        qf1_loss = torch.sum(torch.pow(qf1 - next_q_value, 2), dim = 1).mean()  # JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
-        qf2_loss = torch.sum(torch.pow(qf2 - next_q_value, 2), dim = 1).mean()   # JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
-        qf_loss = qf1_loss + qf2_loss
+        # Sum of MSE losses per reward dimension, each backwarded
+        for i in range(reward_size):
+            q1_loss = F.mse_loss(q1[:, i], q_target[:, i])
+            q2_loss = F.mse_loss(q2[:, i], q_target[:, i])
+            (q1_loss + q2_loss).backward(retain_graph=True)
+            critic_loss += (q1_loss + q2_loss).item()
+        self.optimizer_critic.step()
 
-        self.critic_optim.zero_grad()
-        qf_loss.backward()
-        self.critic_optim.step()
+        # === Policy update (PCGrad-style, per-objective) ===
+        policy_loss = 0.0
+        self.optimizer_actor.zero_grad()
+        pi, logp = self.agent.actor.sample(obs)
+        q1_pi, q2_pi = self.agent.critic(obs, pi)
+        min_q_pi = torch.min(q1_pi, q2_pi)
+        # Policy loss for each reward dimension
+        for i in range(reward_size):
+            pol_loss = ((self.alpha * logp.squeeze(-1)) - min_q_pi[:, i]).mean()
+            pol_loss.backward(retain_graph=True)
+            policy_loss += pol_loss.item()
+        self.optimizer_actor.step()
 
-        pi, log_pi, _ = self.policy.sample(state_batch)
-
-        qf1_pi, qf2_pi = self.critic(state_batch, pi)
-        min_qf_pi = torch.minimum(qf1_pi, qf2_pi)
-
-        min_qf_pi = (min_qf_pi - min_qf_pi.mean(dim = 0))/(min_qf_pi.std(dim = 0) + 1e-6) # Normalize the Q-values to have mean 0 and std 1
-
-        policy_loss = ((self.alpha * log_pi) - min_qf_pi) # Jπ = 𝔼st∼D,εt∼N[α * logπ(f(εt;st)|st) − Q(st,f(εt;st))]
-        
-        policy_loss = torch.sum(policy_loss, dim = 1).mean()
-
-        self.policy_optim.zero_grad()
-        policy_loss.backward()
-        self.policy_optim.step()
-
+        # === Entropy (temperature) update ===
         if self.automatic_entropy_tuning:
-            alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
-
+            alpha_loss = -(self.log_alpha * (logp + self.target_entropy).detach()).mean()
             self.alpha_optim.zero_grad()
             alpha_loss.backward()
             self.alpha_optim.step()
-
-            self.alpha = self.log_alpha.exp()
-            alpha_tlogs = self.alpha.clone() # For TensorboardX logs
+            self.alpha = self.log_alpha.exp().detach()
         else:
-            alpha_loss = torch.tensor(0.).to(self.device)
-            alpha_tlogs = torch.tensor(self.alpha) # For TensorboardX logs
+            alpha_loss = torch.tensor(0.0)
 
+        # === Target network update (soft) ===
+        for param, target_param in zip(self.agent.critic.parameters(), self.agent.critic_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-        if updates % self.target_update_interval == 0:
-            soft_update(self.critic_target, self.critic, self.tau)
+        # === Logging ===
+        info = {
+            "losses/critic_loss": critic_loss,
+            "losses/policy_loss": policy_loss,
+            "losses/alpha_loss": alpha_loss.item() if self.automatic_entropy_tuning else 0.0,
+            "alpha": self.alpha.item() if self.automatic_entropy_tuning else self.alpha,
+        }
+        self.logger.log_training(info, self._global_step)
 
-        return qf1_loss.item(), qf2_loss.item(), policy_loss.item(), alpha_loss.item(), alpha_tlogs.item()
-
-    # Save model parameters
-    def save_checkpoint(self, env_name, suffix="", ckpt_path=None):
-        if not os.path.exists('checkpoints/'):
-            os.makedirs('checkpoints/')
-        if ckpt_path is None:
-            ckpt_path = "checkpoints/sac_checkpoint_{}_{}".format(env_name, suffix)
-        print('Saving models to {}'.format(ckpt_path))
-        torch.save({'policy_state_dict': self.policy.state_dict(),
-                    'critic_state_dict': self.critic.state_dict(),
-                    'critic_target_state_dict': self.critic_target.state_dict(),
-                    'critic_optimizer_state_dict': self.critic_optim.state_dict(),
-                    'policy_optimizer_state_dict': self.policy_optim.state_dict()}, ckpt_path)
-
-    # Load model parameters
-    def load_checkpoint(self, ckpt_path, evaluate=False):
-        print('Loading models from {}'.format(ckpt_path))
-        if ckpt_path is not None:
-            checkpoint = torch.load(ckpt_path)
-            self.policy.load_state_dict(checkpoint['policy_state_dict'])
-            self.critic.load_state_dict(checkpoint['critic_state_dict'])
-            self.critic_target.load_state_dict(checkpoint['critic_target_state_dict'])
-            self.critic_optim.load_state_dict(checkpoint['critic_optimizer_state_dict'])
-            self.policy_optim.load_state_dict(checkpoint['policy_optimizer_state_dict'])
-
-            if evaluate:
-                self.policy.eval()
-                self.critic.eval()
-                self.critic_target.eval()
-            else:
-                self.policy.train()
-                self.critic.train()
-                self.critic_target.train()

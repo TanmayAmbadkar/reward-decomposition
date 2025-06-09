@@ -1,0 +1,25 @@
+Starting training...
+Current pareto archive:
+[array([-4.8519367 , -3.54180526, -2.5230245 ]), array([-1.83030159, -9.7657215 , -4.87661099]), array([ 16.04806018, -21.77472976,  -8.33528201])]
+[]
+SPS: 102
+SPS: 91
+Traceback (most recent call last):
+  File "/scratch1/tsa5252/reward-decomposition/pcn.py", line 40, in <module>
+    main()
+  File "/scratch1/tsa5252/reward-decomposition/pcn.py", line 31, in main
+    algo.train(
+  File "/scratch1/tsa5252/anaconda3/envs/rewarddecomp/lib/python3.11/site-packages/morl_baselines/multi_policy/morld/morld.py", line 465, in train
+    policy.wrapped.train(self.exchange_every, eval_env=eval_env, start_time=start_time)
+  File "/scratch1/tsa5252/anaconda3/envs/rewarddecomp/lib/python3.11/site-packages/morl_baselines/single_policy/ser/mosac_continuous_action.py", line 471, in train
+    self.update()
+  File "/scratch1/tsa5252/anaconda3/envs/rewarddecomp/lib/python3.11/site-packages/morl_baselines/single_policy/ser/mosac_continuous_action.py", line 360, in update
+    (mb_obs, mb_act, mb_rewards, mb_next_obs, mb_dones) = self.buffer.sample(
+                                                          ^^^^^^^^^^^^^^^^^^^
+  File "/scratch1/tsa5252/anaconda3/envs/rewarddecomp/lib/python3.11/site-packages/morl_baselines/common/buffer.py", line 80, in sample
+    return tuple(map(lambda x: th.tensor(x, device=device), experience_tuples))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch1/tsa5252/anaconda3/envs/rewarddecomp/lib/python3.11/site-packages/morl_baselines/common/buffer.py", line 80, in <lambda>
+    return tuple(map(lambda x: th.tensor(x, device=device), experience_tuples))
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

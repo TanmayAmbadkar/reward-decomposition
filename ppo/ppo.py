@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
-import torchbnn as bnn
+from torch.distributions.dirichlet import Dirichlet
 
 
 class LinearLRSchedule:
@@ -19,7 +19,9 @@ class LinearLRSchedule:
         frac = 1.0 - (self.current_update - 1.0) / self.total_updates
         lr = frac * self.initial_lr
         for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
+            param_group["lr"] = min(param_group["lr"] * 0.99, 0.00001)
+        # for param_group in self.optimizer[1].param_groups:
+        #     param_group["lr"] = lr
 
     def get_lr(self):
         return [group["lr"] for group in self.optimizer.param_groups]
@@ -43,7 +45,7 @@ class PPOLogger:
             for i in range(self.reward_size):
                 non_zero_comps.append(infos['episode'][f'r'][infos['_episode']][:,i].mean())
             print(
-                f"global_step={global_step}, episodic_return={non_zero_rews.mean()}",
+                f"global_step={global_step}, episodic_return={non_zero_rews.mean(axis = 0)}",
                 flush=True,
             )
 
@@ -120,6 +122,8 @@ class PPO:
         anneal_lr=True,
         seed=1,
         logger=None,
+        convex=False,
+        scalar_reward = False,
     ):
         """
         Proximal Policy Optimization (PPO) algorithm implementation.
@@ -191,6 +195,7 @@ class PPO:
         self.num_minibatches = num_minibatches
         self.minibatch_size = self.batch_size // num_minibatches
         self.reward_size = reward_size
+        self.scalar_reward = scalar_reward
 
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -212,9 +217,10 @@ class PPO:
         self.lr_scheduler = None
         self._global_step = 0
         self.logger = logger or PPOLogger()
+        self.convex = convex
 
     def create_lr_scheduler(self, num_policy_updates):
-        return LinearLRSchedule(self.optimizer, self.initial_lr, num_policy_updates)
+        return LinearLRSchedule(self.optimizer[1], self.initial_lr, num_policy_updates)
 
     def learn(self, total_timesteps):
         """
@@ -364,8 +370,11 @@ class PPO:
         ) = self._initialize_storage()    
         if current_weights is None:
             if self.reward_size != 1:
-                weights = torch.distributions.uniform.Uniform(low=-1, high=1).sample((self.num_envs, self.reward_size)).to(self.device).type(torch.float32)
+                weights = torch.distributions.uniform.Uniform(low=0, high=1).sample((self.num_envs, self.reward_size)).to(self.device).type(torch.float32)
                 # weights = torch.softmax(weights, dim = 1)
+                if self.convex:
+                    dist = Dirichlet(torch.ones(self.reward_size, device=self.device))
+                    weights = dist.sample((self.num_envs, )).type(torch.float32)
             else:
                 weights = torch.ones(self.num_envs, 1).to(self.device).type(torch.float32)
                 # weights = torch.softmax(weights, dim = 1)
@@ -387,14 +396,15 @@ class PPO:
             change_weights = torch.logical_or(is_next_observation_terminal.type(torch.bool), is_next_observation_truncated.type(torch.bool))
             if self.reward_size != 1 and change_weights.any():
                 # print(weights)   
-                weights[change_weights] = torch.distributions.uniform.Uniform(low=-1, high=1).sample(weights[change_weights].shape).to(self.device).type(torch.float32)
-                # weights[change_weights] = torch.softmax(weights[change_weights], dim = 1)
+                weights[change_weights] = torch.distributions.uniform.Uniform(low=0, high=1).sample(weights[change_weights].shape).to(self.device).type(torch.float32)
+                if self.convex:
+                    dist = Dirichlet(torch.ones(self.reward_size, device=self.device))
+                    weights[change_weights] = dist.sample((sum(change_weights), )).type(torch.float32)
 
                 # weights[:,-1] = 1.0
                 # weights = torch.ones((self.num_envs, self.reward_size)).to(self.device).type(torch.float32)
 
                 
-            noise = torch.randn_like(weights) * 0.001
             with torch.no_grad():
                 action, logprob = self.agent.sample_action_and_compute_log_prob(
                     next_observation, weights
@@ -418,7 +428,11 @@ class PPO:
                 action.cpu().numpy()
             )
             self._global_step += self.num_envs
-            rewards[step] = weights * torch.as_tensor(reward, device=self.device)
+            if self.scalar_reward:
+                rewards[step] = torch.sum(weights * torch.as_tensor(reward, device=self.device), dim=-1, keepdim=True)
+            else:
+                rewards[step] = torch.as_tensor(reward, device=self.device).reshape(self.num_envs, self.reward_size)
+            
             # rewards[step + self.num_rollout_steps] = torch.as_tensor(reward, device=self.device)
 
             is_next_observation_terminal = terminations
@@ -447,9 +461,14 @@ class PPO:
         # Estimate the value of the next state (the state after the last collected step) using the current policy
         # This value will be used in the GAE calculation to compute advantages
         with torch.no_grad():
-            next_value = self.agent.estimate_value_from_observation(
-                next_observation, weights
-            ).reshape(self.num_envs, self.reward_size)
+            if self.scalar_reward:
+                next_value = self.agent.estimate_value_from_observation(
+                    next_observation, weights
+                ).reshape(self.num_envs, 1)
+            else:
+                next_value = self.agent.estimate_value_from_observation(
+                    next_observation, weights
+                ).reshape(self.num_envs, self.reward_size)
 
             advantages, returns = self.compute_advantages(
                 rewards[:self.num_rollout_steps],
@@ -475,7 +494,7 @@ class PPO:
             action_log_probabilities,
             actions,
             advantages,
-            returns * rollout_weights,
+            returns,
             observation_values,
             rollout_weights
         )
@@ -508,16 +527,24 @@ class PPO:
         action_log_probabilities = torch.zeros(
             (self.num_rollout_steps, self.num_envs)
         ).to(self.device)
-        rewards = torch.zeros((self.num_rollout_steps, self.num_envs, self.reward_size)).to(self.device)
+        if self.scalar_reward:
+            rewards = torch.zeros((self.num_rollout_steps, self.num_envs, 1)).to(self.device)
+        else:
+            rewards = torch.zeros((self.num_rollout_steps, self.num_envs, self.reward_size)).to(self.device)
         is_episode_terminated = torch.zeros((self.num_rollout_steps, self.num_envs)).to(
             self.device
         )
         is_episode_truncated = torch.zeros((self.num_rollout_steps, self.num_envs)).to(
             self.device
         )
-        observation_values = torch.zeros((self.num_rollout_steps, self.num_envs, self.reward_size)).to(
-            self.device
-        )
+        if self.scalar_reward:
+            observation_values = torch.zeros((self.num_rollout_steps, self.num_envs, 1)).to(
+                self.device
+            )
+        else:
+            observation_values = torch.zeros((self.num_rollout_steps, self.num_envs, self.reward_size)).to(
+                self.device
+            )
         rollout_weights = torch.zeros((self.num_rollout_steps, self.num_envs, self.reward_size)).to(
             self.device
         )
@@ -556,7 +583,6 @@ class PPO:
         advantages = torch.zeros_like(rewards).to(self.device)
         # Initialize gae_running as a tensor with shape [num_envs]
         gae_running = torch.zeros_like(next_value).to(self.device)
-
         # Iterate backwards over the rollout steps.
         for t in reversed(range(T)):
             if t == T - 1:
@@ -609,9 +635,14 @@ class PPO:
         
         action_space = () if self.env_is_discrete else self.envs.single_action_space.shape
         batch_actions = actions.reshape((-1,) + action_space)
-        batch_advantages = advantages.reshape(-1, self.reward_size)
-        batch_returns = returns.reshape(-1, self.reward_size)
-        batch_values = observation_values.reshape(-1, self.reward_size)
+        if self.scalar_reward:
+            batch_advantages = advantages.reshape(-1, 1)
+            batch_returns = returns.reshape(-1, 1)
+            batch_values = observation_values.reshape(-1, 1)
+        else:
+            batch_advantages = advantages.reshape(-1, self.reward_size)
+            batch_returns = returns.reshape(-1, self.reward_size)
+            batch_values = observation_values.reshape(-1, self.reward_size)
         batch_weights = weights.reshape(-1, self.reward_size)
 
         return (
@@ -635,211 +666,230 @@ class PPO:
         collected_weights,
     ):
         """
-        Update the policy and value function using the collected rollout data.
-
-        This method implements the core PPO algorithm update step. It performs multiple
-        epochs of updates on minibatches of the collected rollout data, optimizing both the policy
-        and value function.
-
-        Args:
-            collected_observations (torch.Tensor): Tensor of shape (batch_size, *obs_shape)
-                containing the observations from the rollout.
-            collected_action_log_probs (torch.Tensor): Tensor of shape (batch_size,)
-                containing the log probabilities of the actions taken during the rollout.
-            collected_actions (torch.Tensor): Tensor of shape (batch_size, *action_shape)
-                containing the actions taken during the rollout.
-            computed_advantages (torch.Tensor): Tensor of shape (batch_size, reward_size) containing
-                the computed advantages for each step in the rollout.
-            computed_returns (torch.Tensor): Tensor of shape (batch_size, reward_size) containing
-                the computed returns (sum of discounted rewards) for each step.
-            previous_value_estimates (torch.Tensor): Tensor of shape (batch_size, reward_size)
-                containing the value estimates from the previous iteration.
-
-        Returns:
-            dict: A dictionary containing various statistics about the update process:
-                - policy_loss: The final policy gradient loss.
-                - value_loss: The final value function loss.
-                - entropy_loss: The entropy loss, encouraging exploration.
-                - old_approx_kl: The old approximate KL divergence.
-                - approx_kl: The new approximate KL divergence.
-                - clipping_fraction: The fraction of policy updates that were clipped.
-                - explained_variance: A measure of how well the value function explains
-                                    the observed returns.
-
-        The method performs the following key steps:
-        1. Iterates over the data for multiple epochs, shuffling at each epoch.
-        2. For each minibatch:
-            a. Computes new action probabilities and values.
-            b. Calculates the policy ratio and clipped policy objective.
-            c. Computes the value function loss, optionally with clipping.
-            d. Calculates the entropy bonus to encourage exploration.
-            e. Combines losses and performs a gradient update step.
-        3. Optionally performs early stopping based on KL divergence.
-        4. Computes and returns various statistics about the update process.
-
-        This implementation uses the PPO clipped objective, which helps to constrain
-        the policy update and improve training stability. It also uses advantage
-        normalization and gradient clipping for further stability.
+        PPO update with multi-objective PCGrad for the actor (plus entropy),
+        followed by a separate critic update.
         """
-        # Prepare for minibatch updates
         batch_size = self.num_rollout_steps * self.num_envs
         assert collected_observations.shape[0] == batch_size
         batch_indices = np.arange(batch_size)
-
-        # Track clipping for monitoring policy update magnitude
         clipping_fractions = []
 
         for epoch in range(self.update_epochs):
             np.random.shuffle(batch_indices)
             kl_div = 0
 
-            # Minibatch updates help stabilize training and can be more compute-efficient
             for start in range(0, batch_size, self.minibatch_size):
                 end = start + self.minibatch_size
-                minibatch_indices = batch_indices[start:end]
+                idx = batch_indices[start:end]
 
-                # Get updated action probabilities and values for the current policy
-                current_policy_log_probs, entropy = (
-                    self.agent.compute_action_log_probabilities_and_entropy(
-                        collected_observations[minibatch_indices],
-                        collected_actions[minibatch_indices],
-                        collected_weights[minibatch_indices]
-                    )
-                )
-                new_value = self.agent.estimate_value_from_observation(
-                    collected_observations[minibatch_indices],
-                    collected_weights[minibatch_indices]
-                )
+                obs_mb    = collected_observations[idx]
+                old_logp  = collected_action_log_probs[idx]
+                acts_mb   = collected_actions[idx]
+                adv_mb    = computed_advantages[idx]    # [N, d]
+                returns_mb= computed_returns[idx]       # [N, d]
+                prev_val  = previous_value_estimates[idx]
+                w_mb      = collected_weights[idx]      # [N, d]
 
-                # Calculate the probability ratio for importance sampling
-                # This allows us to use old trajectories to estimate the new policy's performance
-                log_probability_ratio = (
-                    current_policy_log_probs
-                    - collected_action_log_probs[minibatch_indices]
+                # 1) New policy outputs
+                new_logp, entropy = self.agent.compute_action_log_probabilities_and_entropy(
+                    obs_mb, acts_mb, w_mb
                 )
-                probability_ratio = log_probability_ratio.exp()
+                # 2) New value estimates
+                new_value = self.agent.estimate_value_from_observation(obs_mb, w_mb)
 
-                # Estimate KL divergence for early stopping
-                # This helps prevent the new policy from diverging too much from the old policy
-                # approx_kl http://joschu.net/blog/kl-approx.html
+                # 3) Importance sampling ratio & KL estimates
+                log_ratio = new_logp - old_logp
+                ratio = log_ratio.exp()
                 with torch.no_grad():
-                    old_approx_kl = (-log_probability_ratio).mean()
-                    approx_kl = ((probability_ratio - 1) - log_probability_ratio).mean()
-                    kl_div = approx_kl.mean()
-
-                    # Track the fraction of updates being clipped
-                    # High clipping fraction might indicate too large policy updates
-                    clipping_fractions += [
-                        (
-                            (probability_ratio - 1.0).abs()
-                            > self.surrogate_clip_threshold
-                        )
+                    old_kl = (-log_ratio).mean()
+                    new_kl = ((ratio - 1) - log_ratio).mean()
+                    kl_div = new_kl
+                    # clipping fraction
+                    clipping_fractions.append(
+                        ((ratio - 1.0).abs() > self.surrogate_clip_threshold)
                         .float()
                         .mean()
                         .item()
-                    ]
-
-                minibatch_advantages = computed_advantages[minibatch_indices]  # shape: [N, d]
-                weights = collected_weights[minibatch_indices]  
-
-                mask = (weights != 0).type(torch.float32)
+                    )
                 
-                # minibatch_advantages = mask*minibatch_advantages
+                # 4) Mask out zero-weight objectives
+                mask = (w_mb != 0).float()
+                # adv_mb = adv_mb * mask
+                # mask_add = torch.cat([mask, torch.ones_like(mask.sum(dim = 1).reshape(-1, 1))], dim = 1)
+                # adv_mb = torch.cat([adv_mb, adv_mb.sum(dim = 1).reshape(-1, 1)], dim = 1)
                 
-
                 if self.normalize_advantages:
                     # minibatch_advantages = mask * minibatch_advantages
 
                                         
                     # 1) Zero-out invalid dims
-                    masked_adv = minibatch_advantages * mask  
+                    # adv_mb = adv_mb * mask_add  
 
                     # 2) Compute mean & std _only_ over the valid entries in each column
                     #    (i.e. sum over batch of masked_adv, divide by sum(mask) per dim)
-                    valid_counts = mask.sum(dim=0)                # shape [d]
-                    mean = (masked_adv.sum(dim=0) / valid_counts) # shape [d]
+                    # valid_counts = mask_add.sum(dim=0)                # shape [d]
+                    # mean = (adv_mb.sum(dim=0) / valid_counts) # shape [d]
 
-                    #    For std: compute variance over the same entries
-                    var = (((masked_adv - mean)**2 * mask).sum(dim=0) / valid_counts)
-                    std = torch.sqrt(var + 1e-8)
+                    # #    For std: compute variance over the same entries
+                    # var = (((adv_mb - mean)**2 * mask_add).sum(dim=0) / valid_counts)
+                    # std = torch.sqrt(var + 1e-8)
 
                     # 3) Normalize only the valid entries
-                    normed = (masked_adv - mean) / std
-
-                    # 4) (Optional) re-apply mask to safeguard any numerical drift
-                    minibatch_advantages = normed * mask
-
-                policy_gradient_loss = self.calculate_policy_gradient_loss(
-                    minibatch_advantages, probability_ratio.reshape(-1, 1)
+                    adv_mb = (adv_mb - adv_mb.mean(dim = 0)) / (adv_mb.std(dim = 0) + 1e-8)
+                    
+                policy_losses = self.calculate_policy_gradient_loss(
+                    adv_mb, ratio.reshape(-1, 1)
                 )
+                
+                ent_loss = -self.entropy_loss_coefficient * entropy.mean()
+                
 
+
+            #     # 5) Build one clipped-surrogate loss per objective
+            #     K = adv_mb.shape[1]
+            #     policy_losses = []
+            #     for i in range(K):
+            #         ai = adv_mb[:, i]  # [N]
+            #         unclipped = ai * ratio
+            #         clipped   = ai * torch.clamp(
+            #             ratio,
+            #             1 - self.surrogate_clip_threshold,
+            #             1 + self.surrogate_clip_threshold
+            #         )
+            #         policy_losses.append(-torch.min(unclipped, clipped).mean())
+                
+
+            #     # 6) Compute per-objective grads
+            #     actor_params = list(self.agent.actor.parameters())
+                
+            #     grads_per_obj = []
+            #     for Li in policy_losses:
+            #         self.optimizer[0].zero_grad()
+            #         Li.backward(retain_graph=True)
+            #         grads_per_obj.append([p.grad.clone() for p in actor_params])
+
+            #     # # 7) PCGrad: de-conflict pairwise
+            #     # # eps = 1e-8
+            #     # # for i, grads in enumerate(grads_per_obj):
+            #     # #     # compute the total norm of all parameter grads for objective i
+            #     # #     total_norm = torch.sqrt(sum((g**2).sum() for g in grads))
+            #     # #     # divide each grad tensor by that norm
+            #     # #     grads_per_obj[i] = [g / (total_norm + eps) for g in grads]
+
+            #     # for i in range(K):
+            #     #     for j in range(K):
+            #     #         if i == j:
+            #     #             continue
+            #     #         gi, gj = grads_per_obj[i], grads_per_obj[j]
+            #     #         dot_ij = sum((g_i * g_j).sum() for g_i, g_j in zip(gi, gj))
+            #     #         if dot_ij < 0:
+            #     #             norm_j2 = sum((g_j**2).sum() for g_j in gj)
+            #     #             coeff = dot_ij / (norm_j2 + 1e-12)
+            #     #             grads_per_obj[i] = [
+            #     #                 g_i - coeff * g_j for g_i, g_j in zip(gi, gj)
+            #     #             ]
+
+            #     # # 8) Average the de-conflicted grads
+            #     # self.optimizer[0].zero_grad()
+            #     # for p, *g_list in zip(actor_params, *grads_per_obj):
+            #     #     p.grad = sum(g_list) / K
+
+            #     # # 9) Add entropy gradient
+            #     # # compute entropy loss (we maximize entropy → minimize −entropy)
+            #     # ent_loss = -self.entropy_loss_coefficient * entropy.mean()
+            #     # ent_loss.backward()  # this will add into p.grad fields
+
+            #     # # 10) Step actor
+            #     # nn.utils.clip_grad_norm_(actor_params, self.max_grad_norm)
+            #     # self.optimizer[0].step()
+                
+                
+            #     # flatten each per-objective grad-list into one long vector
+            #     flat_grads = []
+            #     for grad_list in grads_per_obj:
+            #         flat_grads.append(torch.cat([g.view(-1) for g in grad_list]))
+            #     # Stack into K×P
+            #     G_vecs = torch.stack(flat_grads, dim=0)   # shape [K, P]
+
+            #     # build the Gram matrix G_{ij} = g_i · g_j
+            #     G = G_vecs @ G_vecs.t()                  # shape [K, K]
+            #     # regularize slightly for invertibility
+            #     eps = 1e-6
+            #     G += eps * torch.eye(G.size(0), device=G.device)
+
+            #     # solve G α = 1
+            #     ones = torch.ones(G.size(0), device=G.device)
+            #     alpha = torch.linalg.solve(G, ones)      # unconstrained
+            #     # project to simplex: α ≥ 0, sum α = 1
+            #     alpha = torch.clamp(alpha, min=0.0)
+            #     alpha = alpha / alpha.sum()
+
+            #     # now recombine the original parameter-wise grads
+            #     self.optimizer[0].zero_grad()
+            #     for p, *grads_for_param in zip(actor_params, *grads_per_obj):
+            #         # grads_for_param is a list [g^0_p, g^1_p, …, g^{K-1}_p]
+            #         combined = sum(alpha[i] * grads_for_param[i]
+            #                        for i in range(len(alpha)))
+            #         p.grad = combined
+
+            #     # add entropy gradient
+            #     ent_loss = -self.entropy_loss_coefficient * entropy.mean()
+            #     ent_loss.backward()
+
+            #     # step actor
+            #     nn.utils.clip_grad_norm_(actor_params, self.max_grad_norm)
+            #     self.optimizer[0].step()
+
+            #     # # Early stop on KL
+            #     # if self.target_kl is not None and kl_div > self.target_kl:
+            #     #     break
+
+            # # end of epoch minibatches
+
+            # === Critic Update ===
+
+                # 11) Compute scalar value loss over full batch
                 value_function_loss = self.calculate_value_function_loss(
                     new_value,
                     computed_returns,
                     previous_value_estimates,
-                    minibatch_indices,
+                    idx,
                     mask
-                )
-                # Entropy encourages exploration by penalizing overly deterministic policies
-                entropy_loss = entropy.mean()
+                ) * self.value_function_loss_coefficient
+                # total_policy_loss = policy_loss * self.policy_gradient_loss_coefficient + ent_loss
+                # total_loss = value_function_loss + ent_loss + sum(policy_losses) * self.policy_gradient_loss_coefficient
+                self.optimizer[0].zero_grad()
+                self.optimizer[1].zero_grad()
+                # for loss_val in policy_losses:
+                #     loss_val = loss_val * self.policy_gradient_loss_coefficient
+                #     loss_val.backward(retain_graph=True)
+                total_policy_loss = sum(policy_losses) * self.policy_gradient_loss_coefficient + ent_loss
+                total_policy_loss.backward()
+                # ent_loss.backward()
+                value_function_loss.backward()
+                nn.utils.clip_grad_norm_(self.agent.critic.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.agent.actor.parameters(), self.max_grad_norm)
+                self.optimizer[0].step()
+                self.optimizer[1].step()
 
-                # Combine losses: minimize policy and value losses, maximize entropy
-                loss = (
-                    self.policy_gradient_loss_coefficient*policy_gradient_loss
-                    - self.entropy_loss_coefficient
-                    * entropy_loss  # subtraction here to maximise entropy (exploration)
-                    + value_function_loss * self.value_function_loss_coefficient
-                    # + bnn_kl_loss(self.agent)*0.01
-                )
-
-                # Perform backpropagation and optimization step
-                self.optimizer.zero_grad()
-                loss.backward()
-                # Gradient clipping helps prevent too large policy updates
-                nn.utils.clip_grad_norm_(self.agent.parameters(), self.max_grad_norm)
-                self.optimizer.step()
-                    
-                if not self.env_is_discrete:
-                    if self.agent.actor_logstd.isnan().any():
-                        print(policy_gradient_loss
-                        , entropy_loss  # subtraction here to maximise entropy (exploration)
-                        , value_function_loss * self.value_function_loss_coefficient
-                        )
-                        print(minibatch_advantages)
-                        print(probability_ratio)
-                        print(log_probability_ratio)
-                        print(current_policy_log_probs)
-                        print(collected_action_log_probs[minibatch_indices])
-                        self.agent.actor_logstd[self.agent.actor_logstd.isnan()] = 0.01
-
-            # Early stopping based on KL divergence, if enabled, done at epoch level for stability
-            # This provides an additional safeguard against too large policy updates
-            if self.target_kl is not None:
-                if kl_div/len(range(0, batch_size, self.minibatch_size)) > self.target_kl:
-                    break
-
-        predicted_values, actual_returns = (
-            previous_value_estimates.cpu().numpy(),
-            computed_returns.cpu().numpy(),
-        )
-        observed_return_variance = np.var(actual_returns)
-        # explained variance measures how well the value function predicts the actual returns
-        explained_variance = (
-            np.nan
-            if observed_return_variance == 0
-            else 1
-            - np.var(actual_returns - predicted_values) / observed_return_variance
+        # === Diagnostics ===
+        predicted, actual = prev_val.cpu().numpy(), returns_mb.cpu().numpy()
+        var_r = np.var(actual)
+        explained_var = (
+            np.nan if var_r == 0 else 1 - np.var(actual - predicted) / var_r
         )
 
         return {
-            "policy_loss": policy_gradient_loss.item(),
+            "policy_loss": sum(pl.item() for pl in policy_losses),
+            # "policy_loss": policy_losses,
             "value_loss": value_function_loss.item(),
-            "entropy_loss": entropy_loss.item(),
-            "old_approx_kl": old_approx_kl.item(),
-            "approx_kl": approx_kl.item(),
+            "entropy_loss": entropy.mean().item(),
+            "old_approx_kl": old_kl.item(),
+            "approx_kl": new_kl.item(),
             "clipping_fractions": np.mean(clipping_fractions),
-            "explained_variance": explained_variance,
+            "explained_variance": explained_var,
         }
+
 
     def calculate_policy_gradient_loss(self, minibatch_advantages, probability_ratio):
         """
@@ -893,7 +943,7 @@ class PPO:
         #    result in a worse objective (clipped loss might do this).
         # This conservative approach helps prevent the policy from changing too
         # rapidly in any direction, improving stability.
-        policy_gradient_loss = -torch.min(unclipped_pg_obj, clipped_pg_obj).sum(dim = 1).mean()
+        policy_gradient_loss = -torch.min(unclipped_pg_obj, clipped_pg_obj).mean(dim = 0)
 
         return policy_gradient_loss
 

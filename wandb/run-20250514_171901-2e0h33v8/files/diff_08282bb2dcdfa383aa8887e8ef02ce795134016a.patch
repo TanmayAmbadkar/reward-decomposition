@@ -1,0 +1,4019 @@
+diff --git a/config.json b/config.json
+index 5b2d0f4..6a54653 100644
+--- a/config.json
++++ b/config.json
+@@ -1,9 +1,9 @@
+ {
+-    "env_name": "deep-sea-treasure-v0",
+-    "continuous": false,
+-    "reward_size": 2,
+-    "reward_labels": ["Treasure","Time"],
+-    "model_path": "runs/deep-sea-treasure-v0__main_ppo__2025-04-25 13:27:58.098098__1/",
+-    "initial_weights": [1, 0]
++    "env_name": "mo-hopper-v6",
++    "continuous": true,
++    "reward_size": 3,
++    "reward_labels": ["Forward", "Jump", "Fuel"],
++    "model_path": "runs/mo-hopper-v6__main_ppo__2025-05-13 14:36:29.038961__1/",
++    "initial_weights": [1, 0, 0]
+   }
+-  
+\ No newline at end of file
++  
+diff --git a/envs/__init__.py b/envs/__init__.py
+index 3cf3374..2233557 100644
+--- a/envs/__init__.py
++++ b/envs/__init__.py
+@@ -1,3 +1,8 @@
+ from envs.bipedal_walker import BipedalWalker
+ from envs.lunar_lander import LunarLander
+-from envs.crafter_env import CrafterEnv
+\ No newline at end of file
++from envs.crafter_env import CrafterEnv
++from gymnasium.envs.registration import register
++register(
++    id='mo-hopper-v6',
++    entry_point='envs.mo_gym_hopper:MOHopperEnv',
++)
+\ No newline at end of file
+diff --git a/explorations/collect_data copy.py b/explorations/collect_data copy.py
+deleted file mode 100644
+index 56d0d6b..0000000
+--- a/explorations/collect_data copy.py	
++++ /dev/null
+@@ -1,114 +0,0 @@
+-import gymnasium as gym
+-from pysr import PySRRegressor
+-import numpy as np
+-
+-env = gym.make("LunarLander-v3", continuous = True)
+-
+-states, actions, next_states = [], [], []
+-
+-state, info = env.reset()
+-for i in range(100000):
+-    
+-    action = env.action_space.sample()
+-    next_state, rew, done, trunc, info = env.step(action)
+-
+-    states.append(state)
+-    actions.append(action)
+-    next_states.append(next_state)
+-    state = next_state
+-    if done or trunc:
+-        state, info = env.reset()
+-
+-model = PySRRegressor(
+-    maxsize=15,  # Increase complexity allowed
+-    niterations=200,  # Increase the number of iterations
+-    binary_operators=["+", "*", "-", "/"],
+-    unary_operators=[
+-        "cos",
+-        "exp",
+-        "sin",
+-        "sqrt",
+-        "square",
+-        "cube",
+-        "log",      # Added log operator
+-        "tanh"      # Added tanh operator
+-    ],
+-    extra_sympy_mappings={"inv": lambda x: 1 / x},
+-    elementwise_loss="loss(prediction, target) = (prediction - target)^2",
+-    # You might consider a custom loss that penalizes multi-step error as well.
+-)
+-
+-
+-y = np.array(next_states)
+-x = np.array(states)
+-u = np.array(actions)
+-
+-from sklearn.preprocessing import StandardScaler
+-
+-# Combine state and action data for scaling.
+-inp = np.hstack([x, u])
+-inp_scaler = StandardScaler()
+-y_scaler = StandardScaler()
+-
+-inp_scaled = inp_scaler.fit_transform(inp)
+-y_scaled = y_scaler.fit_transform(y)
+-
+-model.fit(inp_scaled, y_scaled)
+-
+-
+-# inp = np.hstack([x, u])
+-
+-# model.fit(inp, y)
+-print(model)
+-
+-next_states = []
+-pred_next_states = []
+-
+-state, info = env.reset()
+-pred_state = state  # initial predicted state equals the actual state
+-
+-for i in range(1000):
+-    action = env.action_space.sample()
+-    next_state, rew, done, trunc, info = env.step(action)
+-    
+-    # Create the input vector by concatenating the predicted state and the action.
+-    input_vector = np.concatenate([pred_state, action], axis=None).reshape(1, -1)
+-    
+-    # Scale the input before feeding it to the model.
+-    input_scaled = inp_scaler.transform(input_vector)
+-    
+-    # Get the prediction (in the scaled space)
+-    pred_scaled = model.predict(input_scaled)
+-    
+-    # Inverse-transform the prediction to get it back into the original scale.
+-    pred_state = y_scaler.inverse_transform(pred_scaled).flatten()
+-    
+-    next_states.append(next_state)
+-    pred_next_states.append(pred_state)
+-    
+-    state = next_state
+-    if done or trunc:
+-        state, info = env.reset()
+-        pred_state = state
+-
+-        next_states = np.array(next_states)
+-        pred_next_states = np.array(pred_next_states).reshape(len(next_states), -1)
+-        
+-        plt.figure()
+-        plt.plot(next_states[:, 0], next_states[:, 1], color="green", label="True")
+-        plt.plot(pred_next_states[:, 0], pred_next_states[:, 1], color="blue", label="Predicted")
+-        plt.legend()
+-        plt.savefig(f"xy_{i}.png")
+-
+-        plt.figure()
+-        plt.plot(next_states[:, 2], next_states[:, 3], color="green", label="True")
+-        plt.plot(pred_next_states[:, 2], pred_next_states[:, 3], color="blue", label="Predicted")
+-        plt.legend()
+-        plt.savefig(f"vxvy_{i}.png")
+-        
+-        print("R2 score:", r2_score(next_states, pred_next_states))
+-        print("MSE:", mean_squared_error(next_states, pred_next_states))
+-        
+-        next_states = []
+-        pred_next_states = []
+-
+diff --git a/explorations/collect_data.py b/explorations/collect_data.py
+deleted file mode 100644
+index 56d0d6b..0000000
+--- a/explorations/collect_data.py
++++ /dev/null
+@@ -1,114 +0,0 @@
+-import gymnasium as gym
+-from pysr import PySRRegressor
+-import numpy as np
+-
+-env = gym.make("LunarLander-v3", continuous = True)
+-
+-states, actions, next_states = [], [], []
+-
+-state, info = env.reset()
+-for i in range(100000):
+-    
+-    action = env.action_space.sample()
+-    next_state, rew, done, trunc, info = env.step(action)
+-
+-    states.append(state)
+-    actions.append(action)
+-    next_states.append(next_state)
+-    state = next_state
+-    if done or trunc:
+-        state, info = env.reset()
+-
+-model = PySRRegressor(
+-    maxsize=15,  # Increase complexity allowed
+-    niterations=200,  # Increase the number of iterations
+-    binary_operators=["+", "*", "-", "/"],
+-    unary_operators=[
+-        "cos",
+-        "exp",
+-        "sin",
+-        "sqrt",
+-        "square",
+-        "cube",
+-        "log",      # Added log operator
+-        "tanh"      # Added tanh operator
+-    ],
+-    extra_sympy_mappings={"inv": lambda x: 1 / x},
+-    elementwise_loss="loss(prediction, target) = (prediction - target)^2",
+-    # You might consider a custom loss that penalizes multi-step error as well.
+-)
+-
+-
+-y = np.array(next_states)
+-x = np.array(states)
+-u = np.array(actions)
+-
+-from sklearn.preprocessing import StandardScaler
+-
+-# Combine state and action data for scaling.
+-inp = np.hstack([x, u])
+-inp_scaler = StandardScaler()
+-y_scaler = StandardScaler()
+-
+-inp_scaled = inp_scaler.fit_transform(inp)
+-y_scaled = y_scaler.fit_transform(y)
+-
+-model.fit(inp_scaled, y_scaled)
+-
+-
+-# inp = np.hstack([x, u])
+-
+-# model.fit(inp, y)
+-print(model)
+-
+-next_states = []
+-pred_next_states = []
+-
+-state, info = env.reset()
+-pred_state = state  # initial predicted state equals the actual state
+-
+-for i in range(1000):
+-    action = env.action_space.sample()
+-    next_state, rew, done, trunc, info = env.step(action)
+-    
+-    # Create the input vector by concatenating the predicted state and the action.
+-    input_vector = np.concatenate([pred_state, action], axis=None).reshape(1, -1)
+-    
+-    # Scale the input before feeding it to the model.
+-    input_scaled = inp_scaler.transform(input_vector)
+-    
+-    # Get the prediction (in the scaled space)
+-    pred_scaled = model.predict(input_scaled)
+-    
+-    # Inverse-transform the prediction to get it back into the original scale.
+-    pred_state = y_scaler.inverse_transform(pred_scaled).flatten()
+-    
+-    next_states.append(next_state)
+-    pred_next_states.append(pred_state)
+-    
+-    state = next_state
+-    if done or trunc:
+-        state, info = env.reset()
+-        pred_state = state
+-
+-        next_states = np.array(next_states)
+-        pred_next_states = np.array(pred_next_states).reshape(len(next_states), -1)
+-        
+-        plt.figure()
+-        plt.plot(next_states[:, 0], next_states[:, 1], color="green", label="True")
+-        plt.plot(pred_next_states[:, 0], pred_next_states[:, 1], color="blue", label="Predicted")
+-        plt.legend()
+-        plt.savefig(f"xy_{i}.png")
+-
+-        plt.figure()
+-        plt.plot(next_states[:, 2], next_states[:, 3], color="green", label="True")
+-        plt.plot(pred_next_states[:, 2], pred_next_states[:, 3], color="blue", label="Predicted")
+-        plt.legend()
+-        plt.savefig(f"vxvy_{i}.png")
+-        
+-        print("R2 score:", r2_score(next_states, pred_next_states))
+-        print("MSE:", mean_squared_error(next_states, pred_next_states))
+-        
+-        next_states = []
+-        pred_next_states = []
+-
+diff --git a/explorations/ppo_bayesian.py b/explorations/ppo_bayesian.py
+deleted file mode 100644
+index 081e451..0000000
+--- a/explorations/ppo_bayesian.py
++++ /dev/null
+@@ -1,261 +0,0 @@
+-import gymnasium as gym
+-import torch
+-import torch.nn as nn
+-import torch.optim as optim
+-import torchbnn as bnn
+-import numpy as np
+-import random
+-from collections import deque
+-import matplotlib.pyplot as plt
+-#---------------------------------------------
+-# Hyperparameters
+-#---------------------------------------------
+-ENV_NAME = "LunarLander-v3"  # or "CartPole-v1", "LunarLander-v2", etc.
+-SEED = 42
+-EPISODES = 1000
+-STEPS_PER_ROLLOUT = 2048      # How many env steps per PPO update
+-PPO_EPOCHS = 10               # How many optimization epochs per update
+-BATCH_SIZE = 256              # Mini-batch size per update epoch
+-GAMMA = 0.99
+-CLIP_EPS = 0.2                # PPO clipping epsilon
+-LR = 1e-3
+-ENTROPY_COEF = 0.01
+-KL_SCALE = 0.01               # Scale factor for Bayesian KL loss
+-DEVICE = "cpu"                # "cuda" if you have a GPU
+-
+-random.seed(SEED)
+-np.random.seed(SEED)
+-torch.manual_seed(SEED)
+-
+-#---------------------------------------------
+-# 1. Actor-Critic Network (Bayesian)
+-#---------------------------------------------
+-class BayesianActorCritic(nn.Module):
+-    def __init__(self, state_dim, action_dim):
+-        super().__init__()
+-        # Shared feature extractor
+-        self.actor1 = bnn.BayesLinear(prior_mu=0, prior_sigma=0.1, 
+-                                       in_features=state_dim, out_features=128)
+-        self.actor2 = bnn.BayesLinear(prior_mu=0, prior_sigma=0.1, 
+-                                       in_features=128, out_features=128)
+-        
+-        self.critic1 = bnn.BayesLinear(prior_mu=0, prior_sigma=0.1, 
+-                                       in_features=state_dim, out_features=128)
+-        self.critic2 = bnn.BayesLinear(prior_mu=0, prior_sigma=0.1, 
+-                                       in_features=128, out_features=128)
+-        
+-        # Policy head (actor)
+-        self.actor_head = bnn.BayesLinear(prior_mu=0, prior_sigma=0.1,
+-                                          in_features=128, out_features=action_dim)
+-        
+-        # Value head (critic)
+-        self.critic_head = bnn.BayesLinear(prior_mu=0, prior_sigma=0.1, 
+-                                           in_features=128, out_features=1)
+-        
+-    def forward(self, x):
+-        # Shared
+-        v = torch.clone(x)
+-        x = torch.tanh(self.actor1(x))
+-        x = torch.tanh(self.actor2(x))
+-
+-        v = torch.tanh(self.critic1(v))
+-        v = torch.tanh(self.critic2(v))
+-        
+-        # Actor logits
+-        logits = self.actor_head(x)
+-        # Critic value
+-        value = self.critic_head(v)
+-        return logits, value.squeeze(-1)
+-    
+-#---------------------------------------------
+-# 2. PPO Storage
+-#---------------------------------------------
+-class RolloutBuffer:
+-    """
+-    We store transitions from interaction over STEPS_PER_ROLLOUT steps,
+-    then use them to run multiple PPO epochs.
+-    """
+-    def __init__(self):
+-        self.states = []
+-        self.actions = []
+-        self.log_probs = []
+-        self.rewards = []
+-        self.dones = []
+-        self.values = []
+-
+-    def add(self, state, action, log_prob, reward, done, value):
+-        self.states.append(state)
+-        self.actions.append(action)
+-        self.log_probs.append(log_prob)
+-        self.rewards.append(reward)
+-        self.dones.append(done)
+-        self.values.append(value)
+-
+-    def clear(self):
+-        self.states = []
+-        self.actions = []
+-        self.log_probs = []
+-        self.rewards = []
+-        self.dones = []
+-        self.values = []
+-
+-#---------------------------------------------
+-# 3. PPO Update Function
+-#---------------------------------------------
+-def compute_returns_and_advantages(buffer, next_value, gamma=0.99):
+-    """
+-    Simple advantage calculation (without GAE).
+-    We compute a set of returns for each time step t:
+-    R_t = r_t + gamma * r_{t+1} + ... until done.
+-    advantage_t = R_t - V(s_t).
+-    next_value is V(s_{t+1}) for the last step in the buffer (or 0 if done).
+-    """
+-    buffer_size = len(buffer.rewards)
+-    returns = [0] * buffer_size
+-    advantages = [0] * buffer_size
+-
+-    running_return = next_value
+-    for t in reversed(range(buffer_size)):
+-        if buffer.dones[t]:
+-            running_return = 0
+-        running_return = buffer.rewards[t] + gamma * running_return
+-        returns[t] = running_return
+-
+-    # advantages = returns - values
+-    for t in range(buffer_size):
+-        advantages[t] = returns[t] - buffer.values[t]
+-
+-    return returns, advantages
+-
+-def ppo_update(policy_net, optimizer, rollouts, next_value, clip_eps, entropy_coef):
+-    """
+-    Runs the PPO update for the data in the rollout buffer.
+-    """
+-    # 1) Compute returns & advantages
+-    returns, advantages = compute_returns_and_advantages(rollouts, next_value, GAMMA)
+-    returns = torch.tensor(np.array(returns), dtype=torch.float32, device=DEVICE)
+-    advantages = torch.tensor(np.array(advantages), dtype=torch.float32, device=DEVICE)
+-
+-    # Normalize advantages (helps training)
+-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+-
+-    states = torch.tensor(np.array(rollouts.states), dtype=torch.float32, device=DEVICE)
+-    actions = torch.tensor(np.array(rollouts.actions), dtype=torch.long, device=DEVICE)
+-    old_log_probs = torch.tensor(np.array(rollouts.log_probs), dtype=torch.float32, device=DEVICE)
+-
+-    # We'll do multiple epochs over the data
+-    dataset_size = len(states)
+-    
+-    kl_loss_fn = bnn.BKLLoss(reduction="mean", last_layer_only=False)
+-
+-    for _ in range(PPO_EPOCHS):
+-        # Shuffle indices for mini-batches
+-        indices = np.arange(dataset_size)
+-        np.random.shuffle(indices)
+-
+-        for start in range(0, dataset_size, BATCH_SIZE):
+-            end = start + BATCH_SIZE
+-            batch_idx = indices[start:end]
+-
+-            batch_states = states[batch_idx]
+-            batch_actions = actions[batch_idx]
+-            batch_old_log_probs = old_log_probs[batch_idx]
+-            batch_returns = returns[batch_idx]
+-            batch_advantages = advantages[batch_idx]
+-
+-            # Forward pass
+-            logits, values = policy_net(batch_states)
+-            
+-            # Critic loss (MSE)
+-            value_loss = nn.MSELoss()(values, batch_returns)
+-
+-            # Actor loss (clipped)
+-            dist = torch.distributions.Categorical(logits=logits)
+-            new_log_probs = dist.log_prob(batch_actions)
+-            entropy = dist.entropy().mean()
+-
+-            ratio = torch.exp(new_log_probs - batch_old_log_probs)
+-            surr1 = ratio * batch_advantages
+-            surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * batch_advantages
+-            actor_loss = -torch.min(surr1, surr2).mean()
+-
+-            # Bayesian KL loss
+-            kl_bnn = kl_loss_fn(policy_net)  # Summed up over all Bayesian layers
+-
+-            # Total PPO loss
+-            total_loss = actor_loss + 0.5 * value_loss - entropy_coef * entropy \
+-                         + KL_SCALE * kl_bnn
+-
+-            optimizer.zero_grad()
+-            total_loss.backward()
+-            optimizer.step()
+-
+-#---------------------------------------------
+-# 4. Training Loop
+-#---------------------------------------------
+-def train_ppo_discrete():
+-    env = gym.make(ENV_NAME)
+-    
+-    env.action_space.seed(SEED)
+-
+-    state_dim = env.observation_space.shape[0]
+-    action_dim = env.action_space.n
+-
+-    policy_net = BayesianActorCritic(state_dim, action_dim).to(DEVICE)
+-    optimizer = optim.Adam(policy_net.parameters(), lr=LR)
+-
+-    rollout_buffer = RolloutBuffer()
+-
+-    total_steps = 0
+-    episode = 0
+-    state, _ = env.reset(seed=SEED)
+-    episode_rewards = []
+-    timesteps = []
+-    while episode < EPISODES:
+-        episode_reward = 0
+-
+-        # Collect experiences for STEPS_PER_ROLLOUT
+-        for step in range(STEPS_PER_ROLLOUT):
+-            total_steps += 1
+-
+-            state_t = torch.tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+-            logits, value = policy_net(state_t)
+-            dist = torch.distributions.Categorical(logits=logits)
+-            action = dist.sample().item()
+-            log_prob = dist.log_prob(torch.tensor(action, device=DEVICE)).item()
+-
+-            next_state, reward, done, truncated, _ = env.step(action)
+-            episode_reward += reward
+-
+-            # Store in rollout buffer
+-            rollout_buffer.add(
+-                state, action, log_prob, reward, done, value.item()
+-            )
+-
+-            state = next_state
+-            if done or truncated:
+-                # Start a new episode if the environment finished
+-                print(f"Episode {episode} ended with reward {episode_reward}")
+-                state, _ = env.reset(seed=SEED)
+-                episode_rewards.append(episode_reward)
+-                timesteps.append(total_steps)
+-                episode_reward = 0
+-                episode+=1
+-
+-        # After STEPS_PER_ROLLOUT, run PPO update
+-        # We need V(s_{t+1}) for advantage calculation (or 0 if done).
+-        with torch.no_grad():
+-            state_t = torch.tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+-            _, next_value = policy_net(state_t)
+-
+-        ppo_update(policy_net, optimizer, rollout_buffer, next_value.item(), 
+-                   CLIP_EPS, ENTROPY_COEF)
+-        rollout_buffer.clear()
+-
+-    env.close()
+-    print("Training finished (Discrete PPO)!")
+-    plt.plot(timesteps, episode_rewards)
+-    plt.savefig(f"ppo_{ENV_NAME}.png")
+-
+-if __name__ == "__main__":
+-    train_ppo_discrete()
+diff --git a/explorations/ppo_bayesian_continuous.py b/explorations/ppo_bayesian_continuous.py
+deleted file mode 100644
+index 0afb263..0000000
+--- a/explorations/ppo_bayesian_continuous.py
++++ /dev/null
+@@ -1,233 +0,0 @@
+-import gymnasium as gym
+-import torch
+-import torch.nn as nn
+-import torch.optim as optim
+-import torchbnn as bnn
+-import numpy as np
+-import random
+-from collections import deque
+-import matplotlib.pyplot as plt
+-
+-#---------------------------------------------
+-# Hyperparameters (continuous)
+-#---------------------------------------------
+-ENV_NAME = "BipedalWalker-v3"
+-SEED = 42
+-EPISODES = 1000
+-STEPS_PER_ROLLOUT = 2048
+-PPO_EPOCHS = 10
+-BATCH_SIZE = 256
+-GAMMA = 0.99
+-CLIP_EPS = 0.2
+-LR = 1e-3
+-ENTROPY_COEF = 0.0  # Typically smaller for continuous
+-KL_SCALE = 0.01
+-DEVICE = "cpu"
+-TOTAL_STEPS = 1000000
+-
+-random.seed(SEED)
+-np.random.seed(SEED)
+-torch.manual_seed(SEED)
+-
+-#---------------------------------------------
+-# 1. Actor-Critic (Bayesian) for continuous
+-#---------------------------------------------
+-class BayesianActorCriticContinuous(nn.Module):
+-    def __init__(self, state_dim, action_dim):
+-        super().__init__()
+-        # Shared features
+-        self.shared1 = bnn.BayesLinear(prior_mu=0, prior_sigma=0.1,
+-                                       in_features=state_dim, out_features=128)
+-        self.shared2 = bnn.BayesLinear(prior_mu=0, prior_sigma=0.1,
+-                                       in_features=128, out_features=128)
+-        
+-        # Actor mean head
+-        self.actor_mean = bnn.BayesLinear(prior_mu=0, prior_sigma=0.1,
+-                                          in_features=128, out_features=action_dim)
+-        # We can also do a Bayesian log std, or keep a separate trainable parameter
+-        # For simplicity, let's do a plain parameter:
+-        self.log_std = nn.Parameter(torch.zeros(action_dim))
+-
+-        # Critic head
+-        self.critic = bnn.BayesLinear(prior_mu=0, prior_sigma=0.1,
+-                                      in_features=128, out_features=1)
+-    
+-    def forward(self, x):
+-        x = torch.relu(self.shared1(x))
+-        x = torch.relu(self.shared2(x))
+-        mean = self.actor_mean(x)
+-        value = self.critic(x).squeeze(-1)
+-        return mean, self.log_std, value
+-
+-#---------------------------------------------
+-# 2. Rollout Buffer for continuous
+-#---------------------------------------------
+-class RolloutBuffer:
+-    def __init__(self):
+-        self.states = []
+-        self.actions = []
+-        self.log_probs = []
+-        self.rewards = []
+-        self.dones = []
+-        self.values = []
+-
+-    def add(self, state, action, log_prob, reward, done, value):
+-        self.states.append(state)
+-        self.actions.append(action)
+-        self.log_probs.append(log_prob)
+-        self.rewards.append(reward)
+-        self.dones.append(done)
+-        self.values.append(value)
+-
+-    def clear(self):
+-        self.states = []
+-        self.actions = []
+-        self.log_probs = []
+-        self.rewards = []
+-        self.dones = []
+-        self.values = []
+-
+-#---------------------------------------------
+-# 3. PPO update
+-#---------------------------------------------
+-def compute_returns_and_advantages(buffer, next_value, gamma=0.99):
+-    returns = []
+-    advantages = []
+-    running_return = next_value
+-    buffer_size = len(buffer.rewards)
+-
+-    for t in reversed(range(buffer_size)):
+-        if buffer.dones[t]:
+-            running_return = 0
+-        running_return = buffer.rewards[t] + gamma * running_return
+-        returns.insert(0, running_return)
+-
+-    for t in range(buffer_size):
+-        advantages.append(returns[t] - buffer.values[t])
+-
+-    return returns, advantages
+-
+-def ppo_update(policy_net, optimizer, rollouts, next_value, clip_eps):
+-    returns, advantages = compute_returns_and_advantages(rollouts, next_value, GAMMA)
+-    returns = torch.tensor(returns, dtype=torch.float32, device=DEVICE)
+-    advantages = torch.tensor(advantages, dtype=torch.float32, device=DEVICE)
+-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+-
+-    states = torch.tensor(rollouts.states, dtype=torch.float32, device=DEVICE)
+-    actions = torch.tensor(rollouts.actions, dtype=torch.float32, device=DEVICE)
+-    old_log_probs = torch.tensor(rollouts.log_probs, dtype=torch.float32, device=DEVICE)
+-
+-    kl_loss_fn = bnn.BKLLoss(reduction="mean", last_layer_only=False)
+-    dataset_size = len(states)
+-
+-    for _ in range(PPO_EPOCHS):
+-        indices = np.arange(dataset_size)
+-        np.random.shuffle(indices)
+-        
+-        for start in range(0, dataset_size, BATCH_SIZE):
+-            end = start + BATCH_SIZE
+-            batch_idx = indices[start:end]
+-
+-            batch_states = states[batch_idx]
+-            batch_actions = actions[batch_idx]
+-            batch_old_log_probs = old_log_probs[batch_idx]
+-            batch_returns = returns[batch_idx]
+-            batch_advantages = advantages[batch_idx]
+-
+-            mean, log_std, value = policy_net(batch_states)
+-            std = log_std.exp()
+-            dist = torch.distributions.Normal(mean, std)
+-            
+-            new_log_probs = dist.log_prob(batch_actions).sum(axis=-1)  # sum over action dims
+-            entropy = dist.entropy().sum(axis=-1).mean()
+-
+-            # Ratio
+-            ratio = torch.exp(new_log_probs - batch_old_log_probs)
+-
+-            surr1 = ratio * batch_advantages
+-            surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * batch_advantages
+-            actor_loss = -torch.min(surr1, surr2).mean()
+-            
+-            # Critic loss
+-            value_loss = nn.MSELoss()(value, batch_returns)
+-
+-            # Bayesian KL loss
+-            kl_bnn = kl_loss_fn(policy_net)
+-
+-            # Total loss
+-            loss = actor_loss + 0.5 * value_loss - ENTROPY_COEF * entropy \
+-                   + KL_SCALE * kl_bnn
+-
+-            optimizer.zero_grad()
+-            loss.backward()
+-            optimizer.step()
+-
+-#---------------------------------------------
+-# 4. Training Loop (continuous)
+-#---------------------------------------------
+-def train_ppo_continuous():
+-    env = gym.make(ENV_NAME)
+-    env.reset(seed=SEED)
+-
+-    state_dim = env.observation_space.shape[0]
+-    action_dim = env.action_space.shape[0]
+-
+-    policy_net = BayesianActorCriticContinuous(state_dim, action_dim).to(DEVICE)
+-    optimizer = optim.Adam(policy_net.parameters(), lr=LR)
+-
+-    rollout_buffer = RolloutBuffer()
+-
+-    total_steps = 0
+-    timesteps = []
+-    episode_rewards = []
+-    episode = 0
+-    while total_steps < TOTAL_STEPS:
+-        state, _ = env.reset()
+-        episode_reward = 0
+-
+-        for step in range(STEPS_PER_ROLLOUT):
+-            total_steps += 1
+-            state_t = torch.tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+-            mean, log_std, value = policy_net(state_t)
+-            std = log_std.exp()
+-            dist = torch.distributions.Normal(mean, std)
+-
+-            action = dist.sample()
+-            log_prob = dist.log_prob(action).sum(dim=-1).item()
+-
+-            # Convert action to numpy, clip if necessary
+-            action_np = action.squeeze(0).cpu().numpy()
+-            # Some environments require clipping actions
+-            # e.g. if env.action_space is [-1, 1], do: action_np = np.clip(action_np, -1, 1)
+-
+-            next_state, reward, done, truncated, info = env.step(action_np)
+-            episode_reward += reward
+-
+-            rollout_buffer.add(
+-                state, action_np, log_prob, reward, done or truncated, value.item()
+-            )
+-
+-            state = next_state
+-            if done or truncated:
+-                print(f"Episode {episode} ended with reward {episode_reward}")
+-                episode+=1
+-                state, _ = env.reset()
+-                episode_rewards.append(episode_reward)
+-                timesteps.append(total_steps)
+-                episode_reward = 0
+-
+-        # After collecting STEPS_PER_ROLLOUT steps, do an update
+-        with torch.no_grad():
+-            state_t = torch.tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+-            _, _, next_value = policy_net(state_t)
+-
+-        ppo_update(policy_net, optimizer, rollout_buffer, next_value.item(), CLIP_EPS)
+-        rollout_buffer.clear()
+-
+-    env.close()
+-    print("Training finished (Continuous PPO)!")
+-    plt.plot(timesteps, episode_rewards)
+-    plt.savefig(f"ppo_{ENV_NAME}.png")
+-
+-if __name__ == "__main__":
+-    train_ppo_continuous()
+diff --git a/explorations/q_learn_bayesian.py b/explorations/q_learn_bayesian.py
+deleted file mode 100644
+index 8a1d927..0000000
+--- a/explorations/q_learn_bayesian.py
++++ /dev/null
+@@ -1,195 +0,0 @@
+-import gymnasium as gym
+-import numpy as np
+-import random
+-import torch
+-import torch.nn as nn
+-import torch.optim as optim
+-import torchbnn as bnn
+-import matplotlib.pyplot as plt
+-
+-from collections import deque
+-
+-# -----------------------------------------------------------
+-# 1. Hyperparameters
+-# -----------------------------------------------------------
+-ENV_NAME = "LunarLander-v3"
+-SEED = 42
+-GAMMA = 0.99
+-LR = 1e-3
+-BATCH_SIZE = 64
+-MEMORY_SIZE = 50_000
+-MIN_REPLAY_SIZE = 1_000   # Minimum experiences before we start training
+-EPS_START = 1.0
+-EPS_END = 0.01
+-EPS_DECAY = 50_000        # Decay over n steps
+-TARGET_UPDATE_FREQ = 100
+-MAX_EPISODES = 500
+-MAX_STEPS = 10_000_000    # Just a large number; training will likely converge earlier
+-
+-# -----------------------------------------------------------
+-# 2. Set seeds for reproducibility (optional)
+-# -----------------------------------------------------------
+-random.seed(SEED)
+-np.random.seed(SEED)
+-torch.manual_seed(SEED)
+-
+-# -----------------------------------------------------------
+-# 3. Replay Buffer
+-# -----------------------------------------------------------
+-class ReplayBuffer:
+-    def __init__(self, capacity):
+-        self.buffer = deque(maxlen=capacity)
+-    
+-    def push(self, state, action, reward, next_state, done):
+-        self.buffer.append((state, action, reward, next_state, done))
+-    
+-    def sample(self, batch_size):
+-        samples = random.sample(self.buffer, batch_size)
+-        states, actions, rewards, next_states, dones = zip(*samples)
+-        return (
+-            np.array(states),
+-            np.array(actions),
+-            np.array(rewards, dtype=np.float32),
+-            np.array(next_states),
+-            np.array(dones, dtype=np.float32),
+-        )
+-    
+-    def __len__(self):
+-        return len(self.buffer)
+-
+-# -----------------------------------------------------------
+-# 4. Q-Network
+-# -----------------------------------------------------------
+-class QNetwork(nn.Module):
+-    def __init__(self, state_dim, action_dim):
+-        super(QNetwork, self).__init__()
+-        self.net = nn.Sequential(
+-            bnn.BayesLinear(prior_mu = 0, prior_sigma = 0.1, in_features = state_dim, out_features = 128),
+-            nn.ReLU(),
+-            bnn.BayesLinear(prior_mu = 0, prior_sigma = 0.1, in_features = 128, out_features = 128),
+-            nn.ReLU(),
+-            bnn.BayesLinear(prior_mu = 0, prior_sigma = 0.1, in_features = 128, out_features = action_dim),
+-        )
+-    
+-    def forward(self, x):
+-        return self.net(x)
+-
+-# -----------------------------------------------------------
+-# 5. Initialize environment, networks, optimizer
+-# -----------------------------------------------------------
+-env = gym.make(ENV_NAME)
+-env.action_space.seed(SEED)
+-state_dim = env.observation_space.shape[0]
+-action_dim = env.action_space.n
+-
+-# Main network (policy network)
+-policy_net = QNetwork(state_dim, action_dim)
+-# Target network
+-target_net = QNetwork(state_dim, action_dim)
+-target_net.load_state_dict(policy_net.state_dict())
+-target_net.eval()
+-
+-optimizer = optim.Adam(policy_net.parameters(), lr=LR)
+-
+-replay_buffer = ReplayBuffer(MEMORY_SIZE)
+-
+-# Epsilon schedule
+-eps = EPS_START
+-eps_decay_step = (EPS_START - EPS_END) / EPS_DECAY
+-
+-# -----------------------------------------------------------
+-# 6. Fill the replay buffer with random transitions (warm-up)
+-# -----------------------------------------------------------
+-state, _ = env.reset()
+-for _ in range(MIN_REPLAY_SIZE):
+-    action = env.action_space.sample()
+-    next_state, reward, done, truncated, info = env.step(action)
+-    replay_buffer.push(state, action, reward, next_state, done or truncated)
+-    state = next_state
+-    if done or truncated:
+-        state, _ = env.reset()
+-
+-# -----------------------------------------------------------
+-# 7. Training Loop
+-# -----------------------------------------------------------
+-kl_loss = bnn.BKLLoss(reduction = "mean", last_layer_only  = False)
+-total_steps = 0
+-episode_rewards = []
+-timesteps = []
+-for episode in range(MAX_EPISODES):
+-    state, _ = env.reset()
+-    episode_reward = 0
+-    while True:
+-
+-        # for step in range(1_000):  # limit each episode to 1000 steps
+-        total_steps += 1
+-
+-        # Epsilon-greedy action selection
+-        if random.random() < eps:
+-            action = env.action_space.sample()
+-        else:
+-            with torch.no_grad():
+-                state_t = torch.FloatTensor(state).unsqueeze(0)
+-                q_values = policy_net(state_t)
+-                action = q_values.argmax(dim=1).item()
+-
+-        # Step in the environment
+-        next_state, reward, done, truncated, info = env.step(action)
+-        replay_buffer.push(state, action, reward, next_state, done or truncated)
+-        state = next_state
+-        episode_reward += reward
+-
+-        # Decrease epsilon
+-        if eps > EPS_END:
+-            eps -= eps_decay_step
+-            eps = max(eps, EPS_END)
+-
+-        # Start gradient updates after MIN_REPLAY_SIZE
+-        if len(replay_buffer) > MIN_REPLAY_SIZE:
+-            # Sample from replay buffer
+-            states, actions, rewards, next_states, dones = replay_buffer.sample(BATCH_SIZE)
+-
+-            # Convert to tensors
+-            states_t = torch.FloatTensor(states)
+-            actions_t = torch.LongTensor(actions)
+-            rewards_t = torch.FloatTensor(rewards)
+-            next_states_t = torch.FloatTensor(next_states)
+-            dones_t = torch.FloatTensor(dones)
+-
+-            # Compute current Q values
+-            q_values = policy_net(states_t)
+-            # Gather the Q-values for the taken actions
+-            q_values = q_values.gather(1, actions_t.unsqueeze(1)).squeeze(1)
+-
+-            # Compute target Q values
+-            with torch.no_grad():
+-                # Double DQN variant can be used, but let's keep it simple (classic DQN)
+-                max_next_q_values = target_net(next_states_t).max(dim=1)[0]
+-                target_q_values = rewards_t + GAMMA * (1 - dones_t) * max_next_q_values
+-
+-            # MSE loss (Huber loss often works better, but MSE is simpler)
+-            loss = nn.MSELoss()(q_values, target_q_values) + kl_loss(policy_net)*0.01
+-
+-            # Gradient descent
+-            optimizer.zero_grad()
+-            loss.backward()
+-            optimizer.step()
+-
+-            # Update target network
+-            if total_steps % TARGET_UPDATE_FREQ == 0:
+-                target_net.load_state_dict(policy_net.state_dict())
+-
+-        if done or truncated:
+-            print(f"Episode {episode} ended with reward {episode_reward}")
+-            episode_rewards.append(episode_reward)
+-            timesteps.append(total_steps)
+-            break
+-
+-plt.plot(timesteps, episode_rewards)
+-plt.savefig(f"cartpole_{ENV_NAME}.png")
+-
+-print("Training finished!")
+-env.close()
+-
+-import pickle
+-pickle.dump(policy_net, open(f"saved_policies/policy_{ENV_NAME}.pkl", "wb"))
+\ No newline at end of file
+diff --git a/explorations/q_learn_symbol.py b/explorations/q_learn_symbol.py
+deleted file mode 100644
+index 20d996c..0000000
+--- a/explorations/q_learn_symbol.py
++++ /dev/null
+@@ -1,128 +0,0 @@
+-import numpy as np
+-import gymnasium as gym
+-from pysr import PySRRegressor
+-
+-# Create the CartPole environment.
+-env = gym.make("CartPole-v1")
+-gamma = 0.99       # Discount factor
+-learning_rate = 0.01  # A step size for our “policy gradient” update.
+-state_size = env.observation_space.shape[0]  # For CartPole, 4 dimensions.
+-n_actions = env.action_space.n               # Typically 2 actions.
+-
+-# We'll represent our policy with one symbolic model per action.
+-# Each model outputs a "logit" (unnormalized score) for its action given the state.
+-policy_models = [
+-    PySRRegressor(
+-        niterations=50,
+-        binary_operators=["+", "-", "*", "/"],
+-        unary_operators=["exp", "abs", "sqrt"],
+-        population_size=50,
+-        model_selection="best",
+-        maxsize=20,
+-        loss="L2DistLoss()",
+-        verbosity=0,
+-        warm_start = True
+-    )
+-    for _ in range(n_actions)
+-]
+-
+-# Dummy initialization (each model takes a state and returns 0 as initial logit).
+-dummy_state = np.zeros((1, state_size))
+-dummy_target = np.array([0.0])
+-for model in policy_models:
+-    model.fit(dummy_state, dummy_target)
+-
+-def get_policy_logits(state):
+-    """
+-    Given a state, return a vector of logits (one per action).
+-    """
+-    state = np.array(state).reshape(1, -1)
+-    logits = np.array([model.predict(state)[0] for model in policy_models])
+-    return logits
+-
+-def get_action_probs(state):
+-    """
+-    Compute softmax over logits to obtain probabilities.
+-    """
+-    logits = get_policy_logits(state)
+-    # For numerical stability subtract the max logit.
+-    # exp_logits = np.exp(logits - np.max(logits))
+-    probs = np.nan_to_num(logits, 0)
+-    probs = np.exp(logits) / np.sum(np.exp(logits))
+-    return probs
+-
+-def select_action(state):
+-    """
+-    Sample an action according to the policy's probability distribution.
+-    """
+-    probs = get_action_probs(state)
+-    return np.random.choice(n_actions, p=probs)
+-
+-def update_policy(episode_transitions):
+-    """
+-    Given a list of transitions (state, action, reward), compute the return G for each time step,
+-    then update the symbolic policy models to push the logit for the taken action in the direction of G.
+-    
+-    Here we "simulate" a policy gradient update by creating target logit values:
+-      target = current logit + learning_rate * G
+-    for the taken action.
+-    """
+-    # First, compute the returns for the episode.
+-    returns = []
+-    G = 0
+-    # Process transitions in reverse order.
+-    for (_, _, reward) in reversed(episode_transitions):
+-        G = reward + gamma * G
+-        returns.insert(0, G)
+-    
+-    # For each action, gather states where that action was taken and compute targets.
+-    # For transitions where an action was not taken, we use the current logit as the target.
+-    # We'll update each model separately.
+-    # First, collect all states for the episode.
+-    states = np.array([s for (s, _, _) in episode_transitions])
+-    # Get current logits for all transitions.
+-    current_logits = np.array([get_policy_logits(s) for s in states])
+-    # Build target matrix (shape: [num_transitions, n_actions]) that initially equals current_logits.
+-    targets = current_logits.copy()
+-    
+-    # For each transition, modify the target for the taken action.
+-    for i, (s, a, _) in enumerate(episode_transitions):
+-        targets[i, a] += learning_rate * returns[i]
+-    
+-    # Now, update each policy model using the states and the corresponding target for that action.
+-    for a in range(n_actions):
+-        # Find indices where we have an update for action a.
+-        indices = [i for i, (_, act, _) in enumerate(episode_transitions) if act == a]
+-        if indices:
+-            X = states[indices]  # Shape: (num_samples, state_size)
+-            y = targets[indices, a]  # The desired logit for action a.
+-            policy_models[a].fit(X, y)
+-
+-# --- Training Loop using a REINFORCE-like update ---
+-num_episodes = 100
+-episode_rewards = []
+-
+-for episode in range(num_episodes):
+-    state, _ = env.reset()  # Gymnasium returns (observation, info)
+-    done = False
+-    episode_transitions = []  # Will store tuples of (state, action, reward)
+-    total_reward = 0
+-
+-    while not done:
+-        action = select_action(state)
+-        next_state, reward, terminated, truncated, _ = env.step(action)
+-        done = terminated or truncated
+-        episode_transitions.append((state, action, reward))
+-        state = next_state
+-        total_reward += reward
+-
+-    episode_rewards.append(total_reward)
+-    update_policy(episode_transitions)
+-    print(f"Episode {episode+1}, Reward: {total_reward}")
+-
+-# --- (Optional) Inspect the learned symbolic policy expressions ---
+-for a, model in enumerate(policy_models):
+-    print(f"\nLearned policy expression for action {a} (logit):")
+-    print(model.sympy())
+-
+-env.close()
+diff --git a/flask_crafter.py b/flask_crafter.py
+deleted file mode 100644
+index d92c8b7..0000000
+--- a/flask_crafter.py
++++ /dev/null
+@@ -1,154 +0,0 @@
+-import os
+-import time
+-import threading
+-import io
+-import numpy as np
+-import torch
+-import cv2
+-import matplotlib.pyplot as plt
+-import imageio
+-import gymnasium as gym
+-from flask import Flask, render_template, Response, request, jsonify
+-from envs.crafter_env import CrafterEnv
+-from envs.utils import SyncVectorEnv
+-from ppo.agent import CNNDiscreteAgent
+-
+-app = Flask(__name__)
+-
+-# List of reward component keys (39 components)
+-reward_keys = [
+-    'health', 'achievement', 'food', 'drink', 'energy', 'sapling', 'wood', 'stone',
+-    'coal', 'iron', 'diamond', 'wood_pickaxe', 'stone_pickaxe', 'iron_pickaxe',
+-    'wood_sword', 'stone_sword', 'iron_sword', 'collect_coal', 'collect_diamond',
+-    'collect_drink', 'collect_iron', 'collect_sapling', 'collect_stone', 'collect_wood',
+-    'defeat_skeleton', 'defeat_zombie', 'eat_cow', 'eat_plant', 'make_iron_pickaxe',
+-    'make_iron_sword', 'make_stone_pickaxe', 'make_stone_sword', 'make_wood_pickaxe',
+-    'make_wood_sword', 'place_furnace', 'place_plant', 'place_stone', 'place_table',
+-    'wake_up'
+-]
+-
+-# Initialize global weight vector (defaulting to zeros, with some default ones)
+-weight = np.zeros(39)
+-weight[[1, 2, 3, 4, 5, 6, 7]] = 1  # example: set some default values
+-
+-# Locks for thread-safe access to shared variables
+-weights_lock = threading.Lock()
+-episode_reward_lock = threading.Lock()
+-
+-# Global variable to store accumulated rewards for the current episode.
+-# It is a list of reward vectors (one per timestep).
+-current_episode_reward = [np.zeros(39)]
+-
+-# --- Initialize the environment and the agent ---
+-# Create a vectorized environment for the agent.
+-env = SyncVectorEnv(
+-    [
+-        lambda: gym.wrappers.TimeLimit(
+-            CrafterEnv(scalar_reward=False, render_mode="rgb_array"),
+-            max_episode_steps=10000
+-        ),
+-    ],
+-    reward_size=39
+-)
+-
+-eval_agent = CNNDiscreteAgent(env, reward_size=39).to("cuda")
+-model_path = "runs/Crafter__main_ppo__2025-03-03 14:07:30.609268__100/main_ppo.rl_model"
+-eval_agent.load_state_dict(torch.load(model_path))
+-eval_agent.eval()
+-
+-# Create a separate environment for rendering
+-env_render = CrafterEnv(scalar_reward=False, render_mode="rgb_array")
+-
+-@app.route('/')
+-def index():
+-    # Pass current weights as a dictionary (key: value) for slider initialization.
+-    with weights_lock:
+-        weight_dict = {key: float(weight[i]) for i, key in enumerate(reward_keys)}
+-    return render_template('crafter.html', weights=weight_dict)
+-
+-@app.route('/update_weights', methods=['POST'])
+-def update_weights():
+-    global weight
+-    try:
+-        new_weights = np.zeros(39)
+-        for i, key in enumerate(reward_keys):
+-            new_weights[i] = float(request.form.get(key, 0))
+-        with weights_lock:
+-            weight = new_weights
+-        # Return updated weights as a dictionary.
+-        return jsonify({"status": "success", "weights": {k: float(weight[i]) for i, k in enumerate(reward_keys)}})
+-    except Exception as e:
+-        return jsonify({"status": "error", "message": str(e)}), 400
+-
+-def simulation_generator():
+-    """Generator that steps through the Crafter environment, accumulates rewards,
+-    and yields rendered frames."""
+-    global weight, current_episode_reward
+-    while True:
+-        # Reset accumulated rewards at the start of an episode.
+-        with episode_reward_lock:
+-            current_episode_reward = [np.zeros(39)]
+-        done = False
+-        trunc = False
+-        obs, _ = env_render.reset()
+-        while not (done or trunc):
+-            with weights_lock:
+-                current_weight = np.copy(weight)
+-            # Predict an action using the agent (note: agent expects a batch)
+-            action, _ = eval_agent.predict(obs, current_weight, deterministic=True, device="cuda")
+-            print(action)
+-            obs, rew, done, trunc, infos = env_render.step(action[0])
+-            with episode_reward_lock:
+-                current_episode_reward.append(rew)
+-            # Render the frame from the environment.
+-            frame = env_render.render(size = (256, 256))
+-            # resized_frame = cv2.resize(frame, None, fx=4, fy=4, interpolation=cv2.INTER_LINEAR)
+-            ret, jpg = cv2.imencode('.jpg', frame,  [cv2.IMWRITE_PNG_COMPRESSION, 0])
+-            if ret:
+-                frame_bytes = jpg.tobytes()
+-                yield (b'--frame\r\n'
+-                       b'Content-Type: image/png\r\n\r\n' + frame_bytes + b'\r\n')
+-            time.sleep(0.03)
+-
+-@app.route('/render_feed')
+-def render_feed():
+-    return Response(simulation_generator(),
+-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+-
+-def generate_plot():
+-    """Generates a PNG plot of the accumulated reward per component for the current episode."""
+-    with episode_reward_lock:
+-        data = np.array(current_episode_reward)
+-    fig, ax = plt.subplots(figsize=(10, 5))
+-    ax.plot(data)
+-    ax.set_title("Accumulated Reward per Component (Current Episode)")
+-    ax.set_ylabel("Accumulated Reward")
+-    ax.legend(reward_keys, loc='upper left', fontsize='xx-small')
+-    buf = io.BytesIO()
+-    fig.savefig(buf, format='png')
+-    plt.close(fig)
+-    buf.seek(0)
+-    return buf.getvalue()
+-
+-@app.route('/plot_feed')
+-def plot_feed():
+-    png = generate_plot()
+-    return Response(png, mimetype='image/png')
+-
+-
+-def reward_plot_gen():
+-    """Generator that continuously yields updated reward plot frames."""
+-    while True:
+-        png = generate_plot()  # Generate the current reward plot as PNG
+-        yield (b'--frame\r\n'
+-               b'Content-Type: image/png\r\n\r\n' + png + b'\r\n')
+-        time.sleep(0.03)  # Adjust the refresh rate as needed
+-
+-@app.route('/reward_plot_stream')
+-def reward_plot_stream():
+-    return Response(reward_plot_gen(),
+-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+-
+-
+-if __name__ == '__main__':
+-    app.run(host='0.0.0.0', port=5000, debug=False)
+diff --git a/flask_lander.py b/flask_lander.py
+deleted file mode 100644
+index 8546316..0000000
+--- a/flask_lander.py
++++ /dev/null
+@@ -1,156 +0,0 @@
+-import os
+-import cv2
+-import time
+-import threading
+-import numpy as np
+-import torch
+-import io
+-import matplotlib.pyplot as plt
+-from flask import Flask, request, render_template, Response, jsonify
+-from envs.lunar_lander import LunarLander  # Ensure this is on your PYTHONPATH
+-from ppo.agent import ContinuousAgent
+-from envs.utils import SyncVectorEnv
+-import gymnasium as gym
+-
+-# Set up paths for templates.
+-DIR_PATH = os.path.dirname(os.path.abspath(__file__))
+-TEMPLATE_PATH = os.path.join(DIR_PATH, 'templates/')
+-
+-app = Flask(__name__, template_folder=TEMPLATE_PATH)
+-
+-# Global weights vector (initialized as desired) and lock.
+-weights = np.array([0.9, 0.7, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0])
+-weights_lock = threading.Lock()
+-
+-# Global variable for the accumulated reward for the current episode.
+-current_episode_reward = [np.zeros(8), ]
+-episode_reward_lock = threading.Lock()
+-
+-# --- Initialize the agent ---
+-# Create a vectorized environment for the agent.
+-env_agent = SyncVectorEnv(
+-    [
+-        lambda: gym.wrappers.TimeLimit(
+-            LunarLander(continuous=True, scalar_reward=False, render_mode="rgb_array"),
+-            max_episode_steps=500
+-        ),
+-    ],
+-    reward_size=8
+-)
+-eval_agent = ContinuousAgent(env_agent, reward_size=8).to("cuda")
+-model_path = "runs/LunarLander__main_ppo__2025-03-04 10:51:44.153791__100/main_ppo.rl_model"
+-eval_agent.load_state_dict(torch.load(model_path))
+-eval_agent.eval()
+-
+-# Create a separate (non-vectorized) environment for rendering.
+-env_render = LunarLander(continuous=True, scalar_reward=False, render_mode="rgb_array")
+-
+-@app.route('/')
+-def index():
+-    # Pass current weights to the template for slider initialization.
+-    return render_template('index.html', weights=weights.tolist())
+-
+-@app.route('/update_weights', methods=['POST'])
+-def update_weights():
+-    global weights
+-    # Get form data sent via AJAX.
+-    data = request.form
+-    try:
+-        new_weights = np.array([
+-            float(data.get("w_distance", 0.9)),
+-            float(data.get("w_speed", 0.7)),
+-            float(data.get("w_tilt", 0.0)),
+-            float(data.get("w_leg1", 0.5)),
+-            float(data.get("w_leg2", 0.5)),
+-            float(data.get("w_main_engine", 1.0)),
+-            float(data.get("w_side_engine", 1.0)),
+-            float(data.get("w_success", 1.0)),
+-        ])
+-        with weights_lock:
+-            weights = new_weights
+-        return jsonify({"status": "success", "weights": weights.tolist()})
+-    except Exception as e:
+-        return jsonify({"status": "error", "message": str(e)}), 400
+-
+-def simulation_generator():
+-    """Generator that steps through the simulation, accumulates weighted rewards,
+-    resets the accumulator at the start of each episode, and yields rendered frames."""
+-    global weights, current_episode_reward
+-    while True:
+-        # Reset the accumulated reward at the start of each episode.
+-        with episode_reward_lock:
+-            current_episode_reward = [np.zeros(8), ]
+-        done = False
+-        trunc = False
+-        obs, _ = env_render.reset()
+-        while not (done or trunc):
+-            with weights_lock:
+-                current_weights = np.copy(weights)
+-            # Agent expects a batch; use the first action.
+-            action, _ = eval_agent.predict(obs, current_weights, deterministic=True, device = "cuda")
+-            obs, rew, done, trunc, infos = env_render.step(action[0])
+-            # Compute the weighted reward for this step.
+-            step_reward = current_weights * rew
+-            with episode_reward_lock:
+-                current_episode_reward.append(step_reward)
+-            frame = env_render.render()
+-            yield frame
+-            time.sleep(0.03)
+-
+-def frame_gen(generator_func, *args, **kwargs):
+-    """Encodes frames from the generator as PNG and yields them in a multipart response."""
+-    get_frame = generator_func(*args, **kwargs)
+-    while True:
+-        frame = next(get_frame, None)
+-        if frame is None:
+-            continue
+-        ret, png = cv2.imencode('.png', frame)
+-        if not ret:
+-            continue
+-        frame_bytes = png.tobytes()
+-        yield (b'--frame\r\n'
+-               b'Content-Type: image/png\r\n\r\n' + frame_bytes + b'\r\n')
+-
+-@app.route('/render_feed')
+-def render_feed():
+-    return Response(frame_gen(simulation_generator),
+-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+-
+-def generate_plot():
+-    """Generates a PNG bar plot of the accumulated reward per component for the current episode."""
+-    with episode_reward_lock:
+-        data = np.array(current_episode_reward)
+-    fig, ax = plt.subplots()
+-    components = ["Distance", "Speed", "Tilt", "Leg 1", "Leg 2", "Main Engine", "Side Engine", "Success"]
+-    # for i in range(8):
+-    ax.plot(data, label = components)
+-    ax.set_title("Accumulated Reward per Component (Current Episode)")
+-    ax.set_ylabel("Accumulated Reward")
+-    buf = io.BytesIO()
+-    ax.legend()
+-    fig.savefig(buf, format='png')
+-    plt.close(fig)
+-    buf.seek(0)
+-    return buf.getvalue()
+-
+-@app.route('/plot_feed')
+-def plot_feed():
+-    png = generate_plot()
+-    return Response(png, mimetype='image/png')
+-
+-def reward_plot_gen():
+-    """Generator that continuously yields updated reward plot frames."""
+-    while True:
+-        png = generate_plot()  # Generate the current reward plot as PNG
+-        yield (b'--frame\r\n'
+-               b'Content-Type: image/png\r\n\r\n' + png + b'\r\n')
+-        time.sleep(0.03)  # Adjust the refresh rate as needed
+-
+-@app.route('/reward_plot_stream')
+-def reward_plot_stream():
+-    return Response(reward_plot_gen(),
+-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+-
+-
+-if __name__ == '__main__':
+-    app.run(host='0.0.0.0', port=5000, debug=False)
+diff --git a/flask_mo_hopper.py b/flask_mo_hopper.py
+deleted file mode 100644
+index dde108f..0000000
+--- a/flask_mo_hopper.py
++++ /dev/null
+@@ -1,328 +0,0 @@
+-import os
+-import cv2
+-import time
+-import threading
+-import numpy as np
+-import torch
+-import io
+-import matplotlib.pyplot as plt
+-from flask import Flask, request, render_template, Response, jsonify
+-from envs.lunar_lander import LunarLander  # Ensure this is on your PYTHONPATH
+-from ppo.agent import DiscreteAgent, ContinuousAgent
+-from envs.utils import SyncVectorEnv
+-import mo_gymnasium as mo_gym
+-import base64
+-import traceback
+-from io import BytesIO
+-
+-# Set up paths for templates.
+-DIR_PATH = os.path.dirname(os.path.abspath(__file__))
+-TEMPLATE_PATH = os.path.join(DIR_PATH, 'templates/')
+-
+-app = Flask(__name__, template_folder=TEMPLATE_PATH)
+-
+-# Global weights vector (initialized as desired) and lock.
+-weights = np.array([1, 0, 0])
+-weights_lock = threading.Lock()
+-
+-# Global variable for the accumulated reward for the current episode.
+-current_episode_reward = [np.zeros(3), ]
+-episode_reward_lock = threading.Lock()
+-
+-# --- Initialize the agent ---
+-# Create a vectorized environment for the agent.
+-env_agent = mo_gym.make("mo-hopper-v5", render_mode = "rgb_array")
+-eval_agent = ContinuousAgent(env_agent, reward_size=3).to("cuda")
+-model_path = "runs/mo-hopper-v5__main_ppo__2025-04-24 19:48:25.226526__1/main_ppo.rl_model"
+-eval_agent.load_state_dict(torch.load(model_path))
+-eval_agent.eval()
+-
+-# Create a separate (non-vectorized) environment for rendering.
+-# env_render = mo_gym.make("mo-hopper-v5", render_mode = "rgb_array")
+-
+-recorded_trajectory = []
+-record_lock = threading.Lock()# signal whether a /play episode is currently running
+-recording_in_progress = False
+-recording_lock = threading.Lock()
+-
+-
+-@app.route('/')
+-def index():
+-    # Pass current weights to the template for slider initialization.
+-    return render_template('mo_hopper.html', weights=weights.tolist())
+-
+-@app.route('/update_weights', methods=['POST'])
+-def update_weights():
+-    global weights
+-    # Get form data sent via AJAX.
+-    data = request.form
+-    try:
+-        new_weights = np.array([
+-            float(data.get("w_forward", 1)),
+-            float(data.get("w_jump", 0)),
+-            float(data.get("w_control", 0.0)),
+-        ])
+-        print(new_weights)
+-        with weights_lock:
+-            weights = new_weights
+-        return jsonify({"status": "success", "weights": weights.tolist()})
+-    except Exception as e:
+-        return jsonify({"status": "error", "message": str(e)}), 400
+-
+-# def simulation_generator():
+-#     """Generator that steps through the simulation, accumulates weighted rewards,
+-#     resets the accumulator at the start of each episode, and yields rendered frames."""
+-#     global weights, current_episode_reward
+-#     while True:
+-#         # Reset the accumulated reward at the start of each episode.
+-#         with episode_reward_lock:
+-#             current_episode_reward = [np.zeros(3), ]
+-#         done = False
+-#         trunc = False
+-#         obs, _ = env_render.reset()
+-#         while not (done or trunc):
+-#             with weights_lock:
+-#                 current_weights = np.copy(weights)
+-#             # Agent expects a batch; use the first action.
+-#             print(obs, current_weights)
+-#             action, _ = eval_agent.predict(obs, current_weights, deterministic=True, device = "cuda")
+-#             obs, rew, done, trunc, infos = env_render.step(action[0])
+-#             # Compute the weighted reward for this step.
+-#             step_reward = current_weights * rew
+-#             with episode_reward_lock:
+-#                 current_episode_reward.append(step_reward)
+-#             frame = env_render.render()
+-#             yield frame
+-#             time.sleep(0.03)
+-
+-# def frame_gen(generator_func, *args, **kwargs):
+-#     """Encodes frames from the generator as PNG and yields them in a multipart response."""
+-#     get_frame = generator_func(*args, **kwargs)
+-#     while True:
+-#         frame = next(get_frame, None)
+-#         if frame is None:
+-#             continue
+-#         ret, png = cv2.imencode('.png', frame)
+-#         if not ret:
+-#             continue
+-#         frame_bytes = png.tobytes()
+-#         yield (b'--frame\r\n'
+-#                b'Content-Type: image/png\r\n\r\n' + frame_bytes + b'\r\n')
+-
+-# @app.route('/render_feed')
+-# def render_feed():
+-#     return Response(frame_gen(simulation_generator),
+-#                     mimetype='multipart/x-mixed-replace; boundary=frame')
+-
+-def generate_plot():
+-    """Generates a PNG bar plot of the accumulated reward per component for the current episode."""
+-    with episode_reward_lock:
+-        data = np.array(current_episode_reward)
+-    fig, ax = plt.subplots()
+-    components = ["Forward", "Jump", "Energy", ]
+-    # for i in range(8):
+-    ax.plot(data, label = components)
+-    ax.set_title("Accumulated Reward per Component (Current Episode)")
+-    ax.set_ylabel("Accumulated Reward")
+-    buf = io.BytesIO()
+-    ax.legend()
+-    fig.savefig(buf, format='png')
+-    plt.close(fig)
+-    buf.seek(0)
+-    return buf.getvalue()
+-
+-@app.route('/plot_feed')
+-def plot_feed():
+-    png = generate_plot()
+-    return Response(png, mimetype='image/png')
+-
+-def reward_plot_gen():
+-    """Generator that continuously yields updated reward plot frames."""
+-    while True:
+-        png = generate_plot()  # Generate the current reward plot as PNG
+-        yield (b'--frame\r\n'
+-               b'Content-Type: image/png\r\n\r\n' + png + b'\r\n')
+-        time.sleep(0.03)  # Adjust the refresh rate as needed
+-
+-@app.route('/reward_plot_stream')
+-def reward_plot_stream():
+-    return Response(reward_plot_gen(),
+-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+-def generate_partial_plot_uri(step: int) -> str:
+-    """
+-    Build a cumulative-reward line plot up to `step` and return it
+-    as a 'data:image/png;base64,…' URI.
+-    """
+-    
+-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-    with record_lock:
+-        # gather reward vectors up to and including `step`
+-        data = np.array([ e['reward_components'] 
+-                          for e in recorded_trajectory ])  # shape (step+1, 4)
+-
+-    # cumulative sum along time
+-    cum = data.cumsum(axis=0)
+-
+-    labels = ["Forward", "Jump", "Energy", ]
+-    fig, ax = plt.subplots()
+-    for idx, lbl in enumerate(labels):
+-        ax.plot(cum[:, idx], label=lbl)
+-    ax.plot([step, step], [cum.min(), cum.max()], 'k--', lw=1)
+-    ax.set_title("Cumulative Reward up to step {}".format(step))
+-    ax.set_ylabel("Reward")
+-    ax.legend(loc="upper left")
+-
+-    buf = BytesIO()
+-    fig.savefig(buf, format="png", bbox_inches="tight")
+-    plt.close(fig)
+-    buf.seek(0)
+-
+-    b64 = base64.b64encode(buf.read()).decode("ascii")
+-    return f"data:image/png;base64,{b64}"
+-@app.route('/play')
+-def play():
+-    """
+-    Streams the simulation as MJPEG and records the trajectory.
+-    Ensures recording_in_progress is always cleared, even if the client
+-    stops the stream early.
+-    """
+-    def generate():
+-        global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-
+-        # Prevent two concurrent plays
+-        with recording_lock:
+-            if recording_in_progress:
+-                return
+-            recording_in_progress = True
+-            recorded_trajectory = []
+-
+-        try:
+-            
+-            env_render = mo_gym.make("mo-hopper-v5", render_mode = "rgb_array")
+-            obs, _ = env_render.reset()
+-            done = trunc = False
+-
+-            while not (done or trunc):
+-                with weights_lock:
+-                    w = weights.copy()
+-                
+-                action, _ = eval_agent.predict(obs, w, deterministic=True, device="cuda")
+-                next_obs, rew, done, trunc, _ = env_render.step(action[0])
+-
+-                ret, png = cv2.imencode('.png', env_render.render())
+-                if not ret:
+-                    obs = next_obs
+-                    continue
+-
+-                # record
+-                b64 = base64.b64encode(png.tobytes()).decode('ascii')
+-                with record_lock:
+-                    recorded_trajectory.append({
+-                        'state':            obs.tolist(),
+-                        'action':           action[0].tolist(),
+-                        'reward_components': (w * rew).tolist(),
+-                        'frame_b64':        b64
+-                    })
+-
+-                # stream
+-                yield (
+-                    b'--frame\r\n'
+-                    b'Content-Type: image/png\r\n\r\n' +
+-                    png.tobytes() +
+-                    b'\r\n'
+-                )
+-
+-                time.sleep(0.03)
+-                obs = next_obs
+-                
+-        except Exception as e:
+-            print(traceback.format_exc())
+-            # Handle any exceptions that occur during the simulation
+-            # You can log the error or take appropriate action here
+-
+-        finally :
+-            print("In Finally")
+-            # ALWAYS clear the flag, even if client aborted
+-            with recording_lock:
+-                recording_in_progress = False
+-
+-    return Response(
+-        generate(),
+-        mimetype='multipart/x-mixed-replace; boundary=frame'
+-    )
+-
+-
+-@app.route('/scrub')
+-def scrub():
+-    # block while recording
+-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-    
+-    with recording_lock:
+-        if recording_in_progress:
+-            return jsonify({'error':'episode still running'}), 409
+-
+-    step = request.args.get('step', type=int)
+-    if step is None:
+-        return jsonify({'error':'must provide ?step=N'}), 400
+-
+-    with record_lock:
+-        if step < 0 or step >= len(recorded_trajectory):
+-            return jsonify({'error':'step out of range'}), 400
+-        entry = recorded_trajectory[step]
+-
+-    # 1) frame data URI
+-    frame_uri = f"data:image/png;base64,{entry['frame_b64']}"
+-    # 2) cumulative‐reward line plot up to step
+-    plot_uri  = generate_partial_plot_uri(step)
+-
+-    # 3) per‐step bar plot of reward components
+-    # ------------------------------------------------
+-
+-    labels = ["Forward", "Jump", "Energy", ]
+-    values = entry['reward_components']
+-    fig, ax = plt.subplots()
+-    ax.bar(labels, values)
+-    ax.set_title(f"Reward Components at Step {step}")
+-    ax.set_ylabel("Reward")
+-    buf = BytesIO()
+-    fig.savefig(buf, format="png", bbox_inches="tight")
+-    plt.close(fig)
+-    buf.seek(0)
+-    bar_b64 = base64.b64encode(buf.read()).decode("ascii")
+-    bar_uri = f"data:image/png;base64,{bar_b64}"
+-    # ------------------------------------------------
+-
+-    return jsonify({
+-        'step':              step,
+-        'state':             entry['state'],
+-        'action':            entry['action'],
+-        'reward_components': entry['reward_components'],
+-        'frame':             frame_uri,
+-        'plot':              plot_uri,
+-        'bar_plot':          bar_uri
+-    })
+-
+-@app.route('/record_status')
+-def record_status():
+-    """
+-    Returns whether a recording is in progress, and how many steps have been recorded so far.
+-    Front-end polls this to know when to re-enable scrubbing.
+-    """
+-    # read the “in progress” flag
+-    
+-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-    with recording_lock:
+-        in_progress = recording_in_progress
+-        print("RECORD STATUS", in_progress)
+-    # read the current recorded length
+-    with record_lock:
+-        length = len(recorded_trajectory)
+-    return jsonify({
+-        "recording": in_progress,
+-        "length":    length
+-    })
+-    
+-
+-
+-if __name__ == '__main__':
+-    app.run(host='0.0.0.0', port=5043, debug=False)
+diff --git a/flask_mo_humanoid.py b/flask_mo_humanoid.py
+deleted file mode 100644
+index b622b30..0000000
+--- a/flask_mo_humanoid.py
++++ /dev/null
+@@ -1,329 +0,0 @@
+-import os
+-import cv2
+-import time
+-import threading
+-import numpy as np
+-import torch
+-import io
+-import matplotlib.pyplot as plt
+-from flask import Flask, request, render_template, Response, jsonify
+-from envs.lunar_lander import LunarLander  # Ensure this is on your PYTHONPATH
+-from ppo.agent import DiscreteAgent, ContinuousAgent
+-from envs.utils import SyncVectorEnv
+-import mo_gymnasium as mo_gym
+-import base64
+-import traceback
+-from io import BytesIO
+-
+-# Set up paths for templates.
+-DIR_PATH = os.path.dirname(os.path.abspath(__file__))
+-TEMPLATE_PATH = os.path.join(DIR_PATH, 'templates/')
+-
+-app = Flask(__name__, template_folder=TEMPLATE_PATH)
+-
+-# Global weights vector (initialized as desired) and lock.
+-weights = np.array([1, 0])
+-weights_lock = threading.Lock()
+-
+-# Global variable for the accumulated reward for the current episode.
+-current_episode_reward = [np.zeros(3), ]
+-episode_reward_lock = threading.Lock()
+-
+-# --- Initialize the agent ---
+-# Create a vectorized environment for the agent.
+-env_agent = mo_gym.make("mo-halfcheetah-v5", render_mode = "rgb_array")
+-eval_agent = ContinuousAgent(env_agent, reward_size=2).to("cuda")
+-model_path = "runs/mo-halfcheetah-v5__main_ppo__2025-04-24 20:54:17.118970__1/main_ppo.rl_model"
+-eval_agent.load_state_dict(torch.load(model_path))
+-eval_agent.eval()
+-
+-# Create a separate (non-vectorized) environment for rendering.
+-# env_render = mo_gym.make("mo-hopper-v5", render_mode = "rgb_array")
+-
+-recorded_trajectory = []
+-record_lock = threading.Lock()# signal whether a /play episode is currently running
+-recording_in_progress = False
+-recording_lock = threading.Lock()
+-
+-
+-@app.route('/')
+-def index():
+-    # Pass current weights to the template for slider initialization.
+-    return render_template('mo_humanoid.html', weights=weights.tolist())
+-
+-@app.route('/update_weights', methods=['POST'])
+-def update_weights():
+-    global weights
+-    # Get form data sent via AJAX.
+-    data = request.form
+-    try:
+-        new_weights = np.array([
+-            float(data.get("w_velocity", 1)),
+-            float(data.get("w_energy", 0.0)),
+-        ])
+-        print(new_weights)
+-        with weights_lock:
+-            weights = new_weights
+-        return jsonify({"status": "success", "weights": weights.tolist()})
+-    except Exception as e:
+-        return jsonify({"status": "error", "message": str(e)}), 400
+-
+-# def simulation_generator():
+-#     """Generator that steps through the simulation, accumulates weighted rewards,
+-#     resets the accumulator at the start of each episode, and yields rendered frames."""
+-#     global weights, current_episode_reward
+-#     while True:
+-#         # Reset the accumulated reward at the start of each episode.
+-#         with episode_reward_lock:
+-#             current_episode_reward = [np.zeros(3), ]
+-#         done = False
+-#         trunc = False
+-#         obs, _ = env_render.reset()
+-#         while not (done or trunc):
+-#             with weights_lock:
+-#                 current_weights = np.copy(weights)
+-#             # Agent expects a batch; use the first action.
+-#             print(obs, current_weights)
+-#             action, _ = eval_agent.predict(obs, current_weights, deterministic=True, device = "cuda")
+-#             obs, rew, done, trunc, infos = env_render.step(action[0])
+-#             # Compute the weighted reward for this step.
+-#             step_reward = current_weights * rew
+-#             with episode_reward_lock:
+-#                 current_episode_reward.append(step_reward)
+-#             frame = env_render.render()
+-#             yield frame
+-#             time.sleep(0.03)
+-
+-# def frame_gen(generator_func, *args, **kwargs):
+-#     """Encodes frames from the generator as PNG and yields them in a multipart response."""
+-#     get_frame = generator_func(*args, **kwargs)
+-#     while True:
+-#         frame = next(get_frame, None)
+-#         if frame is None:
+-#             continue
+-#         ret, png = cv2.imencode('.png', frame)
+-#         if not ret:
+-#             continue
+-#         frame_bytes = png.tobytes()
+-#         yield (b'--frame\r\n'
+-#                b'Content-Type: image/png\r\n\r\n' + frame_bytes + b'\r\n')
+-
+-# @app.route('/render_feed')
+-# def render_feed():
+-#     return Response(frame_gen(simulation_generator),
+-#                     mimetype='multipart/x-mixed-replace; boundary=frame')
+-
+-def generate_plot():
+-    """Generates a PNG bar plot of the accumulated reward per component for the current episode."""
+-    with episode_reward_lock:
+-        data = np.array(current_episode_reward)
+-    fig, ax = plt.subplots()
+-    components = ["Velocity", "Energy", ]
+-    # for i in range(8):
+-    ax.plot(data, label = components)
+-    ax.set_title("Accumulated Reward per Component (Current Episode)")
+-    ax.set_ylabel("Accumulated Reward")
+-    buf = io.BytesIO()
+-    ax.legend()
+-    fig.savefig(buf, format='png')
+-    plt.close(fig)
+-    buf.seek(0)
+-    return buf.getvalue()
+-
+-@app.route('/plot_feed')
+-def plot_feed():
+-    png = generate_plot()
+-    return Response(png, mimetype='image/png')
+-
+-def reward_plot_gen():
+-    """Generator that continuously yields updated reward plot frames."""
+-    while True:
+-        png = generate_plot()  # Generate the current reward plot as PNG
+-        yield (b'--frame\r\n'
+-               b'Content-Type: image/png\r\n\r\n' + png + b'\r\n')
+-        time.sleep(0.03)  # Adjust the refresh rate as needed
+-
+-@app.route('/reward_plot_stream')
+-def reward_plot_stream():
+-    return Response(reward_plot_gen(),
+-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+-def generate_partial_plot_uri(step: int) -> str:
+-    """
+-    Build a cumulative-reward line plot up to `step` and return it
+-    as a 'data:image/png;base64,…' URI.
+-    """
+-    
+-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-    with record_lock:
+-        # gather reward vectors up to and including `step`
+-        data = np.array([ e['reward_components'] 
+-                          for e in recorded_trajectory ])  # shape (step+1, 4)
+-
+-    # cumulative sum along time
+-    cum = data.cumsum(axis=0)
+-
+-    labels = ["Velocity", "Energy", ]
+-    fig, ax = plt.subplots()
+-    for idx, lbl in enumerate(labels):
+-        ax.plot(cum[:, idx], label=lbl)
+-    ax.plot([step, step], [cum.min(), cum.max()], 'k--', lw=1)
+-    ax.set_title("Cumulative Reward up to step {}".format(step))
+-    ax.set_ylabel("Reward")
+-    ax.legend(loc="upper left")
+-
+-    buf = BytesIO()
+-    fig.savefig(buf, format="png", bbox_inches="tight")
+-    plt.close(fig)
+-    buf.seek(0)
+-
+-    b64 = base64.b64encode(buf.read()).decode("ascii")
+-    return f"data:image/png;base64,{b64}"
+-@app.route('/play')
+-def play():
+-    """
+-    Streams the simulation as MJPEG and records the trajectory.
+-    Ensures recording_in_progress is always cleared, even if the client
+-    stops the stream early.
+-    """
+-    def generate():
+-        global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-
+-        # Prevent two concurrent plays
+-        with recording_lock:
+-            if recording_in_progress:
+-                return
+-            recording_in_progress = True
+-            recorded_trajectory = []
+-
+-        try:
+-            
+-            env_render = mo_gym.make("mo-halfcheetah-v5", render_mode = "rgb_array")
+-            obs, _ = env_render.reset()
+-            done = trunc = False
+-
+-            while not (done or trunc):
+-                with weights_lock:
+-                    w = weights.copy()
+-                
+-                action, _ = eval_agent.predict(obs, w, deterministic=True, device="cuda")
+-                next_obs, rew, done, trunc, _ = env_render.step(action[0])
+-
+-                ret, png = cv2.imencode('.png', env_render.render())
+-                if not ret:
+-                    obs = next_obs
+-                    continue
+-
+-                # record
+-                b64 = base64.b64encode(png.tobytes()).decode('ascii')
+-                with record_lock:
+-                    recorded_trajectory.append({
+-                        'state':            obs.tolist(),
+-                        'action':           action[0].tolist(),
+-                        'reward_components': (w * rew).tolist(),
+-                        'weights':         w.tolist(),
+-                        'frame_b64':        b64
+-                    })
+-
+-                # stream
+-                yield (
+-                    b'--frame\r\n'
+-                    b'Content-Type: image/png\r\n\r\n' +
+-                    png.tobytes() +
+-                    b'\r\n'
+-                )
+-
+-                time.sleep(0.03)
+-                obs = next_obs
+-                
+-        except Exception as e:
+-            print(traceback.format_exc())
+-            # Handle any exceptions that occur during the simulation
+-            # You can log the error or take appropriate action here
+-
+-        finally :
+-            print("In Finally")
+-            # ALWAYS clear the flag, even if client aborted
+-            with recording_lock:
+-                recording_in_progress = False
+-
+-    return Response(
+-        generate(),
+-        mimetype='multipart/x-mixed-replace; boundary=frame'
+-    )
+-
+-
+-@app.route('/scrub')
+-def scrub():
+-    # block while recording
+-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-    
+-    with recording_lock:
+-        if recording_in_progress:
+-            return jsonify({'error':'episode still running'}), 409
+-
+-    step = request.args.get('step', type=int)
+-    if step is None:
+-        return jsonify({'error':'must provide ?step=N'}), 400
+-
+-    with record_lock:
+-        if step < 0 or step >= len(recorded_trajectory):
+-            return jsonify({'error':'step out of range'}), 400
+-        entry = recorded_trajectory[step]
+-
+-    # 1) frame data URI
+-    frame_uri = f"data:image/png;base64,{entry['frame_b64']}"
+-    # 2) cumulative‐reward line plot up to step
+-    plot_uri  = generate_partial_plot_uri(step)
+-
+-    # 3) per‐step bar plot of reward components
+-    # ------------------------------------------------
+-
+-    labels = ["Velocity", "Energy", ]
+-    values = entry['reward_components']
+-    fig, ax = plt.subplots()
+-    ax.bar(labels, values)
+-    ax.set_title(f"Reward Components at Step {step}")
+-    ax.set_ylabel("Reward")
+-    buf = BytesIO()
+-    fig.savefig(buf, format="png", bbox_inches="tight")
+-    plt.close(fig)
+-    buf.seek(0)
+-    bar_b64 = base64.b64encode(buf.read()).decode("ascii")
+-    bar_uri = f"data:image/png;base64,{bar_b64}"
+-    # ------------------------------------------------
+-
+-    return jsonify({
+-        'step':              step,
+-        'state':             entry['state'],
+-        'action':            entry['action'],
+-        'reward_components': entry['reward_components'],
+-        'weights':           entry['weights'],
+-        'frame':             frame_uri,
+-        'plot':              plot_uri,
+-        'bar_plot':          bar_uri
+-    })
+-
+-@app.route('/record_status')
+-def record_status():
+-    """
+-    Returns whether a recording is in progress, and how many steps have been recorded so far.
+-    Front-end polls this to know when to re-enable scrubbing.
+-    """
+-    # read the “in progress” flag
+-    
+-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-    with recording_lock:
+-        in_progress = recording_in_progress
+-        print("RECORD STATUS", in_progress)
+-    # read the current recorded length
+-    with record_lock:
+-        length = len(recorded_trajectory)
+-    return jsonify({
+-        "recording": in_progress,
+-        "length":    length
+-    })
+-    
+-
+-
+-if __name__ == '__main__':
+-    app.run(host='0.0.0.0', port=5044, debug=False)
+diff --git a/flask_mo_lander.py b/flask_mo_lander.py
+deleted file mode 100644
+index 0281af1..0000000
+--- a/flask_mo_lander.py
++++ /dev/null
+@@ -1,323 +0,0 @@
+-import os
+-import cv2
+-import time
+-import threading
+-import numpy as np
+-import torch
+-import io
+-import matplotlib.pyplot as plt
+-from flask import Flask, request, render_template, Response, jsonify
+-from envs.lunar_lander import LunarLander  # Ensure this is on your PYTHONPATH
+-from ppo.agent import DiscreteAgent
+-from envs.utils import SyncVectorEnv
+-import mo_gymnasium as mo_gym
+-import base64
+-from io import BytesIO
+-
+-# Set up paths for templates.
+-DIR_PATH = os.path.dirname(os.path.abspath(__file__))
+-TEMPLATE_PATH = os.path.join(DIR_PATH, 'templates/')
+-
+-app = Flask(__name__, template_folder=TEMPLATE_PATH)
+-
+-# Global weights vector (initialized as desired) and lock.
+-weights = np.array([1, 0, 0 , 0])
+-weights_lock = threading.Lock()
+-
+-# Global variable for the accumulated reward for the current episode.
+-current_episode_reward = [np.zeros(4), ]
+-episode_reward_lock = threading.Lock()
+-
+-# --- Initialize the agent ---
+-# Create a vectorized environment for the agent.
+-env_agent = mo_gym.make("mo-lunar-lander-v3", render_mode = "rgb_array")
+-eval_agent = DiscreteAgent(env_agent, reward_size=4).to("cuda")
+-model_path = "runs/mo-lunar-lander-v3__main_ppo__2025-04-15 15:06:33.790188__1/main_ppo.rl_model"
+-eval_agent.load_state_dict(torch.load(model_path))
+-eval_agent.eval()
+-
+-# Create a separate (non-vectorized) environment for rendering.
+-env_render = mo_gym.make("mo-lunar-lander-v3", render_mode = "rgb_array")
+-
+-recorded_trajectory = []
+-record_lock = threading.Lock()# signal whether a /play episode is currently running
+-recording_in_progress = False
+-recording_lock = threading.Lock()
+-
+-
+-@app.route('/')
+-def index():
+-    # Pass current weights to the template for slider initialization.
+-    return render_template('mo_lander.html', weights=weights.tolist())
+-
+-@app.route('/update_weights', methods=['POST'])
+-def update_weights():
+-    global weights
+-    # Get form data sent via AJAX.
+-    data = request.form
+-    try:
+-        new_weights = np.array([
+-            float(data.get("w_landed", 1)),
+-            float(data.get("w_shaping", 0)),
+-            float(data.get("w_main_engine", 0.0)),
+-            float(data.get("w_side_engine", 0.)),
+-        ])
+-        print(new_weights)
+-        with weights_lock:
+-            weights = new_weights
+-        return jsonify({"status": "success", "weights": weights.tolist()})
+-    except Exception as e:
+-        return jsonify({"status": "error", "message": str(e)}), 400
+-
+-def simulation_generator():
+-    """Generator that steps through the simulation, accumulates weighted rewards,
+-    resets the accumulator at the start of each episode, and yields rendered frames."""
+-    global weights, current_episode_reward
+-    while True:
+-        # Reset the accumulated reward at the start of each episode.
+-        with episode_reward_lock:
+-            current_episode_reward = [np.zeros(4), ]
+-        done = False
+-        trunc = False
+-        obs, _ = env_render.reset()
+-        while not (done or trunc):
+-            with weights_lock:
+-                current_weights = np.copy(weights)
+-            # Agent expects a batch; use the first action.
+-            action, _ = eval_agent.predict(obs, current_weights, deterministic=True, device = "cuda")
+-            obs, rew, done, trunc, infos = env_render.step(action[0])
+-            # Compute the weighted reward for this step.
+-            step_reward = current_weights * rew
+-            with episode_reward_lock:
+-                current_episode_reward.append(step_reward)
+-            frame = env_render.render()
+-            yield frame
+-            time.sleep(0.03)
+-
+-def frame_gen(generator_func, *args, **kwargs):
+-    """Encodes frames from the generator as PNG and yields them in a multipart response."""
+-    get_frame = generator_func(*args, **kwargs)
+-    while True:
+-        frame = next(get_frame, None)
+-        if frame is None:
+-            continue
+-        ret, png = cv2.imencode('.png', frame)
+-        if not ret:
+-            continue
+-        frame_bytes = png.tobytes()
+-        yield (b'--frame\r\n'
+-               b'Content-Type: image/png\r\n\r\n' + frame_bytes + b'\r\n')
+-
+-@app.route('/render_feed')
+-def render_feed():
+-    return Response(frame_gen(simulation_generator),
+-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+-
+-def generate_plot():
+-    """Generates a PNG bar plot of the accumulated reward per component for the current episode."""
+-    with episode_reward_lock:
+-        data = np.array(current_episode_reward)
+-    fig, ax = plt.subplots()
+-    components = ["Landed", "Shaping", "Main Engine", "Side Engine", ]
+-    # for i in range(8):
+-    ax.plot(data, label = components)
+-    ax.set_title("Accumulated Reward per Component (Current Episode)")
+-    ax.set_ylabel("Accumulated Reward")
+-    buf = io.BytesIO()
+-    ax.legend()
+-    fig.savefig(buf, format='png')
+-    plt.close(fig)
+-    buf.seek(0)
+-    return buf.getvalue()
+-
+-@app.route('/plot_feed')
+-def plot_feed():
+-    png = generate_plot()
+-    return Response(png, mimetype='image/png')
+-
+-def reward_plot_gen():
+-    """Generator that continuously yields updated reward plot frames."""
+-    while True:
+-        png = generate_plot()  # Generate the current reward plot as PNG
+-        yield (b'--frame\r\n'
+-               b'Content-Type: image/png\r\n\r\n' + png + b'\r\n')
+-        time.sleep(0.03)  # Adjust the refresh rate as needed
+-
+-@app.route('/reward_plot_stream')
+-def reward_plot_stream():
+-    return Response(reward_plot_gen(),
+-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+-def generate_partial_plot_uri(step: int) -> str:
+-    """
+-    Build a cumulative-reward line plot up to `step` and return it
+-    as a 'data:image/png;base64,…' URI.
+-    """
+-    
+-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-    with record_lock:
+-        # gather reward vectors up to and including `step`
+-        data = np.array([ e['reward_components'] 
+-                          for e in recorded_trajectory ])  # shape (step+1, 4)
+-
+-    # cumulative sum along time
+-    cum = data.cumsum(axis=0)
+-
+-    labels = ["Landed","Shaping","Main Engine","Side Engine"]
+-    fig, ax = plt.subplots()
+-    for idx, lbl in enumerate(labels):
+-        ax.plot(cum[:, idx], label=lbl)
+-    ax.plot([step, step], [cum.min(), cum.max()], 'k--', lw=1)
+-    ax.set_title("Cumulative Reward up to step {}".format(step))
+-    ax.set_ylabel("Reward")
+-    ax.legend(loc="upper left")
+-
+-    buf = BytesIO()
+-    fig.savefig(buf, format="png", bbox_inches="tight")
+-    plt.close(fig)
+-    buf.seek(0)
+-
+-    b64 = base64.b64encode(buf.read()).decode("ascii")
+-    return f"data:image/png;base64,{b64}"
+-@app.route('/play')
+-def play():
+-    """
+-    Streams the simulation as MJPEG and records the trajectory.
+-    Ensures recording_in_progress is always cleared, even if the client
+-    stops the stream early.
+-    """
+-    def generate():
+-        global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-
+-        # Prevent two concurrent plays
+-        with recording_lock:
+-            if recording_in_progress:
+-                return
+-            recording_in_progress = True
+-            recorded_trajectory = []
+-
+-        try:
+-            obs, _ = env_render.reset()
+-            done = trunc = False
+-
+-            while not (done or trunc):
+-                with weights_lock:
+-                    w = weights.copy()
+-                action, _ = eval_agent.predict(obs, w, deterministic=True, device="cuda")
+-                next_obs, rew, done, trunc, _ = env_render.step(action[0])
+-
+-                ret, png = cv2.imencode('.png', env_render.render())
+-                if not ret:
+-                    obs = next_obs
+-                    continue
+-
+-                # record
+-                b64 = base64.b64encode(png.tobytes()).decode('ascii')
+-                with record_lock:
+-                    recorded_trajectory.append({
+-                        'state':            obs.tolist(),
+-                        'action':           int(action[0]),
+-                        'reward_components': (w * rew).tolist(),
+-                        'frame_b64':        b64
+-                    })
+-
+-                # stream
+-                yield (
+-                    b'--frame\r\n'
+-                    b'Content-Type: image/png\r\n\r\n' +
+-                    png.tobytes() +
+-                    b'\r\n'
+-                )
+-
+-                time.sleep(0.03)
+-                obs = next_obs
+-                
+-        except Exception as e:
+-            print("Error during simulation:", e)
+-            # Handle any exceptions that occur during the simulation
+-            # You can log the error or take appropriate action here
+-
+-        finally :
+-            print("In Finally")
+-            # ALWAYS clear the flag, even if client aborted
+-            with recording_lock:
+-                recording_in_progress = False
+-
+-    return Response(
+-        generate(),
+-        mimetype='multipart/x-mixed-replace; boundary=frame'
+-    )
+-
+-
+-@app.route('/scrub')
+-def scrub():
+-    # block while recording
+-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-    
+-    with recording_lock:
+-        if recording_in_progress:
+-            return jsonify({'error':'episode still running'}), 409
+-
+-    step = request.args.get('step', type=int)
+-    if step is None:
+-        return jsonify({'error':'must provide ?step=N'}), 400
+-
+-    with record_lock:
+-        if step < 0 or step >= len(recorded_trajectory):
+-            return jsonify({'error':'step out of range'}), 400
+-        entry = recorded_trajectory[step]
+-
+-    # 1) frame data URI
+-    frame_uri = f"data:image/png;base64,{entry['frame_b64']}"
+-    # 2) cumulative‐reward line plot up to step
+-    plot_uri  = generate_partial_plot_uri(step)
+-
+-    # 3) per‐step bar plot of reward components
+-    # ------------------------------------------------
+-    labels = ["Landed","Shaping","Main Engine","Side Engine"]
+-    values = entry['reward_components']
+-    fig, ax = plt.subplots()
+-    ax.bar(labels, values)
+-    ax.set_title(f"Reward Components at Step {step}")
+-    ax.set_ylabel("Reward")
+-    buf = BytesIO()
+-    fig.savefig(buf, format="png", bbox_inches="tight")
+-    plt.close(fig)
+-    buf.seek(0)
+-    bar_b64 = base64.b64encode(buf.read()).decode("ascii")
+-    bar_uri = f"data:image/png;base64,{bar_b64}"
+-    # ------------------------------------------------
+-
+-    return jsonify({
+-        'step':              step,
+-        'state':             entry['state'],
+-        'action':            entry['action'],
+-        'reward_components': entry['reward_components'],
+-        'frame':             frame_uri,
+-        'plot':              plot_uri,
+-        'bar_plot':          bar_uri
+-    })
+-
+-@app.route('/record_status')
+-def record_status():
+-    """
+-    Returns whether a recording is in progress, and how many steps have been recorded so far.
+-    Front-end polls this to know when to re-enable scrubbing.
+-    """
+-    # read the “in progress” flag
+-    
+-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-    with recording_lock:
+-        in_progress = recording_in_progress
+-        print("RECORD STATUS", in_progress)
+-    # read the current recorded length
+-    with record_lock:
+-        length = len(recorded_trajectory)
+-    return jsonify({
+-        "recording": in_progress,
+-        "length":    length
+-    })
+-    
+-
+-
+-if __name__ == '__main__':
+-    app.run(host='0.0.0.0', port=5043, debug=False)
+diff --git a/flask_mo_reacher.py b/flask_mo_reacher.py
+deleted file mode 100644
+index de8d67d..0000000
+--- a/flask_mo_reacher.py
++++ /dev/null
+@@ -1,379 +0,0 @@
+-import os
+-import cv2
+-import time
+-import threading
+-import numpy as np
+-import torch
+-import io
+-import matplotlib.pyplot as plt
+-from flask import Flask, request, render_template, Response, jsonify
+-from envs.lunar_lander import LunarLander  # Ensure this is on your PYTHONPATH
+-from ppo.agent import DiscreteAgent
+-from envs.utils import SyncVectorEnv
+-import mo_gymnasium as mo_gym
+-import base64
+-from io import BytesIO
+-
+-# Set up paths for templates.
+-DIR_PATH = os.path.dirname(os.path.abspath(__file__))
+-TEMPLATE_PATH = os.path.join(DIR_PATH, 'templates/')
+-
+-app = Flask(__name__, template_folder=TEMPLATE_PATH)
+-
+-# Global weights vector (initialized as desired) and lock.
+-weights = np.array([1, 0, 0 , 0])
+-weights_lock = threading.Lock()
+-
+-# Global variable for the accumulated reward for the current episode.
+-current_episode_reward = [np.zeros(4), ]
+-episode_reward_lock = threading.Lock()
+-
+-# --- Initialize the agent ---
+-# Create a vectorized environment for the agent.
+-env_agent = mo_gym.make("mo-reacher-v5", render_mode = "rgb_array")
+-eval_agent = DiscreteAgent(env_agent, reward_size=4).to("cuda")
+-model_path = "runs/mo-reacher-v5__main_ppo__2025-04-24 22:15:19.024851__1/main_ppo.rl_model"
+-eval_agent.load_state_dict(torch.load(model_path))
+-eval_agent.eval()
+-
+-# Create a separate (non-vectorized) environment for rendering.
+-
+-env_render = mo_gym.make("mo-reacher-v5", render_mode = "rgb_array")
+-recorded_trajectory = []
+-record_lock = threading.Lock()# signal whether a /play episode is currently running
+-recording_in_progress = False
+-recording_lock = threading.Lock()
+-
+-
+-@app.route('/')
+-def index():
+-    # Pass current weights to the template for slider initialization.
+-    return render_template('mo_reacher.html', weights=weights.tolist())
+-
+-@app.route('/update_weights', methods=['POST'])
+-def update_weights():
+-    global weights
+-    # Get form data sent via AJAX.
+-    data = request.form
+-    try:
+-        new_weights = np.array([
+-            float(data.get("w_t1", 1)),
+-            float(data.get("w_t2", 0)),
+-            float(data.get("w_t3", 0.0)),
+-            float(data.get("w_t4", 0.)),
+-        ])
+-        print(new_weights)
+-        with weights_lock:
+-            weights = new_weights
+-        return jsonify({"status": "success", "weights": weights.tolist()})
+-    except Exception as e:
+-        return jsonify({"status": "error", "message": str(e)}), 400
+-
+-def simulation_generator():
+-    """Generator that steps through the simulation, accumulates weighted rewards,
+-    resets the accumulator at the start of each episode, and yields rendered frames."""
+-    global weights, current_episode_reward
+-    while True:
+-        # Reset the accumulated reward at the start of each episode.
+-        with episode_reward_lock:
+-            current_episode_reward = [np.zeros(4), ]
+-        done = False
+-        trunc = False
+-        obs, _ = env_render.reset()
+-        while not (done or trunc):
+-            with weights_lock:
+-                current_weights = np.copy(weights)
+-            # Agent expects a batch; use the first action.
+-            action, _ = eval_agent.predict(obs, current_weights, deterministic=True, device = "cuda")
+-            obs, rew, done, trunc, infos = env_render.step(action[0])
+-            # Compute the weighted reward for this step.
+-            step_reward = current_weights * rew
+-            with episode_reward_lock:
+-                current_episode_reward.append(step_reward)
+-            frame = env_render.render()
+-            yield frame
+-            time.sleep(0.03)
+-
+-def frame_gen(generator_func, *args, **kwargs):
+-    """Encodes frames from the generator as PNG and yields them in a multipart response."""
+-    get_frame = generator_func(*args, **kwargs)
+-    while True:
+-        frame = next(get_frame, None)
+-        if frame is None:
+-            continue
+-        ret, png = cv2.imencode('.png', frame)
+-        if not ret:
+-            continue
+-        frame_bytes = png.tobytes()
+-        yield (b'--frame\r\n'
+-               b'Content-Type: image/png\r\n\r\n' + frame_bytes + b'\r\n')
+-
+-@app.route('/render_feed')
+-def render_feed():
+-    return Response(frame_gen(simulation_generator),
+-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+-
+-def generate_plot():
+-    """Generates a PNG bar plot of the accumulated reward per component for the current episode."""
+-    with episode_reward_lock:
+-        data = np.array(current_episode_reward)
+-    fig, ax = plt.subplots()
+-    components = ["Target 1", "Target 2", "Target 3", "Target 4" ]
+-    # for i in range(8):
+-    ax.plot(data, label = components)
+-    ax.set_title("Accumulated Reward per Component (Current Episode)")
+-    ax.set_ylabel("Accumulated Reward")
+-    buf = io.BytesIO()
+-    ax.legend()
+-    fig.savefig(buf, format='png')
+-    plt.close(fig)
+-    buf.seek(0)
+-    return buf.getvalue()
+-
+-@app.route('/plot_feed')
+-def plot_feed():
+-    png = generate_plot()
+-    return Response(png, mimetype='image/png')
+-
+-def reward_plot_gen():
+-    """Generator that continuously yields updated reward plot frames."""
+-    while True:
+-        png = generate_plot()  # Generate the current reward plot as PNG
+-        yield (b'--frame\r\n'
+-               b'Content-Type: image/png\r\n\r\n' + png + b'\r\n')
+-        time.sleep(0.03)  # Adjust the refresh rate as needed
+-
+-@app.route('/reward_plot_stream')
+-def reward_plot_stream():
+-    return Response(reward_plot_gen(),
+-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+-def generate_partial_plot_uri(step: int) -> str:
+-    """
+-    Build a cumulative-reward line plot up to `step` and return it
+-    as a 'data:image/png;base64,…' URI.
+-    """
+-    
+-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-    with record_lock:
+-        # gather reward vectors up to and including `step`
+-        data = np.array([ e['reward_components'] 
+-                          for e in recorded_trajectory ])  # shape (step+1, 4)
+-
+-    # cumulative sum along time
+-    cum = data.cumsum(axis=0)
+-
+-    labels = ["Target 1", "Target 2", "Target 3", "Target 4" ]
+-    fig, ax = plt.subplots()
+-    for idx, lbl in enumerate(labels):
+-        ax.plot(cum[:, idx], label=lbl)
+-    ax.plot([step, step], [cum.min(), cum.max()], 'k--', lw=1)
+-    ax.set_title("Cumulative Reward up to step {}".format(step))
+-    ax.set_ylabel("Reward")
+-    ax.legend(loc="upper left")
+-
+-    buf = BytesIO()
+-    fig.savefig(buf, format="png", bbox_inches="tight")
+-    plt.close(fig)
+-    buf.seek(0)
+-
+-    b64 = base64.b64encode(buf.read()).decode("ascii")
+-    return f"data:image/png;base64,{b64}"
+-@app.route('/play')
+-def play():
+-    """
+-    Streams the simulation as MJPEG and records the trajectory.
+-    Ensures recording_in_progress is always cleared, even if the client
+-    stops the stream early.
+-    """
+-    def generate():
+-        global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-
+-        # Prevent two concurrent plays
+-        with recording_lock:
+-            if recording_in_progress:
+-                return
+-            recording_in_progress = True
+-            recorded_trajectory = []
+-
+-        try:
+-            
+-            env_render = mo_gym.make("mo-reacher-v5", render_mode = "rgb_array")
+-            obs, _ = env_render.reset()
+-            done = trunc = False
+-
+-            while not (done or trunc):
+-                with weights_lock:
+-                    w = weights.copy()
+-                action, value = eval_agent.predict(obs, w, deterministic=True, device="cuda")
+-                next_obs, rew, done, trunc, _ = env_render.step(action[0])
+-
+-                ret, png = cv2.imencode('.png', env_render.render())
+-                if not ret:
+-                    obs = next_obs
+-                    continue
+-
+-                # record
+-                b64 = base64.b64encode(png.tobytes()).decode('ascii')
+-                with record_lock:
+-                    recorded_trajectory.append({
+-                        'state':            np.round(obs, 3).tolist(),
+-                        'action':           int(action[0]),
+-                        'reward_components': (w * rew).tolist(),
+-                        'weights':          w.tolist(),
+-                        'value':            np.round(value[0], 3).tolist(),
+-                        'frame_b64':        b64
+-                    })
+-
+-                # stream
+-                yield (
+-                    b'--frame\r\n'
+-                    b'Content-Type: image/png\r\n\r\n' +
+-                    png.tobytes() +
+-                    b'\r\n'
+-                )
+-
+-                time.sleep(0.03)
+-                obs = next_obs
+-                
+-        except Exception as e:
+-            print("Error during simulation:", e)
+-            # Handle any exceptions that occur during the simulation
+-            # You can log the error or take appropriate action here
+-
+-        finally :
+-            print("In Finally")
+-            # ALWAYS clear the flag, even if client aborted
+-            with recording_lock:
+-                recording_in_progress = False
+-
+-    return Response(
+-        generate(),
+-        mimetype='multipart/x-mixed-replace; boundary=frame'
+-    )
+-
+-
+-@app.route('/scrub')
+-def scrub():
+-    # block while recording
+-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-    
+-    with recording_lock:
+-        if recording_in_progress:
+-            return jsonify({'error':'episode still running'}), 409
+-
+-    step = request.args.get('step', type=int)
+-    if step is None:
+-        return jsonify({'error':'must provide ?step=N'}), 400
+-
+-    with record_lock:
+-        if step < 0 or step >= len(recorded_trajectory):
+-            return jsonify({'error':'step out of range'}), 400
+-        entry = recorded_trajectory[step]
+-
+-    # 1) frame data URI
+-    frame_uri = f"data:image/png;base64,{entry['frame_b64']}"
+-    # 2) cumulative‐reward line plot up to step
+-    plot_uri  = generate_partial_plot_uri(step)
+-
+-    # 3) per‐step bar plot of reward components
+-    # ------------------------------------------------
+-    labels = ["Target 1", "Target 2", "Target 3", "Target 4" ]
+-    values = entry['reward_components']
+-    fig, ax = plt.subplots()
+-    ax.bar(labels, values)
+-    ax.set_title(f"Reward Components at Step {step}")
+-    ax.set_ylabel("Reward")
+-    buf = BytesIO()
+-    fig.savefig(buf, format="png", bbox_inches="tight")
+-    plt.close(fig)
+-    buf.seek(0)
+-    bar_b64 = base64.b64encode(buf.read()).decode("ascii")
+-    bar_uri = f"data:image/png;base64,{bar_b64}"
+-    # ------------------------------------------------
+-
+-    return jsonify({
+-        'step':              step,
+-        'state':             entry['state'],
+-        'action':            entry['action'],
+-        'reward_components': entry['reward_components'],
+-        'weights':           entry['weights'],
+-        'value':             entry['value'],
+-        'frame':             frame_uri,
+-        'plot':              plot_uri,
+-        'bar_plot':          bar_uri
+-    })
+-
+-@app.route('/record_status')
+-def record_status():
+-    """
+-    Returns whether a recording is in progress, and how many steps have been recorded so far.
+-    Front-end polls this to know when to re-enable scrubbing.
+-    """
+-    # read the “in progress” flag
+-    
+-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-    with recording_lock:
+-        in_progress = recording_in_progress
+-        print("RECORD STATUS", in_progress)
+-    # read the current recorded length
+-    with record_lock:
+-        length = len(recorded_trajectory)
+-    return jsonify({
+-        "recording": in_progress,
+-        "length":    length
+-    })
+-    
+-@app.route('/recompute_action', methods=['POST'])
+-def recompute_action():
+-    """
+-    Given a scrub step and a new weight vector, return the action
+-    the agent would now take in that recorded state—without stepping
+-    the environment.
+-    """
+-    # 1) Parse JSON body
+-    data = request.get_json(force=True)
+-    step       = data.get('step')
+-    new_weights = data.get('weights')
+-
+-    # 2) Ensure recording has finished
+-    with recording_lock:
+-        if recording_in_progress:
+-            return jsonify({'error': 'episode still running'}), 409
+-
+-    # 3) Validate inputs
+-    if step is None or new_weights is None:
+-        return jsonify({'error': 'must provide "step" and "weights" in JSON'}), 400
+-    try:
+-        step = int(step)
+-        w_arr = np.array(new_weights, dtype=float)
+-    except Exception:
+-        return jsonify({'error': '"step" must be int and "weights" a list of floats'}), 400
+-
+-    # 4) Grab the recorded observation
+-    with record_lock:
+-        if step < 0 or step >= len(recorded_trajectory):
+-            return jsonify({'error': 'step out of range'}), 400
+-        obs = np.array(recorded_trajectory[step]['state'])
+-
+-    # 5) Compute the new action
+-    #    Note: agent.predict expects a batch, so wrap obs
+-    action_batch, value = eval_agent.predict(
+-        obs[np.newaxis, ...],
+-        w_arr,
+-        deterministic=True,
+-        device="cuda"
+-    )
+-    action0 = action_batch[0]
+-    # If discrete, convert to int; if continuous, to list
+-    try:
+-        action_serialized = int(action0)
+-    except (TypeError, ValueError):
+-        action_serialized = action0.tolist()
+-
+-    value_seralized = np.round(value[0], 3)
+-    return jsonify({'action': action_serialized,
+-                    'value':  value_seralized.tolist()})
+-
+-
+-if __name__ == '__main__':
+-    app.run(host='0.0.0.0', port=5043, debug=False)
+diff --git a/flask_treasure.py b/flask_treasure.py
+deleted file mode 100644
+index c19b47c..0000000
+--- a/flask_treasure.py
++++ /dev/null
+@@ -1,377 +0,0 @@
+-import os
+-import cv2
+-import time
+-import threading
+-import numpy as np
+-import torch
+-import io
+-import matplotlib.pyplot as plt
+-from flask import Flask, request, render_template, Response, jsonify
+-from envs.lunar_lander import LunarLander  # Ensure this is on your PYTHONPATH
+-from ppo.agent import DiscreteAgent
+-from envs.utils import SyncVectorEnv
+-import mo_gymnasium as mo_gym
+-import base64
+-from io import BytesIO
+-
+-# Set up paths for templates.
+-DIR_PATH = os.path.dirname(os.path.abspath(__file__))
+-TEMPLATE_PATH = os.path.join(DIR_PATH, 'templates/')
+-
+-app = Flask(__name__, template_folder=TEMPLATE_PATH)
+-
+-# Global weights vector (initialized as desired) and lock.
+-weights = np.array([1, 0])
+-weights_lock = threading.Lock()
+-
+-# Global variable for the accumulated reward for the current episode.
+-current_episode_reward = [np.zeros(4), ]
+-episode_reward_lock = threading.Lock()
+-
+-# --- Initialize the agent ---
+-# Create a vectorized environment for the agent.
+-env_agent = mo_gym.make("deep-sea-treasure-v0", render_mode = "rgb_array")
+-eval_agent = DiscreteAgent(env_agent, reward_size=2).to("cuda")
+-model_path = "runs/deep-sea-treasure-v0__main_ppo__2025-04-25 13:27:58.098098__1/main_ppo.rl_model"
+-eval_agent.load_state_dict(torch.load(model_path))
+-eval_agent.eval()
+-
+-# Create a separate (non-vectorized) environment for rendering.
+-
+-env_render = mo_gym.make("deep-sea-treasure-v0", render_mode = "rgb_array")
+-recorded_trajectory = []
+-record_lock = threading.Lock()# signal whether a /play episode is currently running
+-recording_in_progress = False
+-recording_lock = threading.Lock()
+-
+-
+-@app.route('/')
+-def index():
+-    # Pass current weights to the template for slider initialization.
+-    return render_template('treasure.html', weights=weights.tolist())
+-
+-@app.route('/update_weights', methods=['POST'])
+-def update_weights():
+-    global weights
+-    # Get form data sent via AJAX.
+-    data = request.form
+-    try:
+-        new_weights = np.array([
+-            float(data.get("w_treasure", 1)),
+-            float(data.get("w_time", 0)),
+-        ])
+-        print(new_weights)
+-        with weights_lock:
+-            weights = new_weights
+-        return jsonify({"status": "success", "weights": weights.tolist()})
+-    except Exception as e:
+-        return jsonify({"status": "error", "message": str(e)}), 400
+-
+-def simulation_generator():
+-    """Generator that steps through the simulation, accumulates weighted rewards,
+-    resets the accumulator at the start of each episode, and yields rendered frames."""
+-    global weights, current_episode_reward
+-    while True:
+-        # Reset the accumulated reward at the start of each episode.
+-        with episode_reward_lock:
+-            current_episode_reward = [np.zeros(2), ]
+-        done = False
+-        trunc = False
+-        obs, _ = env_render.reset()
+-        while not (done or trunc):
+-            with weights_lock:
+-                current_weights = np.copy(weights)
+-            # Agent expects a batch; use the first action.
+-            action, _ = eval_agent.predict(obs, current_weights, deterministic=True, device = "cuda")
+-            obs, rew, done, trunc, infos = env_render.step(action[0])
+-            # Compute the weighted reward for this step.
+-            step_reward = current_weights * rew
+-            with episode_reward_lock:
+-                current_episode_reward.append(step_reward)
+-            frame = env_render.render()
+-            yield frame
+-            time.sleep(0.03)
+-
+-def frame_gen(generator_func, *args, **kwargs):
+-    """Encodes frames from the generator as PNG and yields them in a multipart response."""
+-    get_frame = generator_func(*args, **kwargs)
+-    while True:
+-        frame = next(get_frame, None)
+-        if frame is None:
+-            continue
+-        ret, png = cv2.imencode('.png', frame)
+-        if not ret:
+-            continue
+-        frame_bytes = png.tobytes()
+-        yield (b'--frame\r\n'
+-               b'Content-Type: image/png\r\n\r\n' + frame_bytes + b'\r\n')
+-
+-@app.route('/render_feed')
+-def render_feed():
+-    return Response(frame_gen(simulation_generator),
+-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+-
+-def generate_plot():
+-    """Generates a PNG bar plot of the accumulated reward per component for the current episode."""
+-    with episode_reward_lock:
+-        data = np.array(current_episode_reward)
+-    fig, ax = plt.subplots()
+-    components = ["Treasure", "Time"]
+-    # for i in range(8):
+-    ax.plot(data, label = components)
+-    ax.set_title("Accumulated Reward per Component (Current Episode)")
+-    ax.set_ylabel("Accumulated Reward")
+-    buf = io.BytesIO()
+-    ax.legend()
+-    fig.savefig(buf, format='png')
+-    plt.close(fig)
+-    buf.seek(0)
+-    return buf.getvalue()
+-
+-@app.route('/plot_feed')
+-def plot_feed():
+-    png = generate_plot()
+-    return Response(png, mimetype='image/png')
+-
+-def reward_plot_gen():
+-    """Generator that continuously yields updated reward plot frames."""
+-    while True:
+-        png = generate_plot()  # Generate the current reward plot as PNG
+-        yield (b'--frame\r\n'
+-               b'Content-Type: image/png\r\n\r\n' + png + b'\r\n')
+-        time.sleep(0.03)  # Adjust the refresh rate as needed
+-
+-@app.route('/reward_plot_stream')
+-def reward_plot_stream():
+-    return Response(reward_plot_gen(),
+-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+-def generate_partial_plot_uri(step: int) -> str:
+-    """
+-    Build a cumulative-reward line plot up to `step` and return it
+-    as a 'data:image/png;base64,…' URI.
+-    """
+-    
+-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-    with record_lock:
+-        # gather reward vectors up to and including `step`
+-        data = np.array([ e['reward_components'] 
+-                          for e in recorded_trajectory ])  # shape (step+1, 4)
+-
+-    # cumulative sum along time
+-    cum = data.cumsum(axis=0)
+-
+-    labels =  ["Treasure", "Time"]
+-    fig, ax = plt.subplots()
+-    for idx, lbl in enumerate(labels):
+-        ax.plot(cum[:, idx], label=lbl)
+-    ax.plot([step, step], [cum.min(), cum.max()], 'k--', lw=1)
+-    ax.set_title("Cumulative Reward up to step {}".format(step))
+-    ax.set_ylabel("Reward")
+-    ax.legend(loc="upper left")
+-
+-    buf = BytesIO()
+-    fig.savefig(buf, format="png", bbox_inches="tight")
+-    plt.close(fig)
+-    buf.seek(0)
+-
+-    b64 = base64.b64encode(buf.read()).decode("ascii")
+-    return f"data:image/png;base64,{b64}"
+-@app.route('/play')
+-def play():
+-    """
+-    Streams the simulation as MJPEG and records the trajectory.
+-    Ensures recording_in_progress is always cleared, even if the client
+-    stops the stream early.
+-    """
+-    def generate():
+-        global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-
+-        # Prevent two concurrent plays
+-        with recording_lock:
+-            if recording_in_progress:
+-                return
+-            recording_in_progress = True
+-            recorded_trajectory = []
+-
+-        try:
+-            
+-            env_render = mo_gym.make("deep-sea-treasure-v0", render_mode = "rgb_array")
+-            obs, _ = env_render.reset()
+-            done = trunc = False
+-
+-            while not (done or trunc):
+-                with weights_lock:
+-                    w = weights.copy()
+-                action, value = eval_agent.predict(obs, w, deterministic=True, device="cuda")
+-                next_obs, rew, done, trunc, _ = env_render.step(action[0])
+-
+-                ret, png = cv2.imencode('.png', env_render.render())
+-                if not ret:
+-                    obs = next_obs
+-                    continue
+-
+-                # record
+-                b64 = base64.b64encode(png.tobytes()).decode('ascii')
+-                with record_lock:
+-                    recorded_trajectory.append({
+-                        'state':            np.round(obs, 3).tolist(),
+-                        'action':           int(action[0]),
+-                        'reward_components': (w * rew).tolist(),
+-                        'weights':          w.tolist(),
+-                        'value':            np.round(value[0], 3).tolist(),
+-                        'frame_b64':        b64
+-                    })
+-
+-                # stream
+-                yield (
+-                    b'--frame\r\n'
+-                    b'Content-Type: image/png\r\n\r\n' +
+-                    png.tobytes() +
+-                    b'\r\n'
+-                )
+-
+-                time.sleep(0.03)
+-                obs = next_obs
+-                
+-        except Exception as e:
+-            print("Error during simulation:", e)
+-            # Handle any exceptions that occur during the simulation
+-            # You can log the error or take appropriate action here
+-
+-        finally :
+-            print("In Finally")
+-            # ALWAYS clear the flag, even if client aborted
+-            with recording_lock:
+-                recording_in_progress = False
+-
+-    return Response(
+-        generate(),
+-        mimetype='multipart/x-mixed-replace; boundary=frame'
+-    )
+-
+-
+-@app.route('/scrub')
+-def scrub():
+-    # block while recording
+-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-    
+-    with recording_lock:
+-        if recording_in_progress:
+-            return jsonify({'error':'episode still running'}), 409
+-
+-    step = request.args.get('step', type=int)
+-    if step is None:
+-        return jsonify({'error':'must provide ?step=N'}), 400
+-
+-    with record_lock:
+-        if step < 0 or step >= len(recorded_trajectory):
+-            return jsonify({'error':'step out of range'}), 400
+-        entry = recorded_trajectory[step]
+-
+-    # 1) frame data URI
+-    frame_uri = f"data:image/png;base64,{entry['frame_b64']}"
+-    # 2) cumulative‐reward line plot up to step
+-    plot_uri  = generate_partial_plot_uri(step)
+-
+-    # 3) per‐step bar plot of reward components
+-    # ------------------------------------------------
+-    labels = ["Treasure", "Time"]
+-    values = entry['reward_components']
+-    fig, ax = plt.subplots()
+-    ax.bar(labels, values)
+-    ax.set_title(f"Reward Components at Step {step}")
+-    ax.set_ylabel("Reward")
+-    buf = BytesIO()
+-    fig.savefig(buf, format="png", bbox_inches="tight")
+-    plt.close(fig)
+-    buf.seek(0)
+-    bar_b64 = base64.b64encode(buf.read()).decode("ascii")
+-    bar_uri = f"data:image/png;base64,{bar_b64}"
+-    # ------------------------------------------------
+-
+-    return jsonify({
+-        'step':              step,
+-        'state':             entry['state'],
+-        'action':            entry['action'],
+-        'reward_components': entry['reward_components'],
+-        'weights':           entry['weights'],
+-        'value':             entry['value'],
+-        'frame':             frame_uri,
+-        'plot':              plot_uri,
+-        'bar_plot':          bar_uri
+-    })
+-
+-@app.route('/record_status')
+-def record_status():
+-    """
+-    Returns whether a recording is in progress, and how many steps have been recorded so far.
+-    Front-end polls this to know when to re-enable scrubbing.
+-    """
+-    # read the “in progress” flag
+-    
+-    global recorded_trajectory, recording_in_progress, record_lock, weights_lock, recording_lock, weights
+-    with recording_lock:
+-        in_progress = recording_in_progress
+-        print("RECORD STATUS", in_progress)
+-    # read the current recorded length
+-    with record_lock:
+-        length = len(recorded_trajectory)
+-    return jsonify({
+-        "recording": in_progress,
+-        "length":    length
+-    })
+-    
+-@app.route('/recompute_action', methods=['POST'])
+-def recompute_action():
+-    """
+-    Given a scrub step and a new weight vector, return the action
+-    the agent would now take in that recorded state—without stepping
+-    the environment.
+-    """
+-    # 1) Parse JSON body
+-    data = request.get_json(force=True)
+-    step       = data.get('step')
+-    new_weights = data.get('weights')
+-
+-    # 2) Ensure recording has finished
+-    with recording_lock:
+-        if recording_in_progress:
+-            return jsonify({'error': 'episode still running'}), 409
+-
+-    # 3) Validate inputs
+-    if step is None or new_weights is None:
+-        return jsonify({'error': 'must provide "step" and "weights" in JSON'}), 400
+-    try:
+-        step = int(step)
+-        w_arr = np.array(new_weights, dtype=float)
+-    except Exception:
+-        return jsonify({'error': '"step" must be int and "weights" a list of floats'}), 400
+-
+-    # 4) Grab the recorded observation
+-    with record_lock:
+-        if step < 0 or step >= len(recorded_trajectory):
+-            return jsonify({'error': 'step out of range'}), 400
+-        obs = np.array(recorded_trajectory[step]['state'])
+-
+-    # 5) Compute the new action
+-    #    Note: agent.predict expects a batch, so wrap obs
+-    action_batch, value = eval_agent.predict(
+-        obs[np.newaxis, ...],
+-        w_arr,
+-        deterministic=True,
+-        device="cuda"
+-    )
+-    action0 = action_batch[0]
+-    # If discrete, convert to int; if continuous, to list
+-    try:
+-        action_serialized = int(action0)
+-    except (TypeError, ValueError):
+-        action_serialized = action0.tolist()
+-
+-    value_seralized = np.round(value[0], 3)
+-    return jsonify({'action': action_serialized,
+-                    'value':  value_seralized.tolist()})
+-
+-
+-if __name__ == '__main__':
+-    app.run(host='0.0.0.0', port=5043, debug=False)
+diff --git a/flask_viz.py b/flask_viz.py
+index 61a452c..2c5b169 100644
+--- a/flask_viz.py
++++ b/flask_viz.py
+@@ -13,6 +13,8 @@ import mo_gymnasium as mo_gym
+ from io import BytesIO
+ import base64
+ import subprocess
++import traceback
++import envs
+ 
+ # PPO agent classes
+ from ppo.agent import DiscreteAgent, ContinuousAgent
+@@ -60,9 +62,8 @@ recording_lock          = threading.Lock()
+ # --- Initialize the agent ---
+ # Vectorized environment for inference
+ env_agent = mo_gym.make(ENV_NAME, render_mode="rgb_array")
+-env_render = mo_gym.make(ENV_NAME, render_mode = "rgb_array")
+ AgentClass = ContinuousAgent if CONTINUOUS else DiscreteAgent
+-eval_agent = AgentClass(env_agent, reward_size=REWARD_SIZE).to("cuda")
++eval_agent = AgentClass(env_agent, reward_size=REWARD_SIZE).to("cpu")
+ eval_agent.load_state_dict(torch.load(MODEL_PATH + "main_ppo.rl_model"))
+ eval_agent.eval()
+ 
+@@ -92,7 +93,7 @@ def simulation_generator():
+     while True:
+         # Reset the accumulated reward at the start of each episode.
+         with episode_reward_lock:
+-            current_episode_reward = [np.zeros(2), ]
++            current_episode_reward = [np.zeros(REWARD_SIZE), ]
+         done = False
+         trunc = False
+         obs, _ = env_render.reset()
+@@ -100,7 +101,7 @@ def simulation_generator():
+             with weights_lock:
+                 current_weights = np.copy(weights)
+             # Agent expects a batch; use the first action.
+-            action, _ = eval_agent.predict(obs, current_weights, deterministic=True, device = "cuda")
++            action, _ = eval_agent.predict(obs, current_weights, deterministic=True, device = "cpu")
+             obs, rew, done, trunc, infos = env_render.step(action[0])
+             # Compute the weighted reward for this step.
+             step_reward = current_weights * rew
+@@ -199,16 +200,15 @@ def play():
+ 
+         try:
+             
+-            env_render = mo_gym.make("deep-sea-treasure-v0", render_mode = "rgb_array")
++            env_render = mo_gym.make(ENV_NAME, render_mode = "rgb_array")
+             obs, _ = env_render.reset()
+             done = trunc = False
+ 
+             while not (done or trunc):
+                 with weights_lock:
+                     w = weights.copy()
+-                action, value = eval_agent.predict(obs, w, deterministic=True, device="cuda")
++                action, value = eval_agent.predict(obs, w, deterministic=True, device="cpu")
+                 next_obs, rew, done, trunc, _ = env_render.step(action[0])
+-
+                 ret, png = cv2.imencode('.png', env_render.render())
+                 if not ret:
+                     obs = next_obs
+@@ -219,8 +219,8 @@ def play():
+                 with record_lock:
+                     recorded_trajectory.append({
+                         'state':            np.round(obs, 3).tolist(),
+-                        'action':           int(action[0]),
+-                        'reward_components': (w * rew).tolist(),
++                        'action':           action[0].tolist(),
++                        'reward_components': (rew).tolist(),
+                         'weights':          w.tolist(),
+                         'value':            np.round(value[0], 3).tolist(),
+                         'frame_b64':        b64
+@@ -234,11 +234,11 @@ def play():
+                     b'\r\n'
+                 )
+ 
+-                time.sleep(0.03)
++                time.sleep(0.02)
+                 obs = next_obs
+                 
+         except Exception as e:
+-            print("Error during simulation:", e)
++            print("Error during simulation:", traceback.format_exc())
+             # Handle any exceptions that occur during the simulation
+             # You can log the error or take appropriate action here
+ 
+@@ -279,7 +279,7 @@ def scrub():
+ 
+     # 3) per‐step bar plot of reward components
+     # ------------------------------------------------
+-    labels = ["Treasure", "Time"]
++    labels = REWARD_LABELS
+     values = entry['reward_components']
+     fig, ax = plt.subplots()
+     ax.bar(labels, values)
+@@ -363,7 +363,7 @@ def recompute_action():
+         obs[np.newaxis, ...],
+         w_arr,
+         deterministic=True,
+-        device="cuda"
++        device="cpu"
+     )
+     action0 = action_batch[0]
+     # If discrete, convert to int; if continuous, to list
+@@ -424,4 +424,4 @@ def launch_tensorboard():
+ 
+ 
+ if __name__ == '__main__':
+-    app.run(host='0.0.0.0', port=5043, debug=False)
++    app.run(host='0.0.0.0', port=5123, debug=False)
+diff --git a/gifs/LunarLander__main_ppo__2025-02-18 12:59:09.664053__0_env_0.gif b/gifs/LunarLander__main_ppo__2025-02-18 12:59:09.664053__0_env_0.gif
+deleted file mode 100644
+index 58417f0..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-02-18 12:59:09.664053__0_env_0.gif and /dev/null differ
+diff --git a/gifs/LunarLander__main_ppo__2025-02-18 12:59:09.664053__0_env_1.gif b/gifs/LunarLander__main_ppo__2025-02-18 12:59:09.664053__0_env_1.gif
+deleted file mode 100644
+index 1a304fa..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-02-18 12:59:09.664053__0_env_1.gif and /dev/null differ
+diff --git a/gifs/LunarLander__main_ppo__2025-02-18 12:59:09.664053__0_env_2.gif b/gifs/LunarLander__main_ppo__2025-02-18 12:59:09.664053__0_env_2.gif
+deleted file mode 100644
+index b015d18..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-02-18 12:59:09.664053__0_env_2.gif and /dev/null differ
+diff --git a/gifs/LunarLander__main_ppo__2025-02-18 12:59:09.664053__0_env_3.gif b/gifs/LunarLander__main_ppo__2025-02-18 12:59:09.664053__0_env_3.gif
+deleted file mode 100644
+index f75dd48..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-02-18 12:59:09.664053__0_env_3.gif and /dev/null differ
+diff --git a/gifs/LunarLander__main_ppo__2025-03-04 10:51:44.153791__100_env_0.gif b/gifs/LunarLander__main_ppo__2025-03-04 10:51:44.153791__100_env_0.gif
+deleted file mode 100644
+index 15ae8a3..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-03-04 10:51:44.153791__100_env_0.gif and /dev/null differ
+diff --git a/gifs/LunarLander__main_ppo__2025-03-04 10:51:44.153791__100_env_1.gif b/gifs/LunarLander__main_ppo__2025-03-04 10:51:44.153791__100_env_1.gif
+deleted file mode 100644
+index 550328b..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-03-04 10:51:44.153791__100_env_1.gif and /dev/null differ
+diff --git a/gifs/LunarLander__main_ppo__2025-03-04 10:51:44.153791__100_env_2.gif b/gifs/LunarLander__main_ppo__2025-03-04 10:51:44.153791__100_env_2.gif
+deleted file mode 100644
+index d67845b..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-03-04 10:51:44.153791__100_env_2.gif and /dev/null differ
+diff --git a/gifs/LunarLander__main_ppo__2025-03-04 10:51:44.153791__100_env_3.gif b/gifs/LunarLander__main_ppo__2025-03-04 10:51:44.153791__100_env_3.gif
+deleted file mode 100644
+index f3538c5..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-03-04 10:51:44.153791__100_env_3.gif and /dev/null differ
+diff --git a/gifs/LunarLander__main_ppo__2025-03-06 13:44:02.034352__100_env_0.gif b/gifs/LunarLander__main_ppo__2025-03-06 13:44:02.034352__100_env_0.gif
+deleted file mode 100644
+index 483d2eb..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-03-06 13:44:02.034352__100_env_0.gif and /dev/null differ
+diff --git a/gifs/LunarLander__main_ppo__2025-03-06 13:44:02.034352__100_env_1.gif b/gifs/LunarLander__main_ppo__2025-03-06 13:44:02.034352__100_env_1.gif
+deleted file mode 100644
+index 6d20b01..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-03-06 13:44:02.034352__100_env_1.gif and /dev/null differ
+diff --git a/gifs/LunarLander__main_ppo__2025-03-06 13:44:02.034352__100_env_2.gif b/gifs/LunarLander__main_ppo__2025-03-06 13:44:02.034352__100_env_2.gif
+deleted file mode 100644
+index ca42db8..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-03-06 13:44:02.034352__100_env_2.gif and /dev/null differ
+diff --git a/gifs/LunarLander__main_ppo__2025-03-06 13:44:02.034352__100_env_3.gif b/gifs/LunarLander__main_ppo__2025-03-06 13:44:02.034352__100_env_3.gif
+deleted file mode 100644
+index ce85cd6..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-03-06 13:44:02.034352__100_env_3.gif and /dev/null differ
+diff --git a/gifs/LunarLander__main_ppo__2025-03-17 12:36:43.675560__100_env_0.gif b/gifs/LunarLander__main_ppo__2025-03-17 12:36:43.675560__100_env_0.gif
+deleted file mode 100644
+index 483d2eb..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-03-17 12:36:43.675560__100_env_0.gif and /dev/null differ
+diff --git a/gifs/LunarLander__main_ppo__2025-03-17 12:36:43.675560__100_env_1.gif b/gifs/LunarLander__main_ppo__2025-03-17 12:36:43.675560__100_env_1.gif
+deleted file mode 100644
+index 6d20b01..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-03-17 12:36:43.675560__100_env_1.gif and /dev/null differ
+diff --git a/gifs/LunarLander__main_ppo__2025-03-17 12:36:43.675560__100_env_2.gif b/gifs/LunarLander__main_ppo__2025-03-17 12:36:43.675560__100_env_2.gif
+deleted file mode 100644
+index ca42db8..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-03-17 12:36:43.675560__100_env_2.gif and /dev/null differ
+diff --git a/gifs/LunarLander__main_ppo__2025-03-17 12:36:43.675560__100_env_3.gif b/gifs/LunarLander__main_ppo__2025-03-17 12:36:43.675560__100_env_3.gif
+deleted file mode 100644
+index ce85cd6..0000000
+Binary files a/gifs/LunarLander__main_ppo__2025-03-17 12:36:43.675560__100_env_3.gif and /dev/null differ
+diff --git a/main_ppo.py b/main_ppo.py
+index e906383..d548644 100644
+--- a/main_ppo.py
++++ b/main_ppo.py
+@@ -13,9 +13,7 @@ import imageio
+ 
+ from ppo.agent import ContinuousAgent, DiscreteAgent, CNNDiscreteAgent
+ from ppo.ppo import PPO, PPOLogger
+-from envs.lunar_lander import LunarLander
+-from envs.bipedal_walker import BipedalWalker
+-from envs.crafter_env import CrafterEnv
++import envs
+ from envs.utils import SyncVectorEnv, RecordEpisodeStatistics
+ import torchbnn as bnn
+ import mo_gymnasium as mo_gym
+@@ -98,6 +96,7 @@ def run_ppo(
+     env_id: str = "LunarLander",
+     env_is_discrete: bool = False,
+     num_envs: int = 4,
++    convex: bool = False,
+     scalar_reward: bool = False,
+     total_timesteps: int = 5000000,
+     num_rollout_steps: int = 2048,
+@@ -185,37 +184,6 @@ def run_ppo(
+     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+     device = torch.device("cpu")
+ 
+-    # Create environments
+-    # if env_id == "LunarLander":
+-    #     envs = 
+-    # elif env_id == "BipedalWalker":
+-    #     envs = SyncVectorEnv(
+-    #     [
+-    #         lambda:
+-    #             gym.wrappers.TimeLimit(
+-    #                 BipedalWalker(scalar_reward=scalar_reward, render_mode="rgb_array"), 
+-    #                 max_episode_steps = 1600
+-    #             )
+-            
+-    #     ]*num_envs,
+-    #     reward_size = 1 if scalar_reward else 7
+-    #     )
+-    # elif env_id == "Crafter":
+-    #     envs = SyncVectorEnv(
+-    #     [
+-    #         lambda:
+-    #             gym.wrappers.TimeLimit(
+-    #                 CrafterEnv(scalar_reward=scalar_reward, render_mode="rgb_array"), 
+-    #                 max_episode_steps = 10000
+-    #             )
+-            
+-    #     ]*num_envs,
+-    #     reward_size = 1 if scalar_reward else 39
+-    #     )
+-    # else:
+-    #     raise "ENV NOT FOUND"
+-    # envs = RecordEpisodeStatistics(envs)
+-
+     envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+         lambda: mo_gym.make(env_id) for _ in range(num_envs)
+     )
+@@ -226,6 +194,7 @@ def run_ppo(
+ 
+     # envs = gym.wrappers.vector.RescaleObservation(envs, min_obs = -1, max_obs = 1)
+ # Set up agent
++    
+     agent_class = (
+         partial(DiscreteAgent, reward_size = envs.rewards_shape[-1])
+         if env_is_discrete
+@@ -237,7 +206,20 @@ def run_ppo(
+ 
+     agent = agent_class(envs).to(device)
+ 
+-    optimizer = optim.Adam(agent.parameters(), lr=learning_rate, eps=1e-5)
++    optimizer = torch.optim.Adam([
++        { "params": agent.actor.parameters(),  "lr": learning_rate },
++        { "params": agent.critic.parameters(), "lr": learning_rate },
++    ], eps=1e-5)
++    
++    optimizer = [
++        torch.optim.Adam(
++            agent.actor.parameters(), lr=learning_rate, eps=1e-5
++        ),
++        torch.optim.Adam(
++            agent.critic.parameters(), lr=learning_rate, eps=1e-5
++        )
++    ]
++
+ 
+     logger = PPOLogger(run_name, use_tensorboard, reward_size = envs.rewards_shape[-1])
+     ppo = PPO(
+@@ -263,7 +245,8 @@ def run_ppo(
+         envs=envs,
+         env_is_discrete=env_is_discrete,
+         seed=seed,
+-        logger=logger
++        logger=logger,
++        convex=convex,
+     )
+     print(ppo.agent)
+     # Train the agent
+diff --git a/ppo/agent.py b/ppo/agent.py
+index ee27c73..91336ee 100644
+--- a/ppo/agent.py
++++ b/ppo/agent.py
+@@ -117,7 +117,7 @@ class DiscreteAgent(BaseAgent):
+         if self.weight_vec_size == 0:
+             observation = observation
+         elif weights is None:
+-            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size))])
++            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size)).to(device)])
+         else:
+             observation =  torch.hstack([observation, weights])
+ 
+@@ -229,6 +229,13 @@ class ContinuousAgent(BaseAgent):
+         self.actor_logstd = nn.Parameter(
+             torch.zeros(1, np.prod(action_space))
+         )
++        
++        # 3) now make a *container* module and stick both parts on it
++        self.actor = nn.Module()           # empty container
++        # register the mean‐net as a submodule
++        self.actor.add_module('mean', self.actor_mean)
++        # register the logstd parameter
++        self.actor.register_parameter('logstd', self.actor_logstd)
+         self.shield = shield
+         
+         try:
+diff --git a/ppo/ppo.py b/ppo/ppo.py
+index 7852243..d294ff6 100644
+--- a/ppo/ppo.py
++++ b/ppo/ppo.py
+@@ -4,7 +4,7 @@ import numpy as np
+ import torch
+ import torch.nn as nn
+ from torch.utils.tensorboard import SummaryWriter
+-import torchbnn as bnn
++from torch.distributions.dirichlet import Dirichlet
+ 
+ 
+ class LinearLRSchedule:
+@@ -18,11 +18,13 @@ class LinearLRSchedule:
+         self.current_update += 1
+         frac = 1.0 - (self.current_update - 1.0) / self.total_updates
+         lr = frac * self.initial_lr
+-        for param_group in self.optimizer.param_groups:
++        for param_group in self.optimizer[0].param_groups:
++            param_group["lr"] = lr
++        for param_group in self.optimizer[1].param_groups:
+             param_group["lr"] = lr
+ 
+     def get_lr(self):
+-        return [group["lr"] for group in self.optimizer.param_groups]
++        return [group["lr"] for group in self.optimizer[0].param_groups] + [group["lr"] for group in self.optimizer[1].param_groups]
+ 
+ 
+ class PPOLogger:
+@@ -43,7 +45,7 @@ class PPOLogger:
+             for i in range(self.reward_size):
+                 non_zero_comps.append(infos['episode'][f'r'][infos['_episode']][:,i].mean())
+             print(
+-                f"global_step={global_step}, episodic_return={non_zero_rews.mean()}",
++                f"global_step={global_step}, episodic_return={non_zero_rews.mean(axis = 0)}",
+                 flush=True,
+             )
+ 
+@@ -120,6 +122,7 @@ class PPO:
+         anneal_lr=True,
+         seed=1,
+         logger=None,
++        convex=False,
+     ):
+         """
+         Proximal Policy Optimization (PPO) algorithm implementation.
+@@ -212,6 +215,7 @@ class PPO:
+         self.lr_scheduler = None
+         self._global_step = 0
+         self.logger = logger or PPOLogger()
++        self.convex = convex
+ 
+     def create_lr_scheduler(self, num_policy_updates):
+         return LinearLRSchedule(self.optimizer, self.initial_lr, num_policy_updates)
+@@ -364,8 +368,11 @@ class PPO:
+         ) = self._initialize_storage()    
+         if current_weights is None:
+             if self.reward_size != 1:
+-                weights = torch.distributions.uniform.Uniform(low=-1, high=1).sample((self.num_envs, self.reward_size)).to(self.device).type(torch.float32)
++                weights = torch.distributions.uniform.Uniform(low=0, high=1).sample((self.num_envs, self.reward_size)).to(self.device).type(torch.float32)
+                 # weights = torch.softmax(weights, dim = 1)
++                if self.convex:
++                    dist = Dirichlet(torch.ones(self.reward_size, device=self.device))
++                    weights = dist.sample((self.num_envs, )).type(torch.float32)
+             else:
+                 weights = torch.ones(self.num_envs, 1).to(self.device).type(torch.float32)
+                 # weights = torch.softmax(weights, dim = 1)
+@@ -387,14 +394,15 @@ class PPO:
+             change_weights = torch.logical_or(is_next_observation_terminal.type(torch.bool), is_next_observation_truncated.type(torch.bool))
+             if self.reward_size != 1 and change_weights.any():
+                 # print(weights)   
+-                weights[change_weights] = torch.distributions.uniform.Uniform(low=-1, high=1).sample(weights[change_weights].shape).to(self.device).type(torch.float32)
+-                # weights[change_weights] = torch.softmax(weights[change_weights], dim = 1)
++                weights[change_weights] = torch.distributions.uniform.Uniform(low=0, high=1).sample(weights[change_weights].shape).to(self.device).type(torch.float32)
++                if self.convex:
++                    dist = Dirichlet(torch.ones(self.reward_size, device=self.device))
++                    weights[change_weights] = dist.sample((change_weights.shape[0], )).type(torch.float32)
+ 
+                 # weights[:,-1] = 1.0
+                 # weights = torch.ones((self.num_envs, self.reward_size)).to(self.device).type(torch.float32)
+ 
+                 
+-            noise = torch.randn_like(weights) * 0.001
+             with torch.no_grad():
+                 action, logprob = self.agent.sample_action_and_compute_log_prob(
+                     next_observation, weights
+@@ -475,7 +483,7 @@ class PPO:
+             action_log_probabilities,
+             actions,
+             advantages,
+-            returns * rollout_weights,
++            returns,
+             observation_values,
+             rollout_weights
+         )
+@@ -635,212 +643,230 @@ class PPO:
+         collected_weights,
+     ):
+         """
+-        Update the policy and value function using the collected rollout data.
+-
+-        This method implements the core PPO algorithm update step. It performs multiple
+-        epochs of updates on minibatches of the collected rollout data, optimizing both the policy
+-        and value function.
+-
+-        Args:
+-            collected_observations (torch.Tensor): Tensor of shape (batch_size, *obs_shape)
+-                containing the observations from the rollout.
+-            collected_action_log_probs (torch.Tensor): Tensor of shape (batch_size,)
+-                containing the log probabilities of the actions taken during the rollout.
+-            collected_actions (torch.Tensor): Tensor of shape (batch_size, *action_shape)
+-                containing the actions taken during the rollout.
+-            computed_advantages (torch.Tensor): Tensor of shape (batch_size, reward_size) containing
+-                the computed advantages for each step in the rollout.
+-            computed_returns (torch.Tensor): Tensor of shape (batch_size, reward_size) containing
+-                the computed returns (sum of discounted rewards) for each step.
+-            previous_value_estimates (torch.Tensor): Tensor of shape (batch_size, reward_size)
+-                containing the value estimates from the previous iteration.
+-
+-        Returns:
+-            dict: A dictionary containing various statistics about the update process:
+-                - policy_loss: The final policy gradient loss.
+-                - value_loss: The final value function loss.
+-                - entropy_loss: The entropy loss, encouraging exploration.
+-                - old_approx_kl: The old approximate KL divergence.
+-                - approx_kl: The new approximate KL divergence.
+-                - clipping_fraction: The fraction of policy updates that were clipped.
+-                - explained_variance: A measure of how well the value function explains
+-                                    the observed returns.
+-
+-        The method performs the following key steps:
+-        1. Iterates over the data for multiple epochs, shuffling at each epoch.
+-        2. For each minibatch:
+-            a. Computes new action probabilities and values.
+-            b. Calculates the policy ratio and clipped policy objective.
+-            c. Computes the value function loss, optionally with clipping.
+-            d. Calculates the entropy bonus to encourage exploration.
+-            e. Combines losses and performs a gradient update step.
+-        3. Optionally performs early stopping based on KL divergence.
+-        4. Computes and returns various statistics about the update process.
+-
+-        This implementation uses the PPO clipped objective, which helps to constrain
+-        the policy update and improve training stability. It also uses advantage
+-        normalization and gradient clipping for further stability.
++        PPO update with multi-objective PCGrad for the actor (plus entropy),
++        followed by a separate critic update.
+         """
+-        # Prepare for minibatch updates
+         batch_size = self.num_rollout_steps * self.num_envs
+         assert collected_observations.shape[0] == batch_size
+         batch_indices = np.arange(batch_size)
+-
+-        # Track clipping for monitoring policy update magnitude
+         clipping_fractions = []
+ 
+         for epoch in range(self.update_epochs):
+             np.random.shuffle(batch_indices)
+             kl_div = 0
+ 
+-            # Minibatch updates help stabilize training and can be more compute-efficient
+             for start in range(0, batch_size, self.minibatch_size):
+                 end = start + self.minibatch_size
+-                minibatch_indices = batch_indices[start:end]
+-
+-                # Get updated action probabilities and values for the current policy
+-                current_policy_log_probs, entropy = (
+-                    self.agent.compute_action_log_probabilities_and_entropy(
+-                        collected_observations[minibatch_indices],
+-                        collected_actions[minibatch_indices],
+-                        collected_weights[minibatch_indices]
+-                    )
+-                )
+-                new_value = self.agent.estimate_value_from_observation(
+-                    collected_observations[minibatch_indices],
+-                    collected_weights[minibatch_indices]
+-                )
+-
+-                # Calculate the probability ratio for importance sampling
+-                # This allows us to use old trajectories to estimate the new policy's performance
+-                log_probability_ratio = (
+-                    current_policy_log_probs
+-                    - collected_action_log_probs[minibatch_indices]
++                idx = batch_indices[start:end]
++
++                obs_mb    = collected_observations[idx]
++                old_logp  = collected_action_log_probs[idx]
++                acts_mb   = collected_actions[idx]
++                adv_mb    = computed_advantages[idx]    # [N, d]
++                returns_mb= computed_returns[idx]       # [N, d]
++                prev_val  = previous_value_estimates[idx]
++                w_mb      = collected_weights[idx]      # [N, d]
++
++                # 1) New policy outputs
++                new_logp, entropy = self.agent.compute_action_log_probabilities_and_entropy(
++                    obs_mb, acts_mb, w_mb
+                 )
+-                probability_ratio = log_probability_ratio.exp()
++                # 2) New value estimates
++                new_value = self.agent.estimate_value_from_observation(obs_mb, w_mb)
+ 
+-                # Estimate KL divergence for early stopping
+-                # This helps prevent the new policy from diverging too much from the old policy
+-                # approx_kl http://joschu.net/blog/kl-approx.html
++                # 3) Importance sampling ratio & KL estimates
++                log_ratio = new_logp - old_logp
++                ratio = log_ratio.exp()
+                 with torch.no_grad():
+-                    old_approx_kl = (-log_probability_ratio).mean()
+-                    approx_kl = ((probability_ratio - 1) - log_probability_ratio).mean()
+-                    kl_div = approx_kl.mean()
+-
+-                    # Track the fraction of updates being clipped
+-                    # High clipping fraction might indicate too large policy updates
+-                    clipping_fractions += [
+-                        (
+-                            (probability_ratio - 1.0).abs()
+-                            > self.surrogate_clip_threshold
+-                        )
++                    old_kl = (-log_ratio).mean()
++                    new_kl = ((ratio - 1) - log_ratio).mean()
++                    kl_div = new_kl
++                    # clipping fraction
++                    clipping_fractions.append(
++                        ((ratio - 1.0).abs() > self.surrogate_clip_threshold)
+                         .float()
+                         .mean()
+                         .item()
+-                    ]
+-
+-                minibatch_advantages = computed_advantages[minibatch_indices]  # shape: [N, d]
+-                weights = collected_weights[minibatch_indices]  
+-
+-                mask = (weights != 0).type(torch.float32)
++                    )
+                 
+-                # minibatch_advantages = mask*minibatch_advantages
++                # 4) Mask out zero-weight objectives
++                mask = (w_mb != 0).float()
++                # adv_mb = adv_mb * mask
++                # mask_add = torch.cat([mask, torch.ones_like(mask.sum(dim = 1).reshape(-1, 1))], dim = 1)
++                # adv_mb = torch.cat([adv_mb, adv_mb.sum(dim = 1).reshape(-1, 1)], dim = 1)
+                 
+-
+                 if self.normalize_advantages:
+                     # minibatch_advantages = mask * minibatch_advantages
+ 
+                                         
+                     # 1) Zero-out invalid dims
+-                    masked_adv = minibatch_advantages * mask  
++                    # adv_mb = adv_mb * mask_add  
+ 
+                     # 2) Compute mean & std _only_ over the valid entries in each column
+                     #    (i.e. sum over batch of masked_adv, divide by sum(mask) per dim)
+-                    valid_counts = mask.sum(dim=0)                # shape [d]
+-                    mean = (masked_adv.sum(dim=0) / valid_counts) # shape [d]
++                    # valid_counts = mask_add.sum(dim=0)                # shape [d]
++                    # mean = (adv_mb.sum(dim=0) / valid_counts) # shape [d]
+ 
+-                    #    For std: compute variance over the same entries
+-                    var = (((masked_adv - mean)**2 * mask).sum(dim=0) / valid_counts)
+-                    std = torch.sqrt(var + 1e-8)
++                    # #    For std: compute variance over the same entries
++                    # var = (((adv_mb - mean)**2 * mask_add).sum(dim=0) / valid_counts)
++                    # std = torch.sqrt(var + 1e-8)
+ 
+                     # 3) Normalize only the valid entries
+-                    normed = (masked_adv - mean) / std
++                    adv_mb = (adv_mb - adv_mb.mean(dim = 0)) / (adv_mb.std(dim = 0) + 1e-8)
++                    
++                policy_losses = self.calculate_policy_gradient_loss(
++                    adv_mb, ratio.reshape(-1, 1)
++                )
++                
++                ent_loss = -self.entropy_loss_coefficient * entropy.mean()
++                
+ 
+-                    # 4) (Optional) re-apply mask to safeguard any numerical drift
+-                    minibatch_advantages = normed * mask
+ 
+-                policy_gradient_loss = self.calculate_policy_gradient_loss(
+-                    minibatch_advantages, probability_ratio.reshape(-1, 1)
+-                )
++            #     # 5) Build one clipped-surrogate loss per objective
++            #     K = adv_mb.shape[1]
++            #     policy_losses = []
++            #     for i in range(K):
++            #         ai = adv_mb[:, i]  # [N]
++            #         unclipped = ai * ratio
++            #         clipped   = ai * torch.clamp(
++            #             ratio,
++            #             1 - self.surrogate_clip_threshold,
++            #             1 + self.surrogate_clip_threshold
++            #         )
++            #         policy_losses.append(-torch.min(unclipped, clipped).mean())
++                
+ 
++            #     # 6) Compute per-objective grads
++            #     actor_params = list(self.agent.actor.parameters())
++                
++            #     grads_per_obj = []
++            #     for Li in policy_losses:
++            #         self.optimizer[0].zero_grad()
++            #         Li.backward(retain_graph=True)
++            #         grads_per_obj.append([p.grad.clone() for p in actor_params])
++
++            #     # # 7) PCGrad: de-conflict pairwise
++            #     # # eps = 1e-8
++            #     # # for i, grads in enumerate(grads_per_obj):
++            #     # #     # compute the total norm of all parameter grads for objective i
++            #     # #     total_norm = torch.sqrt(sum((g**2).sum() for g in grads))
++            #     # #     # divide each grad tensor by that norm
++            #     # #     grads_per_obj[i] = [g / (total_norm + eps) for g in grads]
++
++            #     # for i in range(K):
++            #     #     for j in range(K):
++            #     #         if i == j:
++            #     #             continue
++            #     #         gi, gj = grads_per_obj[i], grads_per_obj[j]
++            #     #         dot_ij = sum((g_i * g_j).sum() for g_i, g_j in zip(gi, gj))
++            #     #         if dot_ij < 0:
++            #     #             norm_j2 = sum((g_j**2).sum() for g_j in gj)
++            #     #             coeff = dot_ij / (norm_j2 + 1e-12)
++            #     #             grads_per_obj[i] = [
++            #     #                 g_i - coeff * g_j for g_i, g_j in zip(gi, gj)
++            #     #             ]
++
++            #     # # 8) Average the de-conflicted grads
++            #     # self.optimizer[0].zero_grad()
++            #     # for p, *g_list in zip(actor_params, *grads_per_obj):
++            #     #     p.grad = sum(g_list) / K
++
++            #     # # 9) Add entropy gradient
++            #     # # compute entropy loss (we maximize entropy → minimize −entropy)
++            #     # ent_loss = -self.entropy_loss_coefficient * entropy.mean()
++            #     # ent_loss.backward()  # this will add into p.grad fields
++
++            #     # # 10) Step actor
++            #     # nn.utils.clip_grad_norm_(actor_params, self.max_grad_norm)
++            #     # self.optimizer[0].step()
++                
++                
++            #     # flatten each per-objective grad-list into one long vector
++            #     flat_grads = []
++            #     for grad_list in grads_per_obj:
++            #         flat_grads.append(torch.cat([g.view(-1) for g in grad_list]))
++            #     # Stack into K×P
++            #     G_vecs = torch.stack(flat_grads, dim=0)   # shape [K, P]
++
++            #     # build the Gram matrix G_{ij} = g_i · g_j
++            #     G = G_vecs @ G_vecs.t()                  # shape [K, K]
++            #     # regularize slightly for invertibility
++            #     eps = 1e-6
++            #     G += eps * torch.eye(G.size(0), device=G.device)
++
++            #     # solve G α = 1
++            #     ones = torch.ones(G.size(0), device=G.device)
++            #     alpha = torch.linalg.solve(G, ones)      # unconstrained
++            #     # project to simplex: α ≥ 0, sum α = 1
++            #     alpha = torch.clamp(alpha, min=0.0)
++            #     alpha = alpha / alpha.sum()
++
++            #     # now recombine the original parameter-wise grads
++            #     self.optimizer[0].zero_grad()
++            #     for p, *grads_for_param in zip(actor_params, *grads_per_obj):
++            #         # grads_for_param is a list [g^0_p, g^1_p, …, g^{K-1}_p]
++            #         combined = sum(alpha[i] * grads_for_param[i]
++            #                        for i in range(len(alpha)))
++            #         p.grad = combined
++
++            #     # add entropy gradient
++            #     ent_loss = -self.entropy_loss_coefficient * entropy.mean()
++            #     ent_loss.backward()
++
++            #     # step actor
++            #     nn.utils.clip_grad_norm_(actor_params, self.max_grad_norm)
++            #     self.optimizer[0].step()
++
++            #     # # Early stop on KL
++            #     # if self.target_kl is not None and kl_div > self.target_kl:
++            #     #     break
++
++            # # end of epoch minibatches
++
++            # === Critic Update ===
++
++                # 11) Compute scalar value loss over full batch
+                 value_function_loss = self.calculate_value_function_loss(
+                     new_value,
+                     computed_returns,
+                     previous_value_estimates,
+-                    minibatch_indices,
++                    idx,
+                     mask
+-                )
+-                # Entropy encourages exploration by penalizing overly deterministic policies
+-                entropy_loss = entropy.mean()
+-
+-                # Combine losses: minimize policy and value losses, maximize entropy
+-                loss = (
+-                    self.policy_gradient_loss_coefficient*policy_gradient_loss
+-                    - self.entropy_loss_coefficient
+-                    * entropy_loss  # subtraction here to maximise entropy (exploration)
+-                    + value_function_loss * self.value_function_loss_coefficient
+-                    # + bnn_kl_loss(self.agent)*0.01
+-                )
+-
+-                # Perform backpropagation and optimization step
+-                self.optimizer.zero_grad()
+-                loss.backward()
+-                # Gradient clipping helps prevent too large policy updates
+-                nn.utils.clip_grad_norm_(self.agent.parameters(), self.max_grad_norm)
+-                self.optimizer.step()
+-                    
+-                if not self.env_is_discrete:
+-                    if self.agent.actor_logstd.isnan().any():
+-                        print(policy_gradient_loss
+-                        , entropy_loss  # subtraction here to maximise entropy (exploration)
+-                        , value_function_loss * self.value_function_loss_coefficient
+-                        )
+-                        print(minibatch_advantages)
+-                        print(probability_ratio)
+-                        print(log_probability_ratio)
+-                        print(current_policy_log_probs)
+-                        print(collected_action_log_probs[minibatch_indices])
+-                        self.agent.actor_logstd[self.agent.actor_logstd.isnan()] = 0.01
+-
+-            # Early stopping based on KL divergence, if enabled, done at epoch level for stability
+-            # This provides an additional safeguard against too large policy updates
+-            if self.target_kl is not None:
+-                if kl_div/len(range(0, batch_size, self.minibatch_size)) > self.target_kl:
+-                    break
+-
+-        predicted_values, actual_returns = (
+-            previous_value_estimates.cpu().numpy(),
+-            computed_returns.cpu().numpy(),
+-        )
+-        observed_return_variance = np.var(actual_returns)
+-        # explained variance measures how well the value function predicts the actual returns
+-        explained_variance = (
+-            np.nan
+-            if observed_return_variance == 0
+-            else 1
+-            - np.var(actual_returns - predicted_values) / observed_return_variance
++                ) * self.value_function_loss_coefficient
++                # total_policy_loss = policy_loss * self.policy_gradient_loss_coefficient + ent_loss
++                # total_loss = value_function_loss + ent_loss + sum(policy_losses) * self.policy_gradient_loss_coefficient
++                self.optimizer[0].zero_grad()
++                self.optimizer[1].zero_grad()
++                for loss_val in policy_losses:
++                    loss_val = loss_val * self.policy_gradient_loss_coefficient
++                    loss_val.backward(retain_graph=True)
++                # total_policy_loss = sum(policy_losses) * self.policy_gradient_loss_coefficient + ent_loss
++                ent_loss.backward()
++                value_function_loss.backward()
++                nn.utils.clip_grad_norm_(self.agent.critic.parameters(), self.max_grad_norm)
++                nn.utils.clip_grad_norm_(self.agent.actor.parameters(), self.max_grad_norm)
++                self.optimizer[0].step()
++                self.optimizer[1].step()
++
++        # === Diagnostics ===
++        predicted, actual = prev_val.cpu().numpy(), returns_mb.cpu().numpy()
++        var_r = np.var(actual)
++        explained_var = (
++            np.nan if var_r == 0 else 1 - np.var(actual - predicted) / var_r
+         )
+ 
+         return {
+-            "policy_loss": policy_gradient_loss.item(),
++            "policy_loss": sum(pl.item() for pl in policy_losses),
++            # "policy_loss": policy_losses,
+             "value_loss": value_function_loss.item(),
+-            "entropy_loss": entropy_loss.item(),
+-            "old_approx_kl": old_approx_kl.item(),
+-            "approx_kl": approx_kl.item(),
++            "entropy_loss": entropy.mean().item(),
++            "old_approx_kl": old_kl.item(),
++            "approx_kl": new_kl.item(),
+             "clipping_fractions": np.mean(clipping_fractions),
+-            "explained_variance": explained_variance,
++            "explained_variance": explained_var,
+         }
+ 
++
+     def calculate_policy_gradient_loss(self, minibatch_advantages, probability_ratio):
+         """
+         Calculate the policy gradient loss using the PPO clipped objective, which is designed to
+@@ -893,7 +919,7 @@ class PPO:
+         #    result in a worse objective (clipped loss might do this).
+         # This conservative approach helps prevent the policy from changing too
+         # rapidly in any direction, improving stability.
+-        policy_gradient_loss = -torch.min(unclipped_pg_obj, clipped_pg_obj).sum(dim = 1).mean()
++        policy_gradient_loss = -torch.min(unclipped_pg_obj, clipped_pg_obj).mean(dim = 0)
+ 
+         return policy_gradient_loss
+ 
+diff --git a/saved_policies/policy_LunarLander-v3.pkl b/saved_policies/policy_LunarLander-v3.pkl
+deleted file mode 100644
+index 059a68b..0000000
+Binary files a/saved_policies/policy_LunarLander-v3.pkl and /dev/null differ
+diff --git a/sb3.py b/sb3.py
+deleted file mode 100644
+index c47abb4..0000000
+--- a/sb3.py
++++ /dev/null
+@@ -1,4 +0,0 @@
+-import mo_gymnasium
+-env = mo_gymnasium.make("mo-lunar-lander-v3")
+-
+-print(env.action_space, env.observation_space)

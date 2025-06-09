@@ -13,6 +13,8 @@ import mo_gymnasium as mo_gym
 from io import BytesIO
 import base64
 import subprocess
+import traceback
+import envs
 
 # PPO agent classes
 from ppo.agent import DiscreteAgent, ContinuousAgent
@@ -60,9 +62,8 @@ recording_lock          = threading.Lock()
 # --- Initialize the agent ---
 # Vectorized environment for inference
 env_agent = mo_gym.make(ENV_NAME, render_mode="rgb_array")
-env_render = mo_gym.make(ENV_NAME, render_mode = "rgb_array")
 AgentClass = ContinuousAgent if CONTINUOUS else DiscreteAgent
-eval_agent = AgentClass(env_agent, reward_size=REWARD_SIZE).to("cuda")
+eval_agent = AgentClass(env_agent, reward_size=REWARD_SIZE).to("cpu")
 eval_agent.load_state_dict(torch.load(MODEL_PATH + "main_ppo.rl_model"))
 eval_agent.eval()
 
@@ -92,7 +93,7 @@ def simulation_generator():
     while True:
         # Reset the accumulated reward at the start of each episode.
         with episode_reward_lock:
-            current_episode_reward = [np.zeros(2), ]
+            current_episode_reward = [np.zeros(REWARD_SIZE), ]
         done = False
         trunc = False
         obs, _ = env_render.reset()
@@ -100,7 +101,7 @@ def simulation_generator():
             with weights_lock:
                 current_weights = np.copy(weights)
             # Agent expects a batch; use the first action.
-            action, _ = eval_agent.predict(obs, current_weights, deterministic=True, device = "cuda")
+            action, _ = eval_agent.predict(obs, current_weights, deterministic=True, device = "cpu")
             obs, rew, done, trunc, infos = env_render.step(action[0])
             # Compute the weighted reward for this step.
             step_reward = current_weights * rew
@@ -199,16 +200,15 @@ def play():
 
         try:
             
-            env_render = mo_gym.make("deep-sea-treasure-v0", render_mode = "rgb_array")
+            env_render = mo_gym.make(ENV_NAME, render_mode = "rgb_array")
             obs, _ = env_render.reset()
             done = trunc = False
 
             while not (done or trunc):
                 with weights_lock:
                     w = weights.copy()
-                action, value = eval_agent.predict(obs, w, deterministic=True, device="cuda")
+                action, value = eval_agent.predict(obs, w, deterministic=True, device="cpu")
                 next_obs, rew, done, trunc, _ = env_render.step(action[0])
-
                 ret, png = cv2.imencode('.png', env_render.render())
                 if not ret:
                     obs = next_obs
@@ -219,8 +219,8 @@ def play():
                 with record_lock:
                     recorded_trajectory.append({
                         'state':            np.round(obs, 3).tolist(),
-                        'action':           int(action[0]),
-                        'reward_components': (w * rew).tolist(),
+                        'action':           action[0].tolist(),
+                        'reward_components': (rew).tolist(),
                         'weights':          w.tolist(),
                         'value':            np.round(value[0], 3).tolist(),
                         'frame_b64':        b64
@@ -234,11 +234,11 @@ def play():
                     b'\r\n'
                 )
 
-                time.sleep(0.03)
+                time.sleep(0.02)
                 obs = next_obs
                 
         except Exception as e:
-            print("Error during simulation:", e)
+            print("Error during simulation:", traceback.format_exc())
             # Handle any exceptions that occur during the simulation
             # You can log the error or take appropriate action here
 
@@ -279,7 +279,7 @@ def scrub():
 
     # 3) per‐step bar plot of reward components
     # ------------------------------------------------
-    labels = ["Treasure", "Time"]
+    labels = REWARD_LABELS
     values = entry['reward_components']
     fig, ax = plt.subplots()
     ax.bar(labels, values)
@@ -363,7 +363,7 @@ def recompute_action():
         obs[np.newaxis, ...],
         w_arr,
         deterministic=True,
-        device="cuda"
+        device="cpu"
     )
     action0 = action_batch[0]
     # If discrete, convert to int; if continuous, to list
@@ -424,4 +424,4 @@ def launch_tensorboard():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5043, debug=False)
+    app.run(host='0.0.0.0', port=5023, debug=False)

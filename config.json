@@ -1,9 +1,9 @@
 {
-    "env_name": "deep-sea-treasure-v0",
-    "continuous": false,
+    "env_name": "mo-humanoid-v5",
+    "continuous": true,
     "reward_size": 2,
-    "reward_labels": ["Treasure","Time"],
-    "model_path": "runs/deep-sea-treasure-v0__main_ppo__2025-04-25 13:27:58.098098__1/",
+    "reward_labels": ["X Velocity", "Energy"],
+    "model_path": "runs/mo-humanoid-v5__main_ppo__2025-06-06 19:32:43.235277__1/",
     "initial_weights": [1, 0]
   }
   

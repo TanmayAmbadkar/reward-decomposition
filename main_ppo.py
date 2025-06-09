@@ -13,13 +13,11 @@ import imageio
 
 from ppo.agent import ContinuousAgent, DiscreteAgent, CNNDiscreteAgent
 from ppo.ppo import PPO, PPOLogger
-from envs.lunar_lander import LunarLander
-from envs.bipedal_walker import BipedalWalker
-from envs.crafter_env import CrafterEnv
+import envs
 from envs.utils import SyncVectorEnv, RecordEpisodeStatistics
-import torchbnn as bnn
 import mo_gymnasium as mo_gym
-
+from envs.building_env import BuildingEnv_9d
+from envs.utils_building import ParameterGenerator
 
 def set_seed(seed, torch_deterministic=True):
     random.seed(seed)
@@ -97,14 +95,15 @@ def load_and_evaluate_model(
 def run_ppo(
     env_id: str = "LunarLander",
     env_is_discrete: bool = False,
-    num_envs: int = 4,
+    num_envs: int = 6,
+    convex: bool = False,
     scalar_reward: bool = False,
     total_timesteps: int = 5000000,
     num_rollout_steps: int = 2048,
     update_epochs: int = 10,
     num_minibatches: int = 256,
     learning_rate: float = 0.0003,
-    gamma: float = 0.99,
+    gamma: float = 0.995,
     gae_lambda: float = 0.95,
     surrogate_clip_threshold: float = 0.2,
     entropy_loss_coefficient: float = 0.01,
@@ -185,59 +184,54 @@ def run_ppo(
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device("cpu")
 
-    # Create environments
-    # if env_id == "LunarLander":
-    #     envs = 
-    # elif env_id == "BipedalWalker":
-    #     envs = SyncVectorEnv(
-    #     [
-    #         lambda:
-    #             gym.wrappers.TimeLimit(
-    #                 BipedalWalker(scalar_reward=scalar_reward, render_mode="rgb_array"), 
-    #                 max_episode_steps = 1600
-    #             )
-            
-    #     ]*num_envs,
-    #     reward_size = 1 if scalar_reward else 7
-    #     )
-    # elif env_id == "Crafter":
-    #     envs = SyncVectorEnv(
-    #     [
-    #         lambda:
-    #             gym.wrappers.TimeLimit(
-    #                 CrafterEnv(scalar_reward=scalar_reward, render_mode="rgb_array"), 
-    #                 max_episode_steps = 10000
-    #             )
-            
-    #     ]*num_envs,
-    #     reward_size = 1 if scalar_reward else 39
-    #     )
-    # else:
-    #     raise "ENV NOT FOUND"
-    # envs = RecordEpisodeStatistics(envs)
-
-    envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-        lambda: mo_gym.make(env_id) for _ in range(num_envs)
-    )
+    if env_id == "building":
+        # Special case for BuildingEnv_9d
+        envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+            lambda: BuildingEnv_9d(ParameterGenerator(Building='OfficeLarge', Weather='Warm_Marine', Location='ElPaso')) 
+            for _ in range(num_envs)
+        )
+    else:
+        envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+            lambda: mo_gym.make(env_id) for _ in range(num_envs)
+        )
     envs = mo_gym.wrappers.vector.MORecordEpisodeStatistics(envs)
 
     print(exp_name, scalar_reward, envs.rewards_shape)
+    
 
 
     # envs = gym.wrappers.vector.RescaleObservation(envs, min_obs = -1, max_obs = 1)
 # Set up agent
+    
+    if scalar_reward:
+        reward_size = 1
+    else:
+        reward_size = envs.rewards_shape[-1]
     agent_class = (
-        partial(DiscreteAgent, reward_size = envs.rewards_shape[-1])
+        partial(DiscreteAgent, reward_size = reward_size)
         if env_is_discrete
-        else partial(ContinuousAgent, rpo_alpha=rpo_alpha, reward_size = envs.rewards_shape[-1])
+        else partial(ContinuousAgent, rpo_alpha=rpo_alpha, reward_size = reward_size)
     )
 
     if "mario" in env_id or "rgb" in env_id:
-        agent_class = partial(CNNDiscreteAgent, reward_size = envs.rewards_shape[-1])
+        agent_class = partial(CNNDiscreteAgent, reward_size = reward_size)
 
     agent = agent_class(envs).to(device)
 
-    optimizer = optim.Adam(agent.parameters(), lr=learning_rate, eps=1e-5)
+    optimizer = torch.optim.Adam([
+        { "params": agent.actor.parameters(),  "lr": learning_rate },
+        { "params": agent.critic.parameters(), "lr": learning_rate },
+    ], eps=1e-5)
+    
+    optimizer = [
+        torch.optim.Adam(
+            agent.actor.parameters(), lr=learning_rate, eps=1e-5
+        ),
+        torch.optim.Adam(
+            agent.critic.parameters(), lr=learning_rate, eps=1e-5
+        )
+    ]
+
 
     logger = PPOLogger(run_name, use_tensorboard, reward_size = envs.rewards_shape[-1])
     ppo = PPO(
@@ -263,7 +257,9 @@ def run_ppo(
         envs=envs,
         env_is_discrete=env_is_discrete,
         seed=seed,
-        logger=logger
+        logger=logger,
+        convex=convex,
+        scalar_reward=scalar_reward,
     )
     print(ppo.agent)
     # Train the agent
@@ -273,6 +269,37 @@ def run_ppo(
         if not os.path.exists(f"runs/{run_name}"):
             os.mkdir(f"runs/{run_name}")
         model_path = f"runs/{run_name}/{exp_name}.rl_model"
+        hparams_path = f"runs/{run_name}/hparams.json"
+        
+        # Write hyperparameters to JSON from this function definition
+        hparams_to_json = {
+            "env_id": env_id,
+            "env_is_discrete": env_is_discrete,
+            "num_envs": num_envs,
+            "convex": convex,
+            "scalar_reward": scalar_reward,
+            "total_timesteps": total_timesteps,
+            "num_rollout_steps": num_rollout_steps,
+            "update_epochs": update_epochs,
+            "num_minibatches": num_minibatches,
+            "learning_rate": learning_rate,
+            "gamma": gamma,
+            "gae_lambda": gae_lambda,
+            "surrogate_clip_threshold": surrogate_clip_threshold,
+            "entropy_loss_coefficient": entropy_loss_coefficient,
+            "value_function_loss_coefficient": value_function_loss_coefficient,
+            "policy_gradient_loss_coefficient": policy_gradient_loss_coefficient,
+            "normalize_advantages": normalize_advantages,
+            "clip_value_function_loss": clip_value_function_loss,
+            "max_grad_norm": max_grad_norm,
+            "target_kl": target_kl,
+            "anneal_lr": anneal_lr,
+            "rpo_alpha": rpo_alpha,
+            "seed": seed,
+        }
+        # Write above hparams_to_json hyperparameters to JSON file
+        with open(hparams_path, "w") as f:
+            f.write(str(hparams_to_json))
         torch.save(trained_agent.state_dict(), model_path)
         print(f"Model saved to {model_path}")
 

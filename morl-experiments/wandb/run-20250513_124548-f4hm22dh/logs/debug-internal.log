@@ -1,0 +1,24 @@
+{"time":"2025-05-13T12:45:48.779694912-04:00","level":"INFO","msg":"stream: starting","core version":"0.19.10","symlink path":"/scratch1/tsa5252/reward-decomposition/morl-experiments/wandb/run-20250513_124548-f4hm22dh/logs/debug-core.log"}
+{"time":"2025-05-13T12:45:49.103476037-04:00","level":"INFO","msg":"created new stream","id":"f4hm22dh"}
+{"time":"2025-05-13T12:45:49.103578332-04:00","level":"INFO","msg":"stream: started","id":"f4hm22dh"}
+{"time":"2025-05-13T12:45:49.103791849-04:00","level":"INFO","msg":"writer: Do: started","stream_id":"f4hm22dh"}
+{"time":"2025-05-13T12:45:49.103868-04:00","level":"INFO","msg":"sender: started","stream_id":"f4hm22dh"}
+{"time":"2025-05-13T12:45:49.103923088-04:00","level":"INFO","msg":"handler: started","stream_id":"f4hm22dh"}
+{"time":"2025-05-13T12:45:49.442893056-04:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-05-13T12:45:49.443421872-04:00","level":"ERROR","msg":"git repo not found","error":"repository does not exist"}
+{"time":"2025-05-13T14:27:49.822554233-04:00","level":"INFO","msg":"api: retrying HTTP error","status":502,"url":"https://api.wandb.ai/files/tanmay-ambadkar-penn-state/MORL-Baselines/f4hm22dh/file_stream","body":"\n<html><head>\n<meta http-equiv=\"content-type\" content=\"text/html;charset=utf-8\">\n<title>502 Server Error</title>\n</head>\n<body text=#000000 bgcolor=#ffffff>\n<h1>Error: Server Error</h1>\n<h2>The server encountered a temporary error and could not complete your request.<p>Please try again in 30 seconds.</h2>\n<h2></h2>\n</body></html>\n"}
+{"time":"2025-05-13T22:46:50.163252612-04:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/graphql\": context deadline exceeded"}
+{"time":"2025-05-13T22:47:22.29982772-04:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/graphql\": net/http: request canceled (Client.Timeout exceeded while awaiting headers)"}
+{"time":"2025-05-13T22:47:56.984661742-04:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/graphql\": context deadline exceeded"}
+{"time":"2025-05-13T22:48:28.80985537-04:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/files/tanmay-ambadkar-penn-state/MORL-Baselines/f4hm22dh/file_stream\": dial tcp 35.186.228.49:443: connect: connection timed out"}
+{"time":"2025-05-13T22:48:36.381305273-04:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/graphql\": context deadline exceeded"}
+{"time":"2025-05-13T22:49:22.853812244-04:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/graphql\": context deadline exceeded"}
+{"time":"2025-05-14T03:32:31.93431873-04:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-05-14T03:32:31.934451391-04:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-05-14T03:32:32.939145967-04:00","level":"INFO","msg":"handler: operation stats","stats":{"operations":[{"desc":"uploading artifact run-f4hm22dh-evalfront","runtime_seconds":1.01749001}],"total_operations":1}}
+{"time":"2025-05-14T03:32:33.28608785-04:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-05-14T03:32:33.431511189-04:00","level":"INFO","msg":"stream: closing","id":"f4hm22dh"}
+{"time":"2025-05-14T03:32:33.43155944-04:00","level":"INFO","msg":"handler: closed","stream_id":"f4hm22dh"}
+{"time":"2025-05-14T03:32:33.43157725-04:00","level":"INFO","msg":"writer: Close: closed","stream_id":"f4hm22dh"}
+{"time":"2025-05-14T03:32:33.43168753-04:00","level":"INFO","msg":"sender: closed","stream_id":"f4hm22dh"}
+{"time":"2025-05-14T03:32:33.431752025-04:00","level":"INFO","msg":"stream: closed","id":"f4hm22dh"}

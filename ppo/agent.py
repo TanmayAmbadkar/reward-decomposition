@@ -117,7 +117,7 @@ class DiscreteAgent(BaseAgent):
         if self.weight_vec_size == 0:
             observation = observation
         elif weights is None:
-            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size))])
+            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size)).to(device)])
         else:
             observation =  torch.hstack([observation, weights])
 
@@ -180,6 +180,7 @@ class DiscreteAgent(BaseAgent):
 
         if deterministic:
             action = action_dist.logits.argmax(dim=1)
+            # print(action)
         else:
             action = action_dist.sample()
         # action = torch.clamp(action, torch.Tensor(self.action_space_low).to(action.device), torch.Tensor(self.action_space_high).to(action.device))
@@ -229,6 +230,13 @@ class ContinuousAgent(BaseAgent):
         self.actor_logstd = nn.Parameter(
             torch.zeros(1, np.prod(action_space))
         )
+        
+        # 3) now make a *container* module and stick both parts on it
+        self.actor = nn.Module()           # empty container
+        # register the mean‐net as a submodule
+        self.actor.add_module('mean', self.actor_mean)
+        # register the logstd parameter
+        self.actor.register_parameter('logstd', self.actor_logstd)
         self.shield = shield
         
         try:

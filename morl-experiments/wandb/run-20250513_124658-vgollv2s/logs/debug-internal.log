@@ -1,0 +1,14 @@
+{"time":"2025-05-13T12:46:58.823735907-04:00","level":"INFO","msg":"stream: starting","core version":"0.19.10","symlink path":"/scratch1/tsa5252/reward-decomposition/morl-experiments/wandb/run-20250513_124658-vgollv2s/logs/debug-core.log"}
+{"time":"2025-05-13T12:46:59.17471638-04:00","level":"INFO","msg":"created new stream","id":"vgollv2s"}
+{"time":"2025-05-13T12:46:59.174824416-04:00","level":"INFO","msg":"stream: started","id":"vgollv2s"}
+{"time":"2025-05-13T12:46:59.174978387-04:00","level":"INFO","msg":"writer: Do: started","stream_id":"vgollv2s"}
+{"time":"2025-05-13T12:46:59.175098524-04:00","level":"INFO","msg":"handler: started","stream_id":"vgollv2s"}
+{"time":"2025-05-13T12:46:59.175215889-04:00","level":"INFO","msg":"sender: started","stream_id":"vgollv2s"}
+{"time":"2025-05-13T12:46:59.402905668-04:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-05-13T12:46:59.403461934-04:00","level":"ERROR","msg":"git repo not found","error":"repository does not exist"}
+{"time":"2025-05-13T22:47:00.167900686-04:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/graphql\": net/http: request canceled (Client.Timeout exceeded while awaiting headers)"}
+{"time":"2025-05-13T22:47:32.367739603-04:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/graphql\": net/http: request canceled (Client.Timeout exceeded while awaiting headers)"}
+{"time":"2025-05-13T22:48:06.943804004-04:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/graphql\": context deadline exceeded"}
+{"time":"2025-05-13T22:48:37.001866623-04:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/files/tanmay-ambadkar-penn-state/MORL-Baselines/vgollv2s/file_stream\": dial tcp 35.186.228.49:443: connect: connection timed out"}
+{"time":"2025-05-13T22:48:45.212434061-04:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/graphql\": context deadline exceeded"}
+{"time":"2025-05-13T22:49:33.917820927-04:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/graphql\": context deadline exceeded"}
