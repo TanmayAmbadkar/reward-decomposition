@@ -3,7 +3,8 @@
     "continuous": true,
     "reward_size": 2,
     "reward_labels": ["X Velocity", "Energy"],
-    "model_path": "runs/mo-humanoid-v5__main_ppo__2025-06-06 19:32:43.235277__1/",
-    "initial_weights": [1, 0]
+    "model_path": "runs/mo-hopper-2obj-v5__main_ppo__2025-07-08 14:37:48.219578__1/",
+    "initial_weights": [1, 0],
+    "normalize_observations": true
   }
   

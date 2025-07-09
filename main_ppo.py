@@ -18,6 +18,8 @@ from envs.utils import SyncVectorEnv, RecordEpisodeStatistics
 import mo_gymnasium as mo_gym
 from envs.building_env import BuildingEnv_9d
 from envs.utils_building import ParameterGenerator
+from gymnasium.wrappers.vector import NormalizeObservation
+import pickle
 
 def set_seed(seed, torch_deterministic=True):
     random.seed(seed)
@@ -44,11 +46,11 @@ def load_and_evaluate_model(
     eval_envs = envs
 
     # if not env_is_discrete:
-    #     # Update normalization stats for continuous environments
-    #     avg_rms_obj = (
-    #         np.mean([envs.get_obs_norm_rms_obj(i) for i in range(num_envs)]) / num_envs
-    #     )
-    #     eval_envs.set_obs_norm_rms_obj(avg_rms_obj)
+        # Update normalization stats for continuous environments
+    avg_rms_obj = (
+        np.mean([envs.get_obs_norm_rms_obj(i) for i in range(num_envs)]) / num_envs
+    )
+    eval_envs.set_obs_norm_rms_obj(avg_rms_obj)
 
     eval_agent = agent_class(eval_envs).to(device)
     eval_agent.load_state_dict(torch.load(model_path, map_location=device))
@@ -95,21 +97,22 @@ def load_and_evaluate_model(
 def run_ppo(
     env_id: str = "LunarLander",
     env_is_discrete: bool = False,
-    num_envs: int = 6,
+    num_envs: int = 4,
     convex: bool = False,
     scalar_reward: bool = False,
     total_timesteps: int = 5000000,
-    num_rollout_steps: int = 2048,
+    num_rollout_steps: int = 512,
     update_epochs: int = 10,
-    num_minibatches: int = 256,
-    learning_rate: float = 0.0003,
+    num_minibatches: int = 32,
+    learning_rate: float = 0.00005,
     gamma: float = 0.995,
     gae_lambda: float = 0.95,
     surrogate_clip_threshold: float = 0.2,
-    entropy_loss_coefficient: float = 0.01,
-    policy_gradient_loss_coefficient: float = 2.0,
-    value_function_loss_coefficient: float = 0.1,
+    entropy_loss_coefficient: float = 0.00,
+    policy_gradient_loss_coefficient: float = 1.0,
+    value_function_loss_coefficient: float = 0.5,
     normalize_advantages: bool = True,
+    normalize_observations: bool = True,
     clip_value_function_loss: bool = False,
     max_grad_norm: float = 0.5,
     target_kl: float = None,
@@ -192,11 +195,14 @@ def run_ppo(
         )
     else:
         envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            lambda: mo_gym.make(env_id) for _ in range(num_envs)
+            lambda: gym.wrappers.RecordVideo(mo_gym.make(env_id, render_mode = "rgb_array"), f"runs/{run_name}/videos") for _ in range(num_envs)
         )
+    if normalize_observations:
+        envs = NormalizeObservation(envs)
     envs = mo_gym.wrappers.vector.MORecordEpisodeStatistics(envs)
 
     print(exp_name, scalar_reward, envs.rewards_shape)
+    print(envs.observation_space, envs.action_space)
     
 
 
@@ -270,6 +276,9 @@ def run_ppo(
             os.mkdir(f"runs/{run_name}")
         model_path = f"runs/{run_name}/{exp_name}.rl_model"
         hparams_path = f"runs/{run_name}/hparams.json"
+        if normalize_observations:
+            stats_path = f"runs/{run_name}/norm_stats.pkl"
+            pickle.dump(envs.env.obs_rms, open(stats_path, "wb")) 
         
         # Write hyperparameters to JSON from this function definition
         hparams_to_json = {

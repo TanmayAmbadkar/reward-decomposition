@@ -92,21 +92,21 @@ class DiscreteAgent(BaseAgent):
 
         self.critic = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 64)
+                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 256)
             ),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, reward_size), std=1.0),
+            layer_init(nn.Linear(256, reward_size), std=1.0),
         )
         self.actor = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 64)
+                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 256)
             ),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, action_space), std=0.01),
+            layer_init(nn.Linear(256, action_space), std=0.01),
         )
 
     def estimate_value_from_observation(self, observation, weights = None, device = "cpu"):
@@ -183,7 +183,6 @@ class DiscreteAgent(BaseAgent):
             # print(action)
         else:
             action = action_dist.sample()
-        # action = torch.clamp(action, torch.Tensor(self.action_space_low).to(action.device), torch.Tensor(self.action_space_high).to(action.device))
         return action.cpu().numpy(), self.estimate_value_from_observation(obs_critic, weight, device).cpu().numpy()
 
 
@@ -210,16 +209,12 @@ class ContinuousAgent(BaseAgent):
             nn.Tanh(),
             layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.Tanh(),
             layer_init(nn.Linear(256, self.reward_size), std=1.0),
         )
         self.actor_mean = nn.Sequential(
             layer_init(
                 nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 256)
             ),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
             layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
@@ -292,7 +287,6 @@ class ContinuousAgent(BaseAgent):
             action = action_dist.rsample()
         if self.shield is not None:
             action = self.shield(observation, action)
-        # action = torch.clamp(action, torch.Tensor(self.action_space_low).to(action.device), torch.Tensor(self.action_space_high).to(action.device))
         return action.cpu().numpy(), self.estimate_value_from_observation(obs_critic, weight, device).cpu().numpy()
 
 
@@ -316,7 +310,7 @@ class ContinuousAgent(BaseAgent):
             action = action_dist.rsample()
         if self.shield is not None:
             action = self.shield(observations, action)
-        # action = torch.clamp(action, torch.Tensor(self.action_space_low).to(action.device), torch.Tensor(self.action_space_high).to(action.device))
+        # print(torch.round(action, decimals = 2))
         log_prob = action_dist.log_prob(action).sum(1)
         return action, log_prob
 
@@ -428,7 +422,6 @@ class CNNDiscreteAgent(BaseAgent):
             action = torch.argmax(action_dist.logits, dim = 1)
         else:
             action = action_dist.rsample()
-        # action = torch.clamp(action, torch.Tensor(self.action_space_low).to(action.device), torch.Tensor(self.action_space_high).to(action.device))
         return action.cpu().numpy().astype(int).tolist(), self.estimate_value_from_observation(observation, weight).cpu().numpy()
 
 

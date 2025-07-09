@@ -39,6 +39,7 @@ REWARD_SIZE    = cfg['reward_size']     # int
 REWARD_LABELS  = cfg['reward_labels']   # list of strings, len == REWARD_SIZE
 MODEL_PATH     = cfg['model_path']      # str
 INITIAL_WEIGHTS = cfg.get('initial_weights', [1.0]*REWARD_SIZE)
+NORMALIZE_OBSERVATIONS = cfg.get('normalize_observations', True)
 # Will hold our TensorBoard subprocess handle
 TB_PROCESS = None
 
@@ -62,6 +63,9 @@ recording_lock          = threading.Lock()
 # --- Initialize the agent ---
 # Vectorized environment for inference
 env_agent = mo_gym.make(ENV_NAME, render_mode="rgb_array")
+if NORMALIZE_OBSERVATIONS:
+    pass
+
 AgentClass = ContinuousAgent if CONTINUOUS else DiscreteAgent
 eval_agent = AgentClass(env_agent, reward_size=REWARD_SIZE).to("cpu")
 eval_agent.load_state_dict(torch.load(MODEL_PATH + "main_ppo.rl_model"))
@@ -85,50 +89,6 @@ def update_weights():
     except Exception as e:
         return jsonify(status="error", message=str(e)), 400
     
-    
-def simulation_generator():
-    """Generator that steps through the simulation, accumulates weighted rewards,
-    resets the accumulator at the start of each episode, and yields rendered frames."""
-    global weights, current_episode_reward
-    while True:
-        # Reset the accumulated reward at the start of each episode.
-        with episode_reward_lock:
-            current_episode_reward = [np.zeros(REWARD_SIZE), ]
-        done = False
-        trunc = False
-        obs, _ = env_render.reset()
-        while not (done or trunc):
-            with weights_lock:
-                current_weights = np.copy(weights)
-            # Agent expects a batch; use the first action.
-            action, _ = eval_agent.predict(obs, current_weights, deterministic=True, device = "cpu")
-            obs, rew, done, trunc, infos = env_render.step(action[0])
-            # Compute the weighted reward for this step.
-            step_reward = current_weights * rew
-            with episode_reward_lock:
-                current_episode_reward.append(step_reward)
-            frame = env_render.render()
-            yield frame
-            time.sleep(0.03)
-
-def frame_gen(generator_func, *args, **kwargs):
-    """Encodes frames from the generator as PNG and yields them in a multipart response."""
-    get_frame = generator_func(*args, **kwargs)
-    while True:
-        frame = next(get_frame, None)
-        if frame is None:
-            continue
-        ret, png = cv2.imencode('.png', frame)
-        if not ret:
-            continue
-        frame_bytes = png.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/png\r\n\r\n' + frame_bytes + b'\r\n')
-
-@app.route('/render_feed')
-def render_feed():
-    return Response(frame_gen(simulation_generator),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 def generate_plot():
     with episode_reward_lock:
@@ -143,11 +103,6 @@ def generate_plot():
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
-
-@app.route('/plot_feed')
-def plot_feed():
-    png = generate_plot()
-    return Response(png, mimetype='image/png')
 
 def reward_plot_gen():
     """Generator that continuously yields updated reward plot frames."""
@@ -236,6 +191,7 @@ def play():
 
                 time.sleep(0.02)
                 obs = next_obs
+            print(done, trunc, next_obs, obs)
                 
         except Exception as e:
             print("Error during simulation:", traceback.format_exc())
