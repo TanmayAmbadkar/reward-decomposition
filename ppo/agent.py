@@ -73,6 +73,9 @@ class BaseAgent(nn.Module, ABC):
             - The entropy of the action distribution
         """
         pass
+    
+    def forward():
+        pass
 
 
 class DiscreteAgent(BaseAgent):
@@ -92,21 +95,21 @@ class DiscreteAgent(BaseAgent):
 
         self.critic = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 256)
+                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 64)
             ),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, reward_size), std=1.0),
+            layer_init(nn.Linear(64, reward_size), std=1.0),
         )
         self.actor = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 256)
+                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 64)
             ),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, action_space), std=0.01),
+            layer_init(nn.Linear(64, action_space), std=0.01),
         )
 
     def estimate_value_from_observation(self, observation, weights = None, device = "cpu"):
@@ -188,14 +191,12 @@ class DiscreteAgent(BaseAgent):
 
 
 class ContinuousAgent(BaseAgent):
-    def __init__(self, envs, rpo_alpha=None, reward_size = 1, shield = None):
+    def __init__(self, envs, rpo_alpha=None, reward_size = 1):
         super().__init__()
         self.rpo_alpha = rpo_alpha
         self.reward_size = reward_size
         self.weight_vec_size = 0 if reward_size == 1 else reward_size
-        # self.critic = CriticFiLM(np.array(envs.single_observation_space.shape).prod(), self.weight_vec_size, reward_size)
-        # self.actor_mean = ActorFiLM(np.array(envs.single_observation_space.shape).prod(), self.weight_vec_size,  np.prod(envs.single_action_space.shape))
-        
+
         try:
             action_space = envs.single_action_space.shape
             observation_space = envs.single_observation_space.shape
@@ -204,26 +205,26 @@ class ContinuousAgent(BaseAgent):
             observation_space = envs.observation_space.shape
         self.critic = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(observation_space).prod()+ self.weight_vec_size, 256)
+                nn.Linear(np.array(observation_space).prod()+ self.weight_vec_size, 64)
             ),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, self.reward_size), std=1.0),
+            layer_init(nn.Linear(64, self.reward_size), std=1.0),
         )
         self.actor_mean = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 256)
+                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 64)
             ),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
             layer_init(
-                nn.Linear(256, np.prod(action_space)), std=0.01
+                nn.Linear(64, np.prod(action_space)), std=0.01
             ),
         )
         self.actor_logstd = nn.Parameter(
-            torch.zeros(1, np.prod(action_space))
+            -torch.ones(1, np.prod(action_space))
         )
         
         # 3) now make a *container* module and stick both parts on it
@@ -232,7 +233,6 @@ class ContinuousAgent(BaseAgent):
         self.actor.add_module('mean', self.actor_mean)
         # register the logstd parameter
         self.actor.register_parameter('logstd', self.actor_logstd)
-        self.shield = shield
         
         try:
             self.action_space_low = envs.single_action_space.low
@@ -282,11 +282,9 @@ class ContinuousAgent(BaseAgent):
         action_dist = self.get_action_distribution(observation)
 
         if deterministic:
-            action = action_dist.mean
+            action = action_dist.mode
         else:
             action = action_dist.rsample()
-        if self.shield is not None:
-            action = self.shield(observation, action)
         return action.cpu().numpy(), self.estimate_value_from_observation(obs_critic, weight, device).cpu().numpy()
 
 
@@ -305,11 +303,9 @@ class ContinuousAgent(BaseAgent):
         action_dist = self.get_action_distribution(observations)
 
         if deterministic:
-            action = action_dist.mean
+            action = action_dist.mode
         else:
             action = action_dist.rsample()
-        if self.shield is not None:
-            action = self.shield(observations, action)
         # print(torch.round(action, decimals = 2))
         log_prob = action_dist.log_prob(action).sum(1)
         return action, log_prob
@@ -342,6 +338,12 @@ class ContinuousAgent(BaseAgent):
         entropy = action_dist.entropy().sum(1)
         return log_prob, entropy
     
+    def forward(self, observation):
+        """
+        Forward pass through the agent to get action and value.
+        """
+        action, value = self.predict(observation[:, :-self.reward_size], observation[:, -self.reward_size:], deterministic=False, device="cpu")
+        return action, value
 
 
 class CNNDiscreteAgent(BaseAgent):

@@ -19,7 +19,11 @@ import mo_gymnasium as mo_gym
 from envs.building_env import BuildingEnv_9d
 from envs.utils_building import ParameterGenerator
 from gymnasium.wrappers.vector import NormalizeObservation
+from ppo.utils import RunningMeanStd
 import pickle
+import json
+from morl_baselines.common.pareto import ParetoArchive
+
 
 def set_seed(seed, torch_deterministic=True):
     random.seed(seed)
@@ -33,6 +37,7 @@ def load_and_evaluate_model(
     run_name,
     env_id,
     env_is_discrete,
+    normalize_observations,
     envs,
     num_envs,
     agent_class,
@@ -47,10 +52,13 @@ def load_and_evaluate_model(
 
     # if not env_is_discrete:
         # Update normalization stats for continuous environments
-    avg_rms_obj = (
-        np.mean([envs.get_obs_norm_rms_obj(i) for i in range(num_envs)]) / num_envs
-    )
-    eval_envs.set_obs_norm_rms_obj(avg_rms_obj)
+    
+    # if normalize_observations:
+        
+    #     avg_rms_obj = (
+    #         np.mean([envs.env.obs_rms(i) for i in range(num_envs)]) / num_envs
+    #     )
+    #     eval_envs.set_obs_norm_rms_obj(avg_rms_obj)
 
     eval_agent = agent_class(eval_envs).to(device)
     eval_agent.load_state_dict(torch.load(model_path, map_location=device))
@@ -93,26 +101,30 @@ def load_and_evaluate_model(
             if len(frames_per_env[i]) > 0:
                 imageio.mimsave(gif_name, frames_per_env[i], fps=30)
                 print(f"Saved GIF for env {i}: {gif_name}")
+                
+
 @script
 def run_ppo(
     env_id: str = "LunarLander",
     env_is_discrete: bool = False,
     num_envs: int = 4,
-    convex: bool = False,
+    convex: bool = True,
     scalar_reward: bool = False,
     total_timesteps: int = 5000000,
     num_rollout_steps: int = 512,
     update_epochs: int = 10,
     num_minibatches: int = 32,
-    learning_rate: float = 0.00005,
+    learning_rate: float = 0.0003,
     gamma: float = 0.995,
+    eval_gamma: float = 0.99,
     gae_lambda: float = 0.95,
     surrogate_clip_threshold: float = 0.2,
-    entropy_loss_coefficient: float = 0.00,
+    entropy_loss_coefficient: float = 0.0000,
     policy_gradient_loss_coefficient: float = 1.0,
     value_function_loss_coefficient: float = 0.5,
     normalize_advantages: bool = True,
-    normalize_observations: bool = True,
+    normalize_observations: bool = False,
+    normalize_rewards: bool = True,
     clip_value_function_loss: bool = False,
     max_grad_norm: float = 0.5,
     target_kl: float = None,
@@ -195,11 +207,11 @@ def run_ppo(
         )
     else:
         envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            lambda: gym.wrappers.RecordVideo(mo_gym.make(env_id, render_mode = "rgb_array"), f"runs/{run_name}/videos") for _ in range(num_envs)
+            lambda: gym.wrappers.RecordVideo(mo_gym.make(env_id, render_mode = "rgb_array", max_episode_steps=500), f"runs/{run_name}/videos") for _ in range(num_envs)
         )
     if normalize_observations:
         envs = NormalizeObservation(envs)
-    envs = mo_gym.wrappers.vector.MORecordEpisodeStatistics(envs)
+    envs = mo_gym.wrappers.vector.MORecordEpisodeStatistics(envs, gamma=eval_gamma)
 
     print(exp_name, scalar_reward, envs.rewards_shape)
     print(envs.observation_space, envs.action_space)
@@ -238,8 +250,13 @@ def run_ppo(
         )
     ]
 
+    if normalize_rewards:
+        # Initialize a RunningMeanStd object for reward normalization
+        reward_rms = RunningMeanStd(reward_size)
 
     logger = PPOLogger(run_name, use_tensorboard, reward_size = envs.rewards_shape[-1])
+    
+    pareto_archive = ParetoArchive()
     ppo = PPO(
         agent=agent,
         reward_size = envs.rewards_shape[-1],
@@ -257,6 +274,7 @@ def run_ppo(
         update_epochs=update_epochs,
         num_minibatches=num_minibatches,
         normalize_advantages=normalize_advantages,
+        reward_rms=reward_rms if normalize_rewards else None,
         clip_value_function_loss=clip_value_function_loss,
         target_kl=target_kl,
         anneal_lr=anneal_lr,
@@ -266,6 +284,7 @@ def run_ppo(
         logger=logger,
         convex=convex,
         scalar_reward=scalar_reward,
+        pareto_archive=pareto_archive
     )
     print(ppo.agent)
     # Train the agent
@@ -278,7 +297,10 @@ def run_ppo(
         hparams_path = f"runs/{run_name}/hparams.json"
         if normalize_observations:
             stats_path = f"runs/{run_name}/norm_stats.pkl"
-            pickle.dump(envs.env.obs_rms, open(stats_path, "wb")) 
+            pickle.dump(envs.env.obs_rms, open(stats_path, "wb"))
+            
+        with open(f"runs/{run_name}/pareto_archive.pkl", "wb") as f:
+            pickle.dump(ppo.pareto_archive, f)
         
         # Write hyperparameters to JSON from this function definition
         hparams_to_json = {
@@ -299,6 +321,8 @@ def run_ppo(
             "value_function_loss_coefficient": value_function_loss_coefficient,
             "policy_gradient_loss_coefficient": policy_gradient_loss_coefficient,
             "normalize_advantages": normalize_advantages,
+            "normalize_observations": normalize_observations,
+            "normalize_rewards": normalize_rewards,
             "clip_value_function_loss": clip_value_function_loss,
             "max_grad_norm": max_grad_norm,
             "target_kl": target_kl,
@@ -306,9 +330,8 @@ def run_ppo(
             "rpo_alpha": rpo_alpha,
             "seed": seed,
         }
-        # Write above hparams_to_json hyperparameters to JSON file
         with open(hparams_path, "w") as f:
-            f.write(str(hparams_to_json))
+            json.dump(hparams_to_json, f, indent = 4)
         torch.save(trained_agent.state_dict(), model_path)
         print(f"Model saved to {model_path}")
 
@@ -316,6 +339,7 @@ def run_ppo(
             run_name,
             env_id,
             env_is_discrete,
+            normalize_observations,
             envs,
             num_envs,
             agent_class,

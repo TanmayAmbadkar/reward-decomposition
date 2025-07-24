@@ -15,6 +15,7 @@ import base64
 import subprocess
 import traceback
 import envs
+import pickle
 
 # PPO agent classes
 from ppo.agent import DiscreteAgent, ContinuousAgent
@@ -25,8 +26,10 @@ TEMPLATE_PATH = os.path.join(DIR_PATH, 'templates/')
 
 # Parse command‐line for a config JSON
 parser = argparse.ArgumentParser()
-parser.add_argument('--config', required=True,
-                    help="Path to JSON config with env_name, continuous, reward_size, reward_labels, model_path")
+parser.add_argument('--config', required=False,
+                    help="Path to JSON config with env_name, continuous, reward_size, reward_labels, model_path", default='config.json')
+parser.add_argument('--port', type=int, default=5023, help="Port to run the Flask app on")
+parser.add_argument('--debug', action='store_true', help="Run Flask in debug mode")
 args = parser.parse_args()
 
 # Load config
@@ -39,7 +42,6 @@ REWARD_SIZE    = cfg['reward_size']     # int
 REWARD_LABELS  = cfg['reward_labels']   # list of strings, len == REWARD_SIZE
 MODEL_PATH     = cfg['model_path']      # str
 INITIAL_WEIGHTS = cfg.get('initial_weights', [1.0]*REWARD_SIZE)
-NORMALIZE_OBSERVATIONS = cfg.get('normalize_observations', True)
 # Will hold our TensorBoard subprocess handle
 TB_PROCESS = None
 
@@ -63,8 +65,15 @@ recording_lock          = threading.Lock()
 # --- Initialize the agent ---
 # Vectorized environment for inference
 env_agent = mo_gym.make(ENV_NAME, render_mode="rgb_array")
-if NORMALIZE_OBSERVATIONS:
-    pass
+
+try:
+    norm_stats = pickle.load(open(MODEL_PATH + "norm_stats.pkl", "rb"))
+    print(norm_stats)
+    mean = norm_stats.mean
+    std = np.sqrt(norm_stats.var)
+except:
+    mean = np.zeros(env_agent.observation_space.shape)
+    std = np.ones(env_agent.observation_space.shape)
 
 AgentClass = ContinuousAgent if CONTINUOUS else DiscreteAgent
 eval_agent = AgentClass(env_agent, reward_size=REWARD_SIZE).to("cpu")
@@ -162,6 +171,7 @@ def play():
             while not (done or trunc):
                 with weights_lock:
                     w = weights.copy()
+                obs = (obs - mean)/(std + 1e-8)
                 action, value = eval_agent.predict(obs, w, deterministic=True, device="cpu")
                 next_obs, rew, done, trunc, _ = env_render.step(action[0])
                 ret, png = cv2.imencode('.png', env_render.render())
@@ -380,4 +390,4 @@ def launch_tensorboard():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5023, debug=False)
+    app.run(host='0.0.0.0', port=args.port, debug=args.debug)

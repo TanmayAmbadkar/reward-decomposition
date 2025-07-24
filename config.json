@@ -1,10 +1,10 @@
 {
-    "env_name": "mo-humanoid-v5",
+    "env_name": "mo-hopper-2obj-v5",
     "continuous": true,
     "reward_size": 2,
-    "reward_labels": ["X Velocity", "Energy"],
-    "model_path": "runs/mo-hopper-2obj-v5__main_ppo__2025-07-08 14:37:48.219578__1/",
-    "initial_weights": [1, 0],
-    "normalize_observations": true
-  }
+    "reward_labels": ["X Velocity", "Jump"],
+    "model_path": "runs/mo-hopper-2obj-v5__main_ppo__2025-07-21 12:55:25.882086__1222373/", 
+    "model__path": "mo-humanoid-v5__main_ppo__2025-07-21 20:19:12.825415__18980980",
+    "initial_weights": [1, 0]
+}
   
