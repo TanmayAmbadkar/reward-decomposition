@@ -5,3 +5,4 @@ morl-experiments/
 *.pkl
 *.png
 wandb/
+runs.tar.gz
