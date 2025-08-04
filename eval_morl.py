@@ -13,19 +13,19 @@ from envs.utils_building import ParameterGenerator
 
 from gymnasium.wrappers.vector import NormalizeObservation
 # Set up vectorized env
-env_id = "mo-humanoid-v5"  # or "mo-reacher-v5"
+env_id = "minecart-v0"  # or "mo-reacher-v5"
 num_envs = 16
-reward_size = 2
+reward_size = 3
 episodes_to_collect = 1024
 labels = [str(i) for i in range(reward_size)]  # Adjust based on the environment
-ref_point = np.array([-100, -100])  # Reference point for hypervolume calculation
-# ref_point = np.array([-1, -1, -200])  # Reference point for hypervolume calculation
+# ref_point = np.array([-100, -100])  # Reference point for hypervolume calculation
+ref_point = np.array([-1, -1, -200])  # Reference point for hypervolume calculation
 # ref_point = np.array([-101, -1001, -101, -101])  # Reference point for hypervolume calculation
 # ref_point = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0])  # Reference point for hypervolume calculation
-gamma = 0.99
+gamma = 1.0
 n_to_select = 1024
 
-model_path = "runs/mo-humanoid-v5__main_ppo__2025-07-24 17:49:00.935249__3563852/"
+model_path = "runs/minecart-v0__main_ppo__2025-07-29 20:17:27.535771__3563852/"
 
 if not os.path.exists(f"results/{env_id}"):
     os.makedirs(f"results/{env_id}", exist_ok=True)
@@ -38,7 +38,7 @@ if env_id == "building":
     )
 else:
     vec_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-        [lambda: mo_gym.make(env_id, max_episode_steps = 1000) for _ in range(num_envs)]
+        [lambda: mo_gym.make(env_id) for _ in range(num_envs)]
     )
 
 

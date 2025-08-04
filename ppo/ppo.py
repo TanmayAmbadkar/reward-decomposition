@@ -674,7 +674,7 @@ class PPO:
         """
         self.noise_level = 0.1
         self.lambda_diversity = 0.01
-        self.diversity_scale = 0.01
+        self.diversity_scale = 0.0
 
         batch_size = self.num_rollout_steps * self.num_envs
         assert collected_observations.shape[0] == batch_size

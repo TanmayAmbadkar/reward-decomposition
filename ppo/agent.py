@@ -205,22 +205,22 @@ class ContinuousAgent(BaseAgent):
             observation_space = envs.observation_space.shape
         self.critic = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(observation_space).prod()+ self.weight_vec_size, 64)
+                nn.Linear(np.array(observation_space).prod()+ self.weight_vec_size, 256)
             ),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, self.reward_size), std=1.0),
+            layer_init(nn.Linear(256, self.reward_size), std=1.0),
         )
         self.actor_mean = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 64)
+                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 256)
             ),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
             layer_init(
-                nn.Linear(64, np.prod(action_space)), std=0.01
+                nn.Linear(256, np.prod(action_space)), std=0.01
             ),
         )
         self.actor_logstd = nn.Parameter(

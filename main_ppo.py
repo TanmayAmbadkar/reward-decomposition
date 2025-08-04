@@ -111,7 +111,7 @@ def run_ppo(
     convex: bool = True,
     scalar_reward: bool = False,
     total_timesteps: int = 5000000,
-    num_rollout_steps: int = 512,
+    num_rollout_steps: int = 2048,
     update_epochs: int = 10,
     num_minibatches: int = 32,
     learning_rate: float = 0.0003,
@@ -123,7 +123,7 @@ def run_ppo(
     policy_gradient_loss_coefficient: float = 1.0,
     value_function_loss_coefficient: float = 0.5,
     normalize_advantages: bool = True,
-    normalize_observations: bool = False,
+    normalize_observations: bool = True,
     normalize_rewards: bool = True,
     clip_value_function_loss: bool = False,
     max_grad_norm: float = 0.5,
@@ -207,7 +207,7 @@ def run_ppo(
         )
     else:
         envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            lambda: gym.wrappers.RecordVideo(mo_gym.make(env_id, render_mode = "rgb_array", max_episode_steps=500), f"runs/{run_name}/videos") for _ in range(num_envs)
+            lambda: gym.wrappers.RecordVideo(mo_gym.make(env_id, render_mode = "rgb_array", max_episode_steps=1000), f"runs/{run_name}/videos") for _ in range(num_envs)
         )
     if normalize_observations:
         envs = NormalizeObservation(envs)

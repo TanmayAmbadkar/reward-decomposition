@@ -33,4 +33,4 @@ class RunningMeanStd:
     def normalize(self, x):
         # Clip the standard deviation to prevent division by zero
         std = np.sqrt(self.var).clip(min=1e-8)
-        return (x - self.mean) / std
+        return np.clip((x - self.mean) / std, -10, 10)
