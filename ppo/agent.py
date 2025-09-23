@@ -205,26 +205,26 @@ class ContinuousAgent(BaseAgent):
             observation_space = envs.observation_space.shape
         self.critic = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(observation_space).prod()+ self.weight_vec_size, 256)
+                nn.Linear(np.array(observation_space).prod()+ self.weight_vec_size, 64)
             ),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, self.reward_size), std=1.0),
+            layer_init(nn.Linear(64, self.reward_size), std=1.0),
         )
         self.actor_mean = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 256)
+                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 64)
             ),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
             layer_init(
-                nn.Linear(256, np.prod(action_space)), std=0.01
+                nn.Linear(64, np.prod(action_space)), std=0.01
             ),
         )
         self.actor_logstd = nn.Parameter(
-            -torch.ones(1, np.prod(action_space))
+            torch.zeros(1, np.prod(action_space))
         )
         
         # 3) now make a *container* module and stick both parts on it

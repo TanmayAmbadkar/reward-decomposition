@@ -1,10 +1,9 @@
 {
-    "env_name": "mo-hopper-2obj-v5",
+    "env_name": "mo-ant-v5",
     "continuous": true,
-    "reward_size": 2,
-    "reward_labels": ["X Velocity", "Jump"],
-    "model_path": "runs/mo-hopper-2obj-v5__main_ppo__2025-07-21 12:55:25.882086__1222373/", 
-    "model__path": "mo-humanoid-v5__main_ppo__2025-07-21 20:19:12.825415__18980980",
-    "initial_weights": [1, 0]
+    "reward_size": 3,
+    "reward_labels": ["X Velocity", "Y Velocity", "Energy"], 
+    "model_path": "runs/mo-ant-v5__main_ppo__2025-07-18 12:25:16.230781__10333/",
+    "initial_weights": [1, 0, 0]
 }
   

@@ -13,19 +13,20 @@ from envs.utils_building import ParameterGenerator
 
 from gymnasium.wrappers.vector import NormalizeObservation
 # Set up vectorized env
-env_id = "minecart-v0"  # or "mo-reacher-v5"
+# env_id = "minecart-v0"  # or "mo-reacher-v5"
+env_id = "mo-hopper-2obj-v5"  # or "mo-reacher-v5"
 num_envs = 16
-reward_size = 3
-episodes_to_collect = 1024
+reward_size = 2
+episodes_to_collect = 2048
 labels = [str(i) for i in range(reward_size)]  # Adjust based on the environment
-# ref_point = np.array([-100, -100])  # Reference point for hypervolume calculation
-ref_point = np.array([-1, -1, -200])  # Reference point for hypervolume calculation
+ref_point = np.array([-100, -100])  # Reference point for hypervolume calculation
+# ref_point = np.array([-1, -1, -200])  # Reference point for hypervolume calculation
 # ref_point = np.array([-101, -1001, -101, -101])  # Reference point for hypervolume calculation
 # ref_point = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0])  # Reference point for hypervolume calculation
-gamma = 1.0
-n_to_select = 1024
+gamma = 0.99
+n_to_select = 2048
 
-model_path = "runs/minecart-v0__main_ppo__2025-07-29 20:17:27.535771__3563852/"
+model_path = "runs/mo-hopper-2obj-v5__main_ppo__2025-09-23 12:54:43.726583__31/"
 
 if not os.path.exists(f"results/{env_id}"):
     os.makedirs(f"results/{env_id}", exist_ok=True)
@@ -38,7 +39,7 @@ if env_id == "building":
     )
 else:
     vec_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-        [lambda: mo_gym.make(env_id) for _ in range(num_envs)]
+        [lambda: mo_gym.make(env_id, max_episode_steps = 500) for _ in range(num_envs)]
     )
 
 
@@ -65,7 +66,7 @@ else:
     eval_agent = DiscreteAgent(env_temp, reward_size=reward_size).to("cpu")
     
 eval_agent.load_state_dict(torch.load(model_path + "main_ppo.rl_model"))
-eval_agent.eval()
+# eval_agent.eval()
 
 # Buffers
 rewards_list = []
@@ -203,7 +204,7 @@ mask = pareto_front(rewards_list)
 front = rewards_list[mask]
 dominated = rewards_list[~mask]
 # print(weights_list[mask])
-print(front)
+# print(front)
 print("Pareto front shape:", front.shape)
 
 # Hypervolume and sparsity
@@ -251,6 +252,8 @@ sprs = sparsity(front)
 print("Hypervolume of Pareto front:", hv)
 print("Sparsity of Pareto front:", sprs)
 print("Expected utility of Pareto front:", expected_utility(front, weights_list))
+
+print(np.max(front, axis=0))
 pickle.dump({
     "rewards": rewards_list,
     "weights": weights_list,

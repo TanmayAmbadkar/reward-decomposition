@@ -207,7 +207,7 @@ def run_ppo(
         )
     else:
         envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            lambda: gym.wrappers.RecordVideo(mo_gym.make(env_id, render_mode = "rgb_array", max_episode_steps=1000), f"runs/{run_name}/videos") for _ in range(num_envs)
+            lambda: gym.wrappers.RecordVideo(mo_gym.make(env_id, render_mode = "rgb_array"), f"runs/{run_name}/videos") for _ in range(num_envs)
         )
     if normalize_observations:
         envs = NormalizeObservation(envs)
