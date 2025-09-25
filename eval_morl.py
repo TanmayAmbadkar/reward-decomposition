@@ -26,7 +26,7 @@ ref_point = np.array([-100, -100])  # Reference point for hypervolume calculatio
 gamma = 0.99
 n_to_select = 2048
 
-model_path = "runs/mo-hopper-2obj-v5__main_ppo__2025-09-23 12:54:43.726583__31/"
+model_path = "runs/mo-hopper-2obj-v5__main_ppo__2025-09-24 20:45:49.095460__41/"
 
 if not os.path.exists(f"results/{env_id}"):
     os.makedirs(f"results/{env_id}", exist_ok=True)

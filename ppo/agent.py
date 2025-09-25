@@ -224,6 +224,7 @@ class ContinuousAgent(BaseAgent):
             ),
         )
         self.actor_logstd = nn.Parameter(
+            # torch.zeros(1, np.prod(action_space))
             torch.zeros(1, np.prod(action_space))
         )
         

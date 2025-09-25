@@ -673,8 +673,8 @@ class PPO:
         followed by a separate critic update.
         """
         self.noise_level = 0.1
-        self.lambda_diversity = 0.5
-        self.diversity_scale = 0.1
+        self.lambda_diversity = 0
+        self.diversity_scale = 0
 
         batch_size = self.num_rollout_steps * self.num_envs
         assert collected_observations.shape[0] == batch_size
@@ -732,6 +732,8 @@ class PPO:
                 # --- Actor Update with Diversity Loss ---
                 self.optimizer[0].zero_grad()
                 
+                # adv_mb = w_mb * adv_mb  # ENABLE TO REMOVE LSW
+                
                 # 1. Calculate the standard, weighted PPO policy loss (your current method)
                 if self.normalize_advantages:
                     adv_mb = (adv_mb - adv_mb.mean(dim=0)) / (adv_mb.std(dim=0) + 1e-8)
@@ -744,7 +746,7 @@ class PPO:
                     (new_logp - old_logp).exp().reshape(-1, 1)
                 )
                 
-                policy_losses = policy_losses * w_mb
+                policy_losses = policy_losses * w_mb # ENABLE FOR LSW
                 policy_losses = policy_losses.mean(dim = 0)  # Sum over the reward dimensions
 
                 # 2. Calculate the Diversity Penalty
