@@ -126,6 +126,7 @@ class PPO:
         logger=None,
         convex=False,
         scalar_reward = False,
+        negative = False,
         pareto_archive = ParetoArchive(),
     ):
         """
@@ -225,6 +226,7 @@ class PPO:
         self.beta = 0.9
         self.log_barrier_t = 20.0
         self.pareto_archive = pareto_archive
+        self.negative = negative
 
     def create_lr_scheduler(self, num_policy_updates):
         return LinearLRSchedule(self.optimizer, self.initial_lr, num_policy_updates)
@@ -269,6 +271,7 @@ class PPO:
         self._global_step = 0
 
         current_weights = None
+        current_negatives = None
         for update in range(num_policy_updates):
             if self.anneal_lr:
                 self.lr_scheduler.step()
@@ -285,7 +288,8 @@ class PPO:
                 is_next_observation_terminal,
                 is_next_observation_truncated,
                 current_weights,
-            ) = self.collect_rollouts(next_observation, is_next_observation_terminal, is_next_observation_truncated, current_weights)
+                current_negatives
+            ) = self.collect_rollouts(next_observation, is_next_observation_terminal, is_next_observation_truncated, current_weights, current_negatives)
 
             update_results = self.update_policy(
                 batch_observations,
@@ -327,7 +331,7 @@ class PPO:
         is_initial_observation_truncated = torch.zeros(self.num_envs).to(self.device)
         return initial_observation, is_initial_observation_terminal, is_initial_observation_truncated
 
-    def collect_rollouts(self, next_observation, is_next_observation_terminal, is_next_observation_truncated, current_weights):
+    def collect_rollouts(self, next_observation, is_next_observation_terminal, is_next_observation_truncated, current_weights, current_negatives):
         """
         Collect a set of rollout data by interacting with the environment. A rollout is a sequence of observations,
         actions, and rewards obtained by running the current policy in the environment. The collected data is crucial
@@ -384,9 +388,14 @@ class PPO:
                     weights = dist.sample((self.num_envs, )).type(torch.float32)
             else:
                 weights = torch.ones(self.num_envs, 1).to(self.device).type(torch.float32)
-               
+
+            negative = torch.ones_like(weights).to(self.device).type(torch.float32)                
+            if self.negative:
+                negative = 1 - 2*torch.bernoulli(torch.ones_like(weights) * 0.5).to(self.device).type(torch.float32)
+                weights = weights * negative
         else:
             weights = current_weights
+            negative = current_negatives
 
         for step in range(self.num_rollout_steps):
             # Store current observation
@@ -402,7 +411,11 @@ class PPO:
                     dist = Dirichlet(torch.ones(self.reward_size, device=self.device))
                     weights[change_weights] = dist.sample((sum(change_weights), )).type(torch.float32)
                 
-                
+                if self.negative:
+                    negative[change_weights] = 1 - 2*torch.bernoulli(torch.ones_like(weights[change_weights]) * 0.5).type(torch.float32)
+
+                    weights[change_weights] = weights[change_weights] * negative[change_weights]
+
             with torch.no_grad():
                 action, logprob = self.agent.sample_action_and_compute_log_prob(
                     next_observation, weights, deterministic=False,
@@ -421,8 +434,11 @@ class PPO:
             self._global_step += self.num_envs
             if self.scalar_reward:
                 rewards[step] = torch.sum(weights * torch.as_tensor(reward, device=self.device), dim=-1, keepdim=True)
+            
             else:
-                rewards[step] = torch.as_tensor(reward, device=self.device).reshape(self.num_envs, self.reward_size)
+                rewards[step] = negative * torch.as_tensor(reward, device=self.device).reshape(self.num_envs, self.reward_size)
+            # else?:
+                # rewards[step] = torch.as_tensor(reward, device=self.device).reshape(self.num_envs, self.reward_size)
                 
             # print(clipped_action, rewards[step])
             is_next_observation_terminal = terminations
@@ -507,7 +523,8 @@ class PPO:
             next_observation,
             is_next_observation_terminal,
             is_next_observation_truncated,
-            weights
+            weights,
+            negative
         )
 
     def _initialize_storage(self):
@@ -673,8 +690,8 @@ class PPO:
         followed by a separate critic update.
         """
         self.noise_level = 0.1
-        self.lambda_diversity = 0
-        self.diversity_scale = 0
+        self.lambda_diversity = 1.0
+        self.diversity_scale = 1.0
 
         batch_size = self.num_rollout_steps * self.num_envs
         assert collected_observations.shape[0] == batch_size
@@ -746,20 +763,36 @@ class PPO:
                     (new_logp - old_logp).exp().reshape(-1, 1)
                 )
                 
-                policy_losses = policy_losses * w_mb # ENABLE FOR LSW
+                policy_losses = policy_losses * torch.abs(w_mb) # ENABLE FOR LSW
                 policy_losses = policy_losses.mean(dim = 0)  # Sum over the reward dimensions
 
-                # 2. Calculate the Diversity Penalty
+               # 2. Calculate the Diversity Penalty
+
                 # a. Sample distractor weights on the fly
                 noise = torch.randn_like(w_mb) * self.noise_level
                 distractor_noisy = w_mb + noise
-                distractor_clipped = torch.clamp(distractor_noisy, min=0)
-                distractor_weights_mb = distractor_clipped / (torch.sum(distractor_clipped, dim=1, keepdim=True) + 1e-8)
+
+                # --- MODIFICATION START ---
+                # The original code with clamp and sum-normalization assumes a standard simplex (all positive weights).
+                # We replace it with L1 normalization to handle both positive and negative weights,
+                # ensuring the sum of absolute values of the distractor weights is 1.
+
+                l1_norm = torch.sum(torch.abs(distractor_noisy), dim=1, keepdim=True)
+                distractor_weights_mb = distractor_noisy / (l1_norm + 1e-8)
+
+                # --- MODIFICATION END ---
+
 
                 # b. Get action distributions
+                # The agent needs to be conditioned on the combined vector, which you are already doing.
+                # The 'get_action_distribution' method in your agent should handle this combined vector.
+                # Assuming you've concatenated obs and weights like this:
+                # current_action_dist = self.agent.get_action_distribution(torch.hstack([obs_mb, w_mb]))
+                # This part of your code seems to have a bug as it is not passing the weights to the agent.
                 current_action_dist = self.agent.get_action_distribution(torch.hstack([obs_mb, w_mb]))
                 with torch.no_grad():
                     distractor_action_dist = self.agent.get_action_distribution(torch.hstack([obs_mb, distractor_weights_mb]))
+                    # distractor_action_dist = self.agent.get_action_distribution(obs_mb, distractor_weights_mb)
 
                 # c. Calculate the actual KL divergence
                 actual_kl_divergence = torch.distributions.kl.kl_divergence(
@@ -768,18 +801,16 @@ class PPO:
 
                 # d. Calculate the TARGET KL divergence based on weight distance
                 with torch.no_grad():
-                    # Calculate the L1 distance between the preference vectors
+                    # The L1 distance calculation already works correctly with negative numbers. No changes needed here.
                     weight_distance = torch.abs(w_mb - distractor_weights_mb).sum(dim=1).mean()
-                    # Set the target KL. self.diversity_scale is a new hyperparameter (e.g., 0.5)
                     target_kl_divergence = self.diversity_scale * weight_distance
 
                 # 3. Construct the Final Loss
-                # The diversity loss is now the squared error between the actual and target KL.
-                # We want to MINIMIZE this error, so we ADD it to the loss.
+                # The loss construction is also correct as is.
                 diversity_loss = self.lambda_diversity * (target_kl_divergence - actual_kl_divergence).pow(2)
 
                 ent_loss = self.entropy_loss_coefficient * entropy.mean()
-                
+
                 total_actor_loss = sum(policy_losses) - ent_loss + diversity_loss
                 
                 # 4. Perform a single backward pass and step for the actor.

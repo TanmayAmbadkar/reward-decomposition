@@ -3,7 +3,7 @@
     "continuous": true,
     "reward_size": 3,
     "reward_labels": ["X Velocity", "Y Velocity", "Energy"], 
-    "model_path": "runs/mo-ant-v5__main_ppo__2025-07-18 12:25:16.230781__10333/",
+    "model_path": "runs/mo-ant-v5__main_ppo__2025-10-01 22:37:58.821879__36__negative/",
     "initial_weights": [1, 0, 0]
 }
   

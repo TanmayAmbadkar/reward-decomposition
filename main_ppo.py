@@ -110,6 +110,7 @@ def run_ppo(
     num_envs: int = 4,
     convex: bool = True,
     scalar_reward: bool = False,
+    negative: int = False,
     total_timesteps: int = 5000000,
     num_rollout_steps: int = 2048,
     update_epochs: int = 10,
@@ -192,7 +193,7 @@ def run_ppo(
 
     # Set up run name and logging
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
-    run_name = f"{env_id}__{exp_name}__{datetime.now()}__{seed}"
+    run_name = f"{env_id}__{exp_name}__{datetime.now()}__{seed}__{'negative' if negative else 'positive'}"
     set_seed(seed, torch_deterministic)
 
     # Set up device666
@@ -283,6 +284,7 @@ def run_ppo(
         seed=seed,
         logger=logger,
         convex=convex,
+        negative=negative,
         scalar_reward=scalar_reward,
         pareto_archive=pareto_archive
     )
@@ -308,6 +310,7 @@ def run_ppo(
             "env_is_discrete": env_is_discrete,
             "num_envs": num_envs,
             "convex": convex,
+            "negative":negative,
             "scalar_reward": scalar_reward,
             "total_timesteps": total_timesteps,
             "num_rollout_steps": num_rollout_steps,

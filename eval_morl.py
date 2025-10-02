@@ -14,19 +14,19 @@ from envs.utils_building import ParameterGenerator
 from gymnasium.wrappers.vector import NormalizeObservation
 # Set up vectorized env
 # env_id = "minecart-v0"  # or "mo-reacher-v5"
-env_id = "mo-hopper-2obj-v5"  # or "mo-reacher-v5"
+env_id = "mo-ant-v5"  # or "mo-reacher-v5"
 num_envs = 16
-reward_size = 2
-episodes_to_collect = 2048
+reward_size = 3
+episodes_to_collect = 1024
 labels = [str(i) for i in range(reward_size)]  # Adjust based on the environment
-ref_point = np.array([-100, -100])  # Reference point for hypervolume calculation
+ref_point = np.array([-100, -100, -100])  # Reference point for hypervolume calculation
 # ref_point = np.array([-1, -1, -200])  # Reference point for hypervolume calculation
 # ref_point = np.array([-101, -1001, -101, -101])  # Reference point for hypervolume calculation
 # ref_point = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0])  # Reference point for hypervolume calculation
 gamma = 0.99
 n_to_select = 2048
 
-model_path = "runs/mo-hopper-2obj-v5__main_ppo__2025-09-24 20:45:49.095460__41/"
+model_path = "runs/mo-ant-v5__main_ppo__2025-10-01 22:37:58.821879__36__negative/"
 
 if not os.path.exists(f"results/{env_id}"):
     os.makedirs(f"results/{env_id}", exist_ok=True)
@@ -39,7 +39,7 @@ if env_id == "building":
     )
 else:
     vec_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-        [lambda: mo_gym.make(env_id, max_episode_steps = 500) for _ in range(num_envs)]
+        [lambda: mo_gym.make(env_id, max_episode_steps = 1000) for _ in range(num_envs)]
     )
 
 

@@ -6,3 +6,4 @@ morl-experiments/
 *.png
 wandb/
 runs.tar.gz
+runs*
