@@ -128,6 +128,7 @@ class PPO:
         scalar_reward = False,
         negative = False,
         pareto_archive = ParetoArchive(),
+        diversity_scale = 1,
     ):
         """
         Proximal Policy Optimization (PPO) algorithm implementation.
@@ -227,6 +228,8 @@ class PPO:
         self.log_barrier_t = 20.0
         self.pareto_archive = pareto_archive
         self.negative = negative
+        self.diversity_scale = diversity_scale
+        
 
     def create_lr_scheduler(self, num_policy_updates):
         return LinearLRSchedule(self.optimizer, self.initial_lr, num_policy_updates)
@@ -396,7 +399,9 @@ class PPO:
         else:
             weights = current_weights
             negative = current_negatives
-
+        
+        # weights = torch.ones_like(weights).to(self.device).type(torch.float32)
+        # weights[:,0] = 0
         for step in range(self.num_rollout_steps):
             # Store current observation
             collected_observations[step] = next_observation
@@ -415,6 +420,9 @@ class PPO:
                     negative[change_weights] = 1 - 2*torch.bernoulli(torch.ones_like(weights[change_weights]) * 0.5).type(torch.float32)
 
                     weights[change_weights] = weights[change_weights] * negative[change_weights]
+                
+                # weights = torch.ones_like(weights).to(self.device).type(torch.float32)
+                # weights[:,0] = 0
 
             with torch.no_grad():
                 action, logprob = self.agent.sample_action_and_compute_log_prob(
@@ -690,8 +698,8 @@ class PPO:
         followed by a separate critic update.
         """
         self.noise_level = 0.1
+        
         self.lambda_diversity = 1.0
-        self.diversity_scale = 1.0
 
         batch_size = self.num_rollout_steps * self.num_envs
         assert collected_observations.shape[0] == batch_size

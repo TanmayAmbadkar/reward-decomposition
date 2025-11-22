@@ -105,13 +105,13 @@ def load_and_evaluate_model(
 
 @script
 def run_ppo(
-    env_id: str = "LunarLander",
+    env_id: str = "mo-humanoid-v5",
     env_is_discrete: bool = False,
     num_envs: int = 4,
     convex: bool = True,
     scalar_reward: bool = False,
     negative: int = False,
-    total_timesteps: int = 5000000,
+    total_timesteps: int = 1500000,
     num_rollout_steps: int = 2048,
     update_epochs: int = 10,
     num_minibatches: int = 32,
@@ -120,14 +120,15 @@ def run_ppo(
     eval_gamma: float = 0.99,
     gae_lambda: float = 0.95,
     surrogate_clip_threshold: float = 0.2,
-    entropy_loss_coefficient: float = 0.0000,
+    entropy_loss_coefficient: float = 0.00,
     policy_gradient_loss_coefficient: float = 1.0,
     value_function_loss_coefficient: float = 0.5,
     normalize_advantages: bool = True,
-    normalize_observations: bool = True,
+    normalize_observations: bool = False,
     normalize_rewards: bool = True,
     clip_value_function_loss: bool = False,
     max_grad_norm: float = 0.5,
+    diversity_scale: float = 0.1,
     target_kl: float = None,
     anneal_lr: bool = False,
     rpo_alpha: float = None,
@@ -286,7 +287,8 @@ def run_ppo(
         convex=convex,
         negative=negative,
         scalar_reward=scalar_reward,
-        pareto_archive=pareto_archive
+        pareto_archive=pareto_archive,
+        diversity_scale=diversity_scale
     )
     print(ppo.agent)
     # Train the agent
@@ -332,6 +334,7 @@ def run_ppo(
             "anneal_lr": anneal_lr,
             "rpo_alpha": rpo_alpha,
             "seed": seed,
+            "diversity_scale": diversity_scale
         }
         with open(hparams_path, "w") as f:
             json.dump(hparams_to_json, f, indent = 4)

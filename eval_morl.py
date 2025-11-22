@@ -13,20 +13,20 @@ from envs.utils_building import ParameterGenerator
 
 from gymnasium.wrappers.vector import NormalizeObservation
 # Set up vectorized env
-# env_id = "minecart-v0"  # or "mo-reacher-v5"
-env_id = "mo-ant-v5"  # or "mo-reacher-v5"
+env_id = "mo-humanoid-v5"  # or "mo-reacher-v5"
+# env_id = "fruit-tree-v0"  # or "mo-reacher-v5"
 num_envs = 16
-reward_size = 3
+reward_size = 2
 episodes_to_collect = 1024
 labels = [str(i) for i in range(reward_size)]  # Adjust based on the environment
-ref_point = np.array([-100, -100, -100])  # Reference point for hypervolume calculation
-# ref_point = np.array([-1, -1, -200])  # Reference point for hypervolume calculation
+# ref_point = np.array([-1, -1, -1, -1, -1, -1])  # Reference point for hypervolume calculation
+ref_point = np.array([-100, -100])  # Reference point for hypervolume calculation
 # ref_point = np.array([-101, -1001, -101, -101])  # Reference point for hypervolume calculation
 # ref_point = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0])  # Reference point for hypervolume calculation
 gamma = 0.99
 n_to_select = 2048
 
-model_path = "runs/mo-ant-v5__main_ppo__2025-10-01 22:37:58.821879__36__negative/"
+model_path = "runs/mo-humanoid-v5__main_ppo__2025-11-21 20:14:47.519758__2__positive/"
 
 if not os.path.exists(f"results/{env_id}"):
     os.makedirs(f"results/{env_id}", exist_ok=True)
