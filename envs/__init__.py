@@ -9,3 +9,12 @@ register(
         'cost_objective': False,
     }
 )
+
+register(
+    id='deep-sea-treasure-v1',
+    entry_point='envs.dst:DeepSeaTreasureEnv',
+    max_episode_steps=100,
+    kwargs={
+        'cost_objective': False,
+    }
+)

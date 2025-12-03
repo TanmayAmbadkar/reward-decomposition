@@ -9,24 +9,27 @@ import pickle
 import envs
 import os
 from envs.building_env import BuildingEnv_9d
+from envs.dst import DeepSeaTreasureEnv
 from envs.utils_building import ParameterGenerator
 
 from gymnasium.wrappers.vector import NormalizeObservation
 # Set up vectorized env
 # env_id = "minecart-v0"  # or "mo-reacher-v5"
-env_id = "mo-hopper-2obj-v5"  # or "mo-reacher-v5"
+# env_id = "mo-hopper-2obj-v5"  # or "mo-reacher-v5"
+env_id = "deep-sea-treasure-v1"  # or "mo-reacher-v5"
 num_envs = 16
 reward_size = 2
-episodes_to_collect = 2048
+episodes_to_collect = 128
 labels = [str(i) for i in range(reward_size)]  # Adjust based on the environment
-ref_point = np.array([-100, -100])  # Reference point for hypervolume calculation
-# ref_point = np.array([-1, -1, -200])  # Reference point for hypervolume calculation
+# ref_point = np.array([-100, -100])  # Reference point for hypervolume calculation
+ref_point = np.array([-1000, -1])  # Reference point for hypervolume calculation
 # ref_point = np.array([-101, -1001, -101, -101])  # Reference point for hypervolume calculation
 # ref_point = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0])  # Reference point for hypervolume calculation
-gamma = 0.99
+gamma = 1.0
 n_to_select = 2048
 
-model_path = "runs/mo-hopper-2obj-v5__main_ppo__2025-09-24 20:45:49.095460__41/"
+# model_path = "runs/fruit-tree-v0__main_ppo__2025-11-22 16:10:17.332955__3/"
+model_path = "runs/deep-sea-treasure-v1__main_ppo__2025-11-25 22:03:16.736830__1/"
 
 if not os.path.exists(f"results/{env_id}"):
     os.makedirs(f"results/{env_id}", exist_ok=True)
@@ -35,6 +38,12 @@ if env_id == "building":
     # Special case for BuildingEnv_9d
     vec_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
         lambda: BuildingEnv_9d(ParameterGenerator(Building='OfficeLarge', Weather='Warm_Marine', Location='ElPaso')) 
+        for _ in range(num_envs)
+    )
+elif env_id == "deep-sea-treasure-v1":
+    # Special case for BuildingEnv_9d
+    vec_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+        lambda: DeepSeaTreasureEnv() 
         for _ in range(num_envs)
     )
 else:
@@ -57,6 +66,9 @@ vec_envs = mo_gym.wrappers.vector.MORecordEpisodeStatistics(vec_envs)
 if env_id == "building":
     # Special case for BuildingEnv_9d
     env_temp = BuildingEnv_9d(ParameterGenerator(Building='OfficeLarge', Weather='Warm_Marine', Location='ElPaso'))
+elif env_id == "deep-sea-treasure-v1":
+    # Special case for BuildingEnv_9d
+   env_temp = DeepSeaTreasureEnv()
 else:
     env_temp = mo_gym.make(env_id)
 
@@ -86,7 +98,7 @@ while episodes_collected < episodes_to_collect:
     # Agent action for each env, given obs and per-env weights
     obs = (obs - mean)/(std + 1e-8)  # Normalize observations
     actions = []
-    actions, _ = eval_agent.predict(obs, curr_weights, deterministic=True, device="cpu")
+    actions, _ = eval_agent.predict(obs, curr_weights, deterministic=False, device="cpu")
     # Step all envs
     next_obs, rews, dones, truncs, infos = vec_envs.step(actions)
     env_rewards += gammas * rews
@@ -202,6 +214,7 @@ def select_points_by_crowd_distance(pareto_points, n_to_select):
 
 mask = pareto_front(rewards_list)
 front = rewards_list[mask]
+print(rewards_list)
 dominated = rewards_list[~mask]
 # print(weights_list[mask])
 # print(front)

@@ -5,9 +5,6 @@ import torch
 import torch.nn as nn
 from torch.distributions.categorical import Categorical
 from torch.distributions.normal import Normal
-from ppo.resnet import WeightFeatureExtractorNet
-
-import torchbnn as bnn
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -18,72 +15,56 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 class BaseAgent(nn.Module, ABC):
     @abstractmethod
-    def estimate_value_from_observation(self, observation):
+    def estimate_value_from_observation(self, observation, accumulated_reward, task_id=None, device="cpu"):
         """
-        Estimate the value of an observation using the critic network.
-
+        Estimate the value (Utility and Auxiliary Returns) using the critic network.
+        
         Args:
-            observation: The observation to estimate.
-
+            observation: The environment state.
+            accumulated_reward: The vector of rewards collected so far in the episode.
+            task_id: The one-hot vector indicating the active utility function.
+            
         Returns:
-            The estimated value of the observation.
+            Tuple (utility_value, auxiliary_returns_vector)
         """
         pass
 
     @abstractmethod
-    def get_action_distribution(self, observation):
+    def get_action_distribution(self, observation, accumulated_reward, task_id=None, device="cpu"):
         """
-        Get the action distribution for a given observation.
-
-        Args:
-            observation: The observation to base the action distribution on.
-
-        Returns:
-            A probability distribution over possible actions.
+        Get the action distribution.
         """
         pass
 
     @abstractmethod
-    def sample_action_and_compute_log_prob(self, observations):
+    def sample_action_and_compute_log_prob(self, observations, accumulated_reward, task_id=None, deterministic=False, device="cpu"):
         """
-        Sample an action from the action distribution and compute its log probability.
-
-        Args:
-            observations: The observations to base the actions on.
-
-        Returns:
-            A tuple containing:
-            - The sampled action(s)
-            - The log probability of the sampled action(s)
+        Sample action and compute log prob.
         """
         pass
 
     @abstractmethod
-    def compute_action_log_probabilities_and_entropy(self, observations, actions):
+    def compute_action_log_probabilities_and_entropy(self, observations, actions, accumulated_reward, task_id=None, device="cpu"):
         """
-        Compute the log probabilities and entropy of given actions for given observations.
-
-        Args:
-            observations: The observations corresponding to the actions.
-            actions: The actions to compute probabilities and entropy for.
-
-        Returns:
-            A tuple containing:
-            - The log probabilities of the actions
-            - The entropy of the action distribution
+        Compute log probs and entropy for optimization.
         """
         pass
     
-    def forward():
+    def forward(self):
         pass
 
 
 class DiscreteAgent(BaseAgent):
-    def __init__(self, envs, reward_size = 1):
+    def __init__(self, envs, reward_size=1, task_size=0):
+        """
+        Args:
+            envs: Gym environments.
+            reward_size: Number of objectives (Dimension of accumulated_reward and auxiliary head).
+            task_size: Number of utility functions (Dimension of one-hot task_id). Set to 0 for single-task.
+        """
         super().__init__()
         self.reward_size = reward_size
-        
-        self.weight_vec_size = 0 if reward_size == 1 else reward_size
+        self.task_size = task_size
 
         try:
             action_space = envs.single_action_space.n
@@ -92,110 +73,116 @@ class DiscreteAgent(BaseAgent):
             action_space = envs.action_space.n
             observation_space = envs.observation_space.shape
 
+        # Input dimension: State + Accumulated Rewards + Task ID
+        self.input_dim = np.array(observation_space).prod() + self.reward_size + self.task_size
 
-        self.critic = nn.Sequential(
-            layer_init(
-                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 64)
-            ),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, reward_size), std=1.0),
-        )
-        self.actor = nn.Sequential(
-            layer_init(
-                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 64)
-            ),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, action_space), std=0.01),
-        )
-
-    def estimate_value_from_observation(self, observation, weights = None, device = "cpu"):
+        # --- SEPARATE BODIES ---
         
-        if weights is not None:
-            assert weights.shape[0] == observation.shape[0]
+        # Actor Body
+        self.actor_body = nn.Sequential(
+            layer_init(nn.Linear(self.input_dim, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+        )
+        
+        # Critic Body
+        self.critic_body = nn.Sequential(
+            layer_init(nn.Linear(self.input_dim, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+        )
 
-        if self.weight_vec_size == 0:
-            observation = observation
-        elif weights is None:
-            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size)).to(device)])
-        else:
-            observation =  torch.hstack([observation, weights])
+        # Actor Head
+        self.actor_head = layer_init(nn.Linear(64, action_space), std=0.01)
 
-        return self.critic(observation)
+        # Critic Head 1: Main Utility (Scalar)
+        self.critic_utility_head = layer_init(nn.Linear(64, 1), std=1.0)
 
-    def get_action_distribution(self, observation):
-        logits = self.actor(observation)
+        # Critic Head 2: Auxiliary Returns (Vector = reward_size)
+        self.critic_returns_head = layer_init(nn.Linear(64, reward_size), std=1.0)
+
+    def _get_feature_embedding(self, observation, accumulated_reward, task_id=None, device="cpu"):
+        """Helper to format input. Returns raw concatenated tensor."""
+        # Ensure inputs are tensors and on correct device
+        if not isinstance(observation, torch.Tensor):
+            observation = torch.Tensor(observation).to(device)
+        if not isinstance(accumulated_reward, torch.Tensor):
+            accumulated_reward = torch.Tensor(accumulated_reward).to(device)
+            
+        # Reshape inputs if necessary
+        if len(observation.shape) == 1:
+            observation = observation.unsqueeze(0)
+        if len(accumulated_reward.shape) == 1:
+            accumulated_reward = accumulated_reward.unsqueeze(0)
+
+        inputs = [observation, accumulated_reward]
+
+        # Handle Task ID
+        if self.task_size > 0:
+            if task_id is None:
+                raise ValueError("Agent initialized with task_size > 0 but no task_id provided.")
+            if not isinstance(task_id, torch.Tensor):
+                task_id = torch.Tensor(task_id).to(device)
+            if len(task_id.shape) == 1:
+                task_id = task_id.unsqueeze(0)
+            inputs.append(task_id)
+
+        # Concatenate: [State, History, Task]
+        return torch.hstack(inputs)
+
+    def estimate_value_from_observation(self, observation, accumulated_reward, task_id=None, device="cpu"):
+        model_input = self._get_feature_embedding(observation, accumulated_reward, task_id, device)
+        
+        # Pass through Critic Body
+        critic_features = self.critic_body(model_input)
+        
+        utility_val = self.critic_utility_head(critic_features)
+        returns_val = self.critic_returns_head(critic_features)
+        
+        return utility_val, returns_val
+
+    def get_action_distribution(self, observation, accumulated_reward, task_id=None, device="cpu"):
+        model_input = self._get_feature_embedding(observation, accumulated_reward, task_id, device)
+        
+        # Pass through Actor Body
+        actor_features = self.actor_body(model_input)
+        
+        logits = self.actor_head(actor_features)
         return Categorical(logits=logits)
 
-    def sample_action_and_compute_log_prob(self, observations, weights = None, deterministic = False):
-
-        if weights is not None:
-            assert weights.shape[0] == observations.shape[0]
-
-        if self.weight_vec_size == 0:
-            observations = observations
-        elif weights is None:
-            observations = torch.hstack([observations, torch.ones((observations.shape[0], self.weight_vec_size))])
+    def sample_action_and_compute_log_prob(self, observations, accumulated_reward, task_id=None, deterministic=False, device="cpu"):
+        action_dist = self.get_action_distribution(observations, accumulated_reward, task_id, device)
+        
+        if deterministic:
+            action = action_dist.logits.argmax(dim=1)
         else:
-            observations =  torch.hstack([observations, weights])
-
-        action_dist = self.get_action_distribution(observations)
-        action = action_dist.sample()
+            action = action_dist.sample()
+            
         log_prob = action_dist.log_prob(action)
         return action, log_prob
 
-    def compute_action_log_probabilities_and_entropy(self, observations, actions, weights = None):
-
-        if weights is not None:
-            assert weights.shape[0] == observations.shape[0]
-
-        if self.weight_vec_size == 0:
-            observations = observations
-        elif weights is None:
-            observations = torch.hstack([observations, torch.ones((observations.shape[0], self.weight_vec_size))])
-        else:
-            observations =  torch.hstack([observations, weights])
-
-        action_dist = self.get_action_distribution(observations)
+    def compute_action_log_probabilities_and_entropy(self, observations, actions, accumulated_reward, task_id=None, device="cpu"):
+        action_dist = self.get_action_distribution(observations, accumulated_reward, task_id, device)
         log_prob = action_dist.log_prob(actions)
         entropy = action_dist.entropy()
         return log_prob, entropy
     
     @torch.no_grad
-    def predict(self, observation, weight = None, deterministic = False, device = "cpu"):
-        
-        observation = torch.Tensor(observation).to(device)
-        if len(observation.shape) == 1:
-            observation = observation.reshape(-1, observation.shape[0])
-        obs_critic = observation.clone()
-        if self.weight_vec_size == 0:
-            observation = observation
-        elif weight is None:
-            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size)).to(device)])
-        else:
-            weight = torch.Tensor(weight).reshape(observation.shape[0], -1).to(device)
-            observation =  torch.hstack([observation, weight.to(device)])
-
-        action_dist = self.get_action_distribution(observation)
-
-        if deterministic:
-            action = action_dist.logits.argmax(dim=1)
-            # print(action)
-        else:
-            action = action_dist.sample()
-        return action.cpu().numpy(), self.estimate_value_from_observation(obs_critic, weight, device).cpu().numpy()
-
+    def predict(self, observation, accumulated_reward, task_id=None, deterministic=False, device="cpu"):
+        action, _ = self.sample_action_and_compute_log_prob(observation, accumulated_reward, task_id, deterministic, device)
+        # For prediction, we might want just the utility value, or both. Returning utility for standard compat.
+        utility_val, _ = self.estimate_value_from_observation(observation, accumulated_reward, task_id, device)
+        return action.cpu().numpy(), utility_val.cpu().numpy()
 
 
 class ContinuousAgent(BaseAgent):
-    def __init__(self, envs, rpo_alpha=None, reward_size = 1):
+    def __init__(self, envs, reward_size=1, task_size=0, rpo_alpha=None):
         super().__init__()
-        self.rpo_alpha = rpo_alpha
         self.reward_size = reward_size
-        self.weight_vec_size = 0 if reward_size == 1 else reward_size
+        self.task_size = task_size
+        self.rpo_alpha = rpo_alpha
 
         try:
             action_space = envs.single_action_space.shape
@@ -203,38 +190,52 @@ class ContinuousAgent(BaseAgent):
         except:
             action_space = envs.action_space.shape
             observation_space = envs.observation_space.shape
-        self.critic = nn.Sequential(
-            layer_init(
-                nn.Linear(np.array(observation_space).prod()+ self.weight_vec_size, 64)
-            ),
+
+        # Input dimension: State + Accumulated Rewards + Task ID
+        self.input_dim = np.array(observation_space).prod() + self.reward_size + self.task_size
+
+        # --- SEPARATE BODIES ---
+        
+        # Actor Body
+        self.actor_body = nn.Sequential(
+            layer_init(nn.Linear(self.input_dim, 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, self.reward_size), std=1.0),
-        )
-        self.actor_mean = nn.Sequential(
-            layer_init(
-                nn.Linear(np.array(observation_space).prod() + self.weight_vec_size, 64)
-            ),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(
-                nn.Linear(64, np.prod(action_space)), std=0.01
-            ),
-        )
-        self.actor_logstd = nn.Parameter(
-            # torch.zeros(1, np.prod(action_space))
-            torch.zeros(1, np.prod(action_space))
         )
         
-        # 3) now make a *container* module and stick both parts on it
-        self.actor = nn.Module()           # empty container
-        # register the mean‐net as a submodule
+        # Critic Body
+        self.critic_body = nn.Sequential(
+            layer_init(nn.Linear(self.input_dim, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+        )
+
+        # Actor Head (Mean)
+        self.actor_mean = layer_init(nn.Linear(64, np.prod(action_space)), std=0.01)
+        
+        # Actor LogStd
+        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(action_space)))
+        
+        # Container for actor parameters
+        self.actor = nn.Module()
+        self.actor.add_module('body', self.actor_body)
         self.actor.add_module('mean', self.actor_mean)
-        # register the logstd parameter
         self.actor.register_parameter('logstd', self.actor_logstd)
+
+        # Critic Head 1: Main Utility (Scalar)
+        self.critic_utility_head = layer_init(nn.Linear(64, 1), std=1.0)
+
+        # Critic Head 2: Auxiliary Returns (Vector = reward_size)
+        self.critic_returns_head = layer_init(nn.Linear(64, reward_size), std=1.0)
         
+        # Critic Container (to easily get params)
+        self.critic = nn.Module()
+        self.critic.add_module('body', self.critic_body)
+        self.critic.add_module('utility_head', self.critic_utility_head)
+        self.critic.add_module('returns_head', self.critic_returns_head)
+
         try:
             self.action_space_low = envs.single_action_space.low
             self.action_space_high = envs.single_action_space.high
@@ -242,95 +243,79 @@ class ContinuousAgent(BaseAgent):
             self.action_space_low = envs.action_space.low
             self.action_space_high = envs.action_space.high
 
-    def estimate_value_from_observation(self, observation, weights = None, device = "cpu"):
+    def _get_feature_embedding(self, observation, accumulated_reward, task_id=None, device="cpu"):
+        """Helper to format input. Returns raw concatenated tensor."""
+        # Ensure inputs are tensors and on correct device
+        if not isinstance(observation, torch.Tensor):
+            observation = torch.Tensor(observation).to(device)
+        if not isinstance(accumulated_reward, torch.Tensor):
+            accumulated_reward = torch.Tensor(accumulated_reward).to(device)
+            
+        # Reshape inputs if necessary
+        if len(observation.shape) == 1:
+            observation = observation.unsqueeze(0)
+        if len(accumulated_reward.shape) == 1:
+            accumulated_reward = accumulated_reward.unsqueeze(0)
+
+        inputs = [observation, accumulated_reward]
+
+        # Handle Task ID
+        if self.task_size > 0:
+            if task_id is None:
+                raise ValueError("Agent initialized with task_size > 0 but no task_id provided.")
+            if not isinstance(task_id, torch.Tensor):
+                task_id = torch.Tensor(task_id).to(device)
+            if len(task_id.shape) == 1:
+                task_id = task_id.unsqueeze(0)
+            inputs.append(task_id)
+
+        # Concatenate: [State, History, Task]
+        return torch.hstack(inputs)
+
+    def estimate_value_from_observation(self, observation, accumulated_reward, task_id=None, device="cpu"):
+        model_input = self._get_feature_embedding(observation, accumulated_reward, task_id, device)
         
-        if weights is not None:
-            assert weights.shape[0] == observation.shape[0]
+        # Pass through Critic Body
+        critic_features = self.critic_body(model_input)
+        
+        utility_val = self.critic_utility_head(critic_features)
+        returns_val = self.critic_returns_head(critic_features)
+        
+        return utility_val, returns_val
 
-        if self.weight_vec_size == 0:
-            observation = observation
-        elif weights is None:
-            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size)).to(device)])
-        else:
-            observation =  torch.hstack([observation, weights])
-
-        return self.critic(observation)
-
-    def get_action_distribution(self, observation):
-        action_mean = self.actor_mean(observation)
+    def get_action_distribution(self, observation, accumulated_reward, task_id=None, device="cpu"):
+        model_input = self._get_feature_embedding(observation, accumulated_reward, task_id, device)
+        
+        # Pass through Actor Body
+        actor_features = self.actor_body(model_input)
+        
+        action_mean = self.actor_mean(actor_features)
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
-        action_dist = Normal(action_mean, action_std)
-
-        return action_dist
-    
-    @torch.no_grad
-    def predict(self, observation, weight = None, deterministic = False, device = "cpu"):
         
-        
-        observation = torch.Tensor(observation).to(device)
-        if len(observation.shape) == 1:
-            observation = observation.reshape(-1, observation.shape[0])
-        obs_critic = observation.clone()
-        if self.weight_vec_size == 0:
-            observation = observation
-        elif weight is None:
-            observation = torch.hstack([observation, torch.ones((observation.shape[0], self.weight_vec_size)).to(device)])
-        else:
-            weight = torch.Tensor(weight).reshape(observation.shape[0], -1).to(device)
-            observation =  torch.hstack([observation, weight.to(device)])
+        return Normal(action_mean, action_std)
 
-        action_dist = self.get_action_distribution(observation)
+    def sample_action_and_compute_log_prob(self, observations, accumulated_reward, task_id=None, deterministic=False, device="cpu"):
+        action_dist = self.get_action_distribution(observations, accumulated_reward, task_id, device)
 
         if deterministic:
-            action = action_dist.mode
+            action = action_dist.mean
         else:
             action = action_dist.rsample()
-        return action.cpu().numpy(), self.estimate_value_from_observation(obs_critic, weight, device).cpu().numpy()
-
-
-    def sample_action_and_compute_log_prob(self, observations, weights = None, deterministic = False):
-
-        if weights is not None:
-            assert weights.shape[0] == observations.shape[0]
-
-        if self.weight_vec_size == 0:
-            observations = observations
-        elif weights is None:
-            observations = torch.hstack([observations, torch.ones((observations.shape[0], self.weight_vec_size))])
-        else:
-            observations =  torch.hstack([observations, weights])
-
-        action_dist = self.get_action_distribution(observations)
-
-        if deterministic:
-            action = action_dist.mode
-        else:
-            action = action_dist.rsample()
-        # print(torch.round(action, decimals = 2))
+            
         log_prob = action_dist.log_prob(action).sum(1)
         return action, log_prob
 
-    def compute_action_log_probabilities_and_entropy(self, observations, actions, weights = None):
-
-        if weights is not None:
-            assert weights.shape[0] == observations.shape[0]
-
-        if self.weight_vec_size == 0:
-            observations = observations
-        elif weights is None:
-            observations = torch.hstack([observations, torch.ones((observations.shape[0], self.weight_vec_size))])
-        else:
-            observations =  torch.hstack([observations, weights])
-
-        action_dist = self.get_action_distribution(observations)
+    def compute_action_log_probabilities_and_entropy(self, observations, actions, accumulated_reward, task_id=None, device="cpu"):
+        action_dist = self.get_action_distribution(observations, accumulated_reward, task_id, device)
+        
         if self.rpo_alpha is not None:
-            # sample again to add stochasticity to the policy
+            # RPO (Robust Policy Optimization) tweak
             action_mean = action_dist.mean
             z = (
                 torch.FloatTensor(action_mean.shape)
                 .uniform_(-self.rpo_alpha, self.rpo_alpha)
-                .to(self.actor_logstd.device)
+                .to(device)
             )
             action_mean = action_mean + z
             action_dist = Normal(action_mean, action_dist.stddev)
@@ -338,118 +323,15 @@ class ContinuousAgent(BaseAgent):
         log_prob = action_dist.log_prob(actions).sum(1)
         entropy = action_dist.entropy().sum(1)
         return log_prob, entropy
-    
-    def forward(self, observation):
-        """
-        Forward pass through the agent to get action and value.
-        """
-        action, value = self.predict(observation[:, :-self.reward_size], observation[:, -self.reward_size:], deterministic=False, device="cpu")
-        return action, value
 
-
-class CNNDiscreteAgent(BaseAgent):
-    def __init__(self, envs, reward_size = 1):
-        super().__init__()
-        self.reward_size = reward_size
-        self.weight_vec_size = 0 if reward_size == 1 else reward_size
-
-        try:
-            action_space = envs.single_action_space.n
-            observation_space = envs.single_observation_space.shape
-        except:
-            action_space = envs.action_space.n
-            observation_space = envs.observation_space.shape
-
-        self.feature_extractor = WeightFeatureExtractorNet(self.weight_vec_size)
-        with torch.no_grad():
-            observation_space = 512 + 128
-
-        self.critic = nn.Sequential(
-            layer_init(
-                nn.Linear(observation_space, 128)
-            ),
-            nn.Tanh(),
-            layer_init(nn.Linear(128, 128)),
-            nn.Tanh(),
-            layer_init(nn.Linear(128, reward_size), std=1.0),
-        )
-        self.actor = nn.Sequential(
-            layer_init(
-                nn.Linear(observation_space, 128)
-            ),
-            nn.Tanh(),
-            layer_init(nn.Linear(128, 128)),
-            nn.Tanh(),
-            layer_init(nn.Linear(128, action_space), std=0.01),
-        )
-
-    def estimate_value_from_observation(self, observations, weights = None):
-        
-        
-        if weights is not None:
-            assert weights.shape[0] == observations.shape[0]
-        else:
-            weights = torch.ones((observations.shape[0], self.weight_vec_size))
-
-        
-        features = self.feature_extractor(observations, weights)
-        
-
-        return self.critic(features)
-
-    def get_action_distribution(self, observations, weights):
-
-        features = self.feature_extractor(observations, weights)
-        logits = self.actor(features)
-        return Categorical(logits=logits)
-    
     @torch.no_grad
-    def predict(self, observation, weight = None, deterministic = False, device = "cpu"):
-        
-        observation = torch.Tensor(observation).to(device)
-        weight = torch.Tensor(weight).to(device)
-        if len(observation.shape) == 3:
-            observation = observation.reshape(1, *observation.shape)
-            weight = weight.reshape(1, *weight.shape)
-        elif len(weight.shape) == 1:   
-            weight = weight.reshape(1, *weight.shape)
-        # print(observation.shape, weight.shape)
-        if weight is not None:
-            assert weight.shape[0] == observation.shape[0]
-        else:
-            weight = torch.ones((observation.shape[0], self.weight_vec_size)).to(device)
-        
-        action_dist = self.get_action_distribution(observation, weight)
-        if deterministic:
-            print(action_dist.logits)
-            action = torch.argmax(action_dist.logits, dim = 1)
-        else:
-            action = action_dist.rsample()
-        return action.cpu().numpy().astype(int).tolist(), self.estimate_value_from_observation(observation, weight).cpu().numpy()
-
-
-    def sample_action_and_compute_log_prob(self, observations, weights = None, deterministic = False):
-
-        if weights is not None:
-            assert weights.shape[0] == observations.shape[0]
-        else:
-            weights = torch.ones((observations.shape[0], self.weight_vec_size))
-        
-        action_dist = self.get_action_distribution(observations, weights)
-        action = action_dist.sample()
-        log_prob = action_dist.log_prob(action)
-        return action, log_prob
-
-    def compute_action_log_probabilities_and_entropy(self, observations, actions, weights = None):
-
-       
-        if weights is not None:
-            assert weights.shape[0] == observations.shape[0]
-        else:
-            weights = torch.ones((observations.shape[0], self.weight_vec_size))
-        
-        action_dist = self.get_action_distribution(observations, weights)
-        log_prob = action_dist.log_prob(actions)
-        entropy = action_dist.entropy()
-        return log_prob, entropy
-
+    def predict(self, observation, accumulated_reward, task_id=None, deterministic=False, device="cpu"):
+        action, _ = self.sample_action_and_compute_log_prob(observation, accumulated_reward, task_id, deterministic, device)
+        utility_val, _ = self.estimate_value_from_observation(observation, accumulated_reward, task_id, device)
+        return action.cpu().numpy(), utility_val.cpu().numpy()
+    
+    def forward(self, observation, accumulated_reward, task_id=None):
+        """
+        Forward pass for compatibility, returning action and utility value.
+        """
+        return self.predict(observation, accumulated_reward, task_id)
