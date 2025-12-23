@@ -31,12 +31,7 @@ from morl_baselines.common.pareto import ParetoArchive
 from morl_baselines.common.performance_indicators import hypervolume, sparsity, expected_utility
 
 # Utility Functions
-from utility_functions import (
-    DSTDebtUtility, 
-    DSTGeneralUtility, 
-    FTNProductUtility, 
-    FTNBenchmarkUtility
-)
+from utility_functions import *
 
 # ==========================================
 # Environment & Utility Configuration
@@ -50,13 +45,18 @@ ENVIRONMENT_UTILITY_MAP = {
         DSTGeneralUtility(mode='threshold'), 
         DSTGeneralUtility(mode='ratio')
     ],
-    "fruit-tree-1": [FTNProductUtility()],
+    "fruit-tree-prod": [FTNProductUtility()],
+    "fruit-tree-max": [FTNMaxUtility()],
+    "fruit-tree-min": [FTNMinUtility()],
+    "fruit-tree-2prod": [FTN2ProductUtility()],
+    "fruit-tree-mixed": [FTNMixedUtility()],
+    "fruit-tree-dist": [FTNDistanceUtility()],
     "fruit-tree-5": [
-        FTNBenchmarkUtility(mode='max'), 
-        FTNBenchmarkUtility(mode='min'), 
-        FTNBenchmarkUtility(mode='product'), 
-        FTNBenchmarkUtility(mode='mixed'), 
-        FTNBenchmarkUtility(mode='distance')
+        FTNMaxUtility(),
+        FTNMinUtility(),
+        FTN2ProductUtility(),
+        FTNMixedUtility(),
+        FTNDistanceUtility(),
     ],
 }
 
@@ -67,12 +67,12 @@ def set_seed(seed, torch_deterministic=True):
     torch.backends.cudnn.deterministic = torch_deterministic
 
 
-
 def load_and_evaluate_model(
     run_name,
     env_id,
     env_is_discrete,
     normalize_observations,
+    obs_rms,
     envs,
     num_envs,
     agent_class,
@@ -80,8 +80,9 @@ def load_and_evaluate_model(
     model_path,
     gamma,
     capture_video,
+    eval_task_id=None
 ):
-    # Run simple evaluation to demonstrate how to load and use a trained model
+    # Run comprehensive evaluation matching PPO.evaluate logic
     eval_episodes = 10
     eval_envs = envs
 
@@ -90,55 +91,123 @@ def load_and_evaluate_model(
     eval_agent.eval()
     frames_per_env = [[] for _ in range(num_envs)]  # one list of frames per env
 
-    obs, _ = eval_envs.reset()
-    episodic_returns = []
-    
-    # Init Augmentation
-    reward_size = eval_agent.reward_size
-    acc_rewards = torch.zeros((num_envs, reward_size)).to(device)
-    
-    # Init Task (Just pick task 0 for visualization)
+    # Get Task Size & Utils
     task_size = eval_agent.task_size
-    task_onehot = torch.zeros((num_envs, task_size)).to(device)
-    if task_size > 0:
-        task_onehot[:, 0] = 1.0 # Task 0
+    utility_funcs = ENVIRONMENT_UTILITY_MAP.get(env_id, None)
+    if utility_funcs is None:
+        utility_funcs = [lambda r: r.sum(-1)] # Default to sum
+        
+    num_tasks = len(utility_funcs)
+    reward_size = eval_agent.reward_size
 
-    while len(episodic_returns) < eval_episodes:
+    print(f"--- Starting Comprehensive Evaluation ---")
+    
+    # Dictionary to store results: task_id -> list of utilities
+    results = {t_id: [] for t_id in range(num_tasks)}
+    
+    # We process tasks in chunks based on available eval envs
+    # If eval_task_id is specified, only evaluate that task
+    if eval_task_id is not None:
+        tasks_to_run = np.repeat([eval_task_id], eval_episodes)
+    else:
+        tasks_to_run = np.repeat(np.arange(num_tasks), eval_episodes)
+        
+    total_episodes_needed = len(tasks_to_run)
+    
+    obs, _ = eval_envs.reset()
+    if normalize_observations:
+        obs = obs_rms.normalize(obs)
+    obs = torch.tensor(obs, dtype=torch.float32, device=device)
+    
+    acc_rewards = torch.zeros((num_envs, reward_size), device=device)
+    acc_gamma = torch.ones((num_envs, 1), device=device)
+    
+    active_tasks = torch.zeros(num_envs, dtype=torch.long, device=device)
+    env_task_ptr = np.full(num_envs, -1, dtype=np.int32)
+    
+    # Fill initially
+    params_ptr = 0
+    for i in range(num_envs):
+        if params_ptr < total_episodes_needed:
+            active_tasks[i] = int(tasks_to_run[params_ptr])
+            env_task_ptr[i] = params_ptr
+            params_ptr += 1
+    
+    def get_one_hot_task(task_idx_tensor, batch_size):
+        task_one_hot = torch.zeros((batch_size, num_tasks), device=device)
+        if num_tasks > 0:
+            task_idx_tensor = task_idx_tensor.long()
+            task_one_hot.scatter_(1, task_idx_tensor.unsqueeze(1), 1.0)
+        return task_one_hot
+
+    while (env_task_ptr != -1).any():
+        task_one_hot = get_one_hot_task(active_tasks, num_envs)
+        
         with torch.no_grad():
             actions, _ = eval_agent.predict(
-                torch.Tensor(obs).to(device), 
+                obs, 
                 acc_rewards,
-                task_onehot,
-                deterministic = True, 
-                device = device
+                task_one_hot,
+                deterministic=True, 
+                device=device
             )
-        obs, rews, dones, truncs, infos = eval_envs.step(actions)
         
-        # Update Acc Rewards
-        acc_rewards += torch.tensor(rews).float().to(device)
-        is_done = np.logical_or(dones, truncs)
-        if np.any(is_done):
-             acc_rewards[is_done] = 0
+        next_obs, rews, dones, truncs, infos = eval_envs.step(actions)
+        if normalize_observations:
+            next_obs = obs_rms.normalize(next_obs)
+        
+        reward_tens = torch.tensor(rews, dtype=torch.float32, device=device).reshape(num_envs, reward_size)
+        
+        # Mask out idle environments
+        idle_mask = torch.tensor(env_task_ptr == -1, device=device).unsqueeze(1)
+        reward_tens[idle_mask.squeeze(1)] = 0.0
 
-        if "episode" in infos:
-            print(
-                    f"Eval episode {len(episodic_returns)}, episodic return: {infos['episode']['r'].sum()}"
-                )
-            episodic_returns.append(infos["episode"]["r"].sum())
+        acc_rewards += acc_gamma * reward_tens
+        acc_gamma *= gamma
+        
+        is_done = torch.logical_or(torch.tensor(dones), torch.tensor(truncs)).to(device)
+        
+        if is_done.any():
+            done_indices = torch.where(is_done)[0]
+            for idx in done_indices:
+                if env_task_ptr[idx.item()] != -1:
+                    task_id = active_tasks[idx].item()
+                    final_vec = acc_rewards[idx]
+                    u_val = utility_funcs[task_id](final_vec).item()
+                    results[task_id].append(u_val)
+                    
+                    print(f"Task {task_id} finished. Vec={final_vec.cpu().numpy()}, Utility={u_val:.3f}")
+                    
+                    acc_rewards[idx] = 0
+                    acc_gamma[idx] = 1.0
+                    
+                    if params_ptr < total_episodes_needed:
+                        active_tasks[idx] = int(tasks_to_run[params_ptr])
+                        env_task_ptr[idx.item()] = params_ptr
+                        params_ptr += 1
+                    else:
+                        env_task_ptr[idx.item()] = -1 
+        
+        obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
 
         if capture_video:
             all_frames = eval_envs.render()
-            # all_frames is a list of length num_envs, each an RGB array
             for i in range(num_envs):
-                frames_per_env[i].append(all_frames[i])
+                # Only record frames if the environment is active
+                if env_task_ptr[i] != -1:
+                    frames_per_env[i].append(all_frames[i])
 
     eval_envs.close()
+
+    print("\n--- Evaluation Summary ---")
+    for t_id, vals in results.items():
+        if len(vals) > 0:
+            print(f"Task {t_id}: Min={np.min(vals):.3f} Mean={np.mean(vals):.3f} Max={np.max(vals):.3f} | Returns={vals}")
 
     # Once done, save each environment's frames to an individual GIF
     if capture_video:
         for i in range(num_envs):
-            gif_name = f"gifs/{run_name}_env_{i}.gif"
-            # Only save if we actually have frames
+            gif_name = f"gifs/{run_name}_eval_env_{i}.gif"
             if len(frames_per_env[i]) > 0:
                 imageio.mimsave(gif_name, frames_per_env[i], fps=30)
                 print(f"Saved GIF for env {i}: {gif_name}")
@@ -159,14 +228,14 @@ def run_ppo(
     learning_rate: float = 0.0003,
     gamma: float = 0.995,
     eval_gamma: float = 0.99,
-    gae_lambda: float = 0.95,
+    gae_lambda: float = 1.0,
     surrogate_clip_threshold: float = 0.2,
-    entropy_loss_coefficient: float = 0.001,
+    entropy_loss_coefficient: float = 0.02,
     policy_gradient_loss_coefficient: float = 1.0,
     value_function_loss_coefficient: float = 0.5,
     normalize_advantages: bool = True,
     normalize_observations: bool = False, # Often False for GridWorlds
-    normalize_rewards: bool = True,
+    normalize_rewards: bool = False,
     clip_value_function_loss: bool = False,
     max_grad_norm: float = 0.5,
     target_kl: float = None,
@@ -177,6 +246,8 @@ def run_ppo(
     capture_video: bool = False,
     use_tensorboard: bool = True,
     save_model: bool = True,
+    eval_interval: int = 10000,
+    num_eval_episodes: int = 10
 ):
     """
     Main function to run the PPO (Proximal Policy Optimization) algorithm.
@@ -200,14 +271,13 @@ def run_ppo(
     # Environment Initialization
     # ==========================
     
-    
     # 1. Select Utility Functions based on Env ID map
     utility_functions = ENVIRONMENT_UTILITY_MAP.get(env_id, None)
     if utility_functions is None:
         # Fallback / Warning
         print(f"Warning: No utility functions mapped for {env_id}. Defaulting to Sum.")
         
-    # 2. Select Environment Constructor
+    # 2. Select Environment Constructor (User Specified Logic)
     if env_id == "building":
         envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
             lambda: BuildingEnv_9d(ParameterGenerator(Building='OfficeLarge', Weather='Warm_Marine', Location='ElPaso')) 
@@ -221,7 +291,7 @@ def run_ppo(
         )
     elif env_id.startswith("fruit-tree"):
         envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            lambda: mo_gym.make("fruit-tree-v0") 
+            lambda: mo_gym.make("fruit-tree-v0", depth = 7) 
             for _ in range(num_envs)
         )
     else:
@@ -233,6 +303,34 @@ def run_ppo(
     if normalize_observations:
         envs = NormalizeObservation(envs)
     envs = mo_gym.wrappers.vector.MORecordEpisodeStatistics(envs, gamma=eval_gamma)
+
+    # 3. Create Evaluation Environments (Mirroring User Logic)
+    # We replicate the construction logic to ensure eval envs match training envs exactly.
+    # Note: We skip RecordVideo for eval_envs to reduce I/O overhead during periodic eval.
+    if env_id == "building":
+        eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+            lambda: BuildingEnv_9d(ParameterGenerator(Building='OfficeLarge', Weather='Warm_Marine', Location='ElPaso')) 
+            for _ in range(num_envs)
+        )
+    elif env_id.startswith("deep-sea-treasure"):
+        eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+            lambda: DeepSeaTreasureEnv() 
+            for _ in range(num_envs)
+        )
+    elif env_id.startswith("fruit-tree"):
+        eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+            lambda: mo_gym.make("fruit-tree-v0", depth = 7) 
+            for _ in range(num_envs)
+        )
+    else:
+        # Generic MO-Gym (No RecordVideo for internal eval)
+        eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+            lambda: mo_gym.make(env_id, render_mode = "rgb_array") for _ in range(num_envs)
+        )
+
+    if normalize_observations:
+        eval_envs = NormalizeObservation(eval_envs)
+    eval_envs = mo_gym.wrappers.vector.MORecordEpisodeStatistics(eval_envs, gamma=eval_gamma)
 
     print(f"Env: {env_id}, Reward Shape: {envs.rewards_shape}")
     print(f"Obs Space: {envs.observation_space}, Action Space: {envs.action_space}")
@@ -258,14 +356,14 @@ def run_ppo(
 
     # Optimizer
     # Define actor parameters
-    actor_params = list(agent.actor_body.parameters()) + list(agent.actor_head.parameters() if env_is_discrete else agent.actor.parameters())
+    # actor_params = list(agent.actor.parameters()) + list(agent.actor_head.parameters() if env_is_discrete else agent.actor.parameters())
     
     # Define critic parameters
-    critic_params = list(agent.critic_body.parameters()) + list(agent.critic_utility_head.parameters()) + list(agent.critic_returns_head.parameters())
+    # critic_params = list(agent.critic_body.parameters()) + list(agent.critic_utility_head.parameters()) + list(agent.critic_returns_head.parameters())
 
     optimizer = [
-        torch.optim.Adam(actor_params, lr=learning_rate, eps=1e-5),
-        torch.optim.Adam(critic_params, lr=learning_rate, eps=1e-5)
+        torch.optim.Adam(agent.actor.parameters(), lr=learning_rate, eps=1e-5),
+        torch.optim.Adam(agent.critic.parameters(), lr=learning_rate, eps=1e-5)
     ]
 
     if normalize_rewards:
@@ -278,7 +376,8 @@ def run_ppo(
         agent=agent,
         optimizer=optimizer,
         envs=envs,
-        utility_functions=utility_functions, # Pass the list of utilities
+        eval_envs=eval_envs, # Pass the separate eval environments
+        utility_functions=utility_functions, 
         env_is_discrete=env_is_discrete,
         reward_size=reward_size,
         learning_rate=learning_rate,
@@ -302,7 +401,9 @@ def run_ppo(
         logger=logger,
         convex=convex,
         scalar_reward=scalar_reward,
-        pareto_archive=pareto_archive
+        pareto_archive=pareto_archive,
+        eval_interval=eval_interval,
+        num_eval_episodes=num_eval_episodes
     )
     
     # Train the agent
@@ -347,6 +448,8 @@ def run_ppo(
             "anneal_lr": anneal_lr,
             "rpo_alpha": rpo_alpha,
             "seed": seed,
+            "eval_interval": eval_interval,
+            "num_eval_episodes": num_eval_episodes
         }
         with open(hparams_path, "w") as f:
             json.dump(hparams_to_json, f, indent = 4)
@@ -354,17 +457,19 @@ def run_ppo(
         print(f"Model saved to {model_path}")
 
         # 1. Visual Evaluation (GIFs)
+        # Note: We reuse training envs for visual check at end to save re-instantiation
         frames = load_and_evaluate_model(
             run_name,
             env_id,
             env_is_discrete,
             normalize_observations,
+            envs.env.obs_rms if normalize_observations else None,
             envs,
             num_envs,
             agent_class,
             device,
             model_path,
-            gamma,
+            eval_gamma,
             capture_video,
         )
 
@@ -373,6 +478,7 @@ def run_ppo(
         
     # Close environments
     envs.close()
+    eval_envs.close()
 
 
 if __name__ == "__main__":

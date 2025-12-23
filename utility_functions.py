@@ -97,62 +97,101 @@ class FTNProductUtility(UtilityFunction):
     u(r) = Product(r_i)
     """
     def __call__(self, r):
-        if isinstance(r, np.ndarray):
-            return np.prod(r, axis=-1)
-        else:
-            return torch.prod(r, dim=-1)
+        
+        r0 = r[..., 0]/10
+        r1 = r[..., 1]/10
+        r2 = r[..., 2]/10
+        return r0*r1*r2
 
-class FTNBenchmarkUtility(UtilityFunction):
+class FTNMaxUtility(UtilityFunction):
     """
-    The 5 utility functions used for Multi-Policy evaluation (MODeM 5.3.3).
-    These functions are defined on 2 objectives (r0, r1).
-    
-    Modes:
-    1: 'max' -> max(r0, r1)
-    2: 'min' -> min(r0, r1)
-    3: 'product' -> r0 * r1
-    4: 'mixed' -> w0 * r0^2 + w1 * r1
-    5: 'distance' -> - (w0(i0 - r0) + w1(i1 - r1))^2
+    Mode 1: Max
+    Returns max(r0, r1) after normalizing inputs by dividing by 10.
     """
-    def __init__(self, mode='max', w=(0.5, 0.5), ideal=(20.0, 20.0)):
-        self.mode = mode
+    def __call__(self, r):
+        # Normalize inputs
+        r0 = r[..., 0] / 10.0
+        r1 = r[..., 1] / 10.0
+
+        if isinstance(r, np.ndarray):
+            return np.maximum(r0, r1)
+        else:
+            return torch.max(r0, r1)
+
+class FTNMinUtility(UtilityFunction):
+    """
+    Mode 2: Min
+    Returns min(r0, r1) after normalizing inputs by dividing by 10.
+    """
+    def __call__(self, r):
+        r0 = r[..., 0] / 10.0
+        r1 = r[..., 1] / 10.0
+
+        if isinstance(r, np.ndarray):
+            return np.minimum(r0, r1)
+        else:
+            return torch.min(r0, r1)
+
+class FTN2ProductUtility(UtilityFunction):
+    """
+    Mode 3: Product
+    Returns r0 * r1 after normalizing inputs by dividing by 10.
+    """
+    def __call__(self, r):
+        r0 = r[..., 0] / 10.0
+        r1 = r[..., 1] / 10.0
+        return r0 * r1
+
+class FTNMixedUtility(UtilityFunction):
+    """
+    Mode 4: Mixed
+    Sorts the objectives and applies weights [2/3, 1/3] to the sorted values.
+    Result is normalized by dividing by 10.
+    """
+    def __init__(self):
+        self.weights_np = np.array([2/3, 1/3])
+        self.weights_torch = torch.tensor([2/3, 1/3])
+
+    def __call__(self, r):
+        # We operate on the first two dimensions
+        objs = r[..., :2]
+
+        if isinstance(r, np.ndarray):
+            # Sort along the last axis
+            sorted_objs = np.sort(objs, axis=-1)
+            # Dot product with weights
+            return np.dot(sorted_objs, self.weights_np) / 10.0
+        else:
+            # Ensure weights are on the correct device
+            if self.weights_torch.device != r.device:
+                self.weights_torch = self.weights_torch.to(r.device)
+            
+            sorted_objs = torch.sort(objs, dim=-1).values
+            
+            if r.dim() == 1:
+                return torch.dot(sorted_objs, self.weights_torch) / 10.0
+            else:
+                # Broadcasted sum/dot product
+                return torch.sum(sorted_objs * self.weights_torch, dim=-1) / 10.0
+
+class FTNDistanceUtility(UtilityFunction):
+    """
+    Mode 5: Distance
+    Weighted negative squared distance to an ideal point.
+    Uses raw objective values (unnormalized).
+    """
+    def __init__(self, w=(0.2, 0.8), ideal=(9.49729374, 8.77986293)):
         self.w = w
         self.i = ideal
 
     def __call__(self, r):
-        # We assume input is at least size 2. We use first two dims as per paper.
+        # Use raw values (index 0 and 1)
         r0 = r[..., 0]
         r1 = r[..., 1]
 
-        if self.mode == 'max': # u1
-            if isinstance(r, np.ndarray):
-                return np.maximum(r0, r1)
-            else:
-                return torch.max(r0, r1)
+        term0 = self.w[0] * (self.i[0] - r0)
+        term1 = self.w[1] * (self.i[1] - r1)
+        
+        return -((term0 + term1) ** 2)
 
-        elif self.mode == 'min': # u2
-            if isinstance(r, np.ndarray):
-                return np.minimum(r0, r1)
-            else:
-                return torch.min(r0, r1)
-
-        elif self.mode == 'product': # u3
-            return r0 * r1
-
-        elif self.mode == 'mixed': # u4: w0*r0^2 + w1*r1
-            return self.w[0] * (r0 ** 2) + self.w[1] * r1
-
-        elif self.mode == 'distance': # u5: Weighted distance to ideal point
-            term0 = self.w[0] * (self.i[0] - r0)
-            term1 = self.w[1] * (self.i[1] - r1)
-            return -((term0 + term1) ** 2)
-
-        else:
-            raise ValueError(f"Unknown mode {self.mode}")
-
-environment_map = {
-    "deep-sea-treasure-1": [DSTDebtUtility(),],
-    "deep-sea-treasure-2": [DSTGeneralUtility(mode='linear'), DSTGeneralUtility(mode='threshold'), DSTGeneralUtility(mode='ratio')],
-    "fruit-tree-1": [FTNProductUtility()],
-    "fruit-tree-5": [FTNBenchmarkUtility(mode='max'), FTNBenchmarkUtility(mode='min'), FTNBenchmarkUtility(mode='product'), FTNBenchmarkUtility(mode='mixed'), FTNBenchmarkUtility(mode='distance')],
-}
+        
