@@ -194,4 +194,38 @@ class FTNDistanceUtility(UtilityFunction):
         
         return -((term0 + term1) ** 2)
 
+class NSWSpeedRatioUtility(UtilityFunction):
+    """
+    NSW Speed Ratio Utility.
+    Robust implementation using log1p-like shift to avoid -inf and NaNs.
+    Formula: log(r1 + 1) + log(r2 + 1) - log(-fuel + 1)
+    """
+    def __call__(self, vec):
+        # We use a shift of 1.0 so u(0,0,0) = 0.
+        # This avoids gradients exploding at 0 and keeps values well-scaled.
+        c = 1e-10
+        
+        if isinstance(vec, np.ndarray):
+            vec = torch.tensor(vec)
+        
+        if vec.dim() == 1:
+            r0 = torch.clamp(vec[0], min=0)
+            r1 = torch.clamp(vec[1], min=0)
+            f = torch.clamp(vec[2], max=0) # Fuel is usually negative
+            
+            # log(r0 + 1) + log(r1 + 1) - log(-f + 1)
+            return torch.log(r0 + c) + torch.log(r1 + c) - torch.log(-f + c) 
+        else:
+            vec_shape = vec.shape
+            flat_vec = vec.view(-1,3)
+            
+            r0 = torch.clamp(flat_vec[:,0], min=0)
+            r1 = torch.clamp(flat_vec[:,1], min=0)
+            f = torch.clamp(flat_vec[:,2], max=0)
+
+            resources = torch.log(r0 + c) + torch.log(r1 + c) 
+            fuel = torch.log(-f + c)
+            return (resources - fuel).view(vec_shape[:len(vec_shape) - 1])
+
+
         

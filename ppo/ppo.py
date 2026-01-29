@@ -315,7 +315,7 @@ class PPO:
             
             with torch.no_grad():
                 action, _ = self.agent.sample_action_and_compute_log_prob(
-                    obs, acc_rewards, task_one_hot, deterministic=True, device=self.device
+                    obs, acc_rewards, task_one_hot, deterministic=False, device=self.device
                 )
             
             next_obs, reward, terminations, truncations, infos = self.eval_envs.step(action.cpu().numpy())
@@ -715,126 +715,108 @@ class PPO:
         # This represents pi_behavior(a|s), needed for the IS ratio.
         b_behavior_lp = self._flatten(storage['logprobs'])
 
-        # 2. Flatten & Repeat Data for Super Batch
-        M = self.num_tasks
-        mk_reps = lambda x: (M,) + (1,) * (x.ndim - 1)
+        # 2. Iterative optimization to save memory (Replaces Super Batch)
+        target_tasks = torch.arange(self.num_tasks, device=self.device)
+        total_real_samples = self.batch_size
+        inds = np.arange(total_real_samples)
+        
+        # Pre-calculate threshold
+        is_ratio_threshold = np.log(0.01)
 
-        super_obs = b_obs.repeat(*mk_reps(b_obs))
-        super_acc = b_acc.repeat(*mk_reps(b_acc))
-        super_act = b_actions.repeat(*mk_reps(b_actions))
-        
-        # [NEW] Repeat behavior logprobs to align with the super batch
-        super_behavior_lp = b_behavior_lp.repeat(*mk_reps(b_behavior_lp))
-        
-        # Track the Behavior Task ID for every sample in the Super Batch
-        super_behavior_task_ids = b_task_ids.repeat(M)
-
-        # 3. Construct Target Task IDs
-        # Pattern: [0,0... (B times), 1,1... (B times), ...]
-        task_indices = torch.arange(self.num_tasks, device=self.device).repeat_interleave(self.batch_size)
-        super_task_hot = self._get_one_hot_task(task_indices, self.batch_size * self.num_tasks)
-        
-        super_adv = torch.cat(all_task_advantages, dim=0)
-        super_old_lp = torch.cat(all_task_old_logprobs, dim=0)
-
-        total_samples = self.batch_size * M
-        inds = np.arange(total_samples)
-        
         for _ in range(self.update_epochs):
             np.random.shuffle(inds)
-            for start in range(0, total_samples, self.minibatch_size):
+            for start in range(0, total_real_samples, self.minibatch_size):
                 mb_inds = inds[start:start + self.minibatch_size]
 
-                mb_obs = super_obs[mb_inds]
-                mb_acc = super_acc[mb_inds]
-                mb_task = super_task_hot[mb_inds]
-                mb_act = super_act[mb_inds]
-                mb_adv = super_adv[mb_inds]
+                # Basic Minibatch Data (Behavioral)
+                mb_obs = b_obs[mb_inds]
+                mb_acc = b_acc[mb_inds]
+                mb_act = b_actions[mb_inds]
                 
-                # mb_old_lp is LogProb(Action | Target Task)
-                mb_old_lp = super_old_lp[mb_inds] 
+                # mb_behavior_lp: LogProb(Action | BehaviorPolicy)
+                mb_behavior_lp = b_behavior_lp[mb_inds]
                 
-                # [NEW] mb_behavior_lp is LogProb(Action | Behavior Task)
-                mb_behavior_lp = super_behavior_lp[mb_inds]
+                # mb_behavior_id: The ID of the task that generated this data
+                mb_behavior_id = b_task_ids[mb_inds]
                 
-                mb_target_id = task_indices[mb_inds]       
-                mb_behavior_id = super_behavior_task_ids[mb_inds]
-
-                # =========================================================
-                # 1. Dynamic IS-Based Plausibility Mask
-                # =========================================================
-                # Calculate Log Importance Sampling Weight: log( P_target / P_behavior )
-                # If 0: policies are identical. If negative: target is less likely.
-                log_is_weight = mb_old_lp - mb_behavior_lp
-                
-                # Threshold: Keep if action is at least 1% as likely under 
-                # the target policy as it was under the behavior policy.
-                # log(0.01) approx -4.6
-                is_ratio_threshold = np.log(0.01) 
-                
-                is_plausible = (log_is_weight > is_ratio_threshold)
-                
-                if self.num_tasks == 1:
-                    is_real = torch.ones_like(mb_target_id, dtype=torch.bool)
-                else:
-                    is_real = (mb_target_id == mb_behavior_id)
-                
-                keep_mask = (is_real | is_plausible).float()
-                
-                # Check if we have valid samples to avoid division by zero
-                valid_samples = keep_mask.sum()
-                
-                if valid_samples == 0:
-                    continue # Skip this minibatch if no samples are valid
-
-                # =========================================================
-                # 2. Compute New LogProbs
-                # =========================================================
-                new_lp, entropy = self.agent.compute_action_log_probabilities_and_entropy(
-                    mb_obs, mb_act, mb_acc, mb_task, self.device
-                )
-
-                logratio = new_lp - mb_old_lp
-                
-                # [SAFETY] Clamp logratio to prevent e^100 explosion in counterfactuals
-                if (logratio > 20.0).any():
-                    # Optional: Log this occurrence if debugging
-                    pass 
-                
-                logratio = torch.clamp(logratio, max=20.0) 
-                ratio = logratio.exp()
-
-                # Metrics (Apply mask to metrics to get accurate reporting)
-                with torch.no_grad():
-                    # Only calculate KL on kept samples
-                    approx_kl = (((ratio - 1) - logratio) * keep_mask).sum() / valid_samples
-                    clip_frac = ((((ratio - 1.0).abs() > self.surrogate_clip_threshold).float()) * keep_mask).sum() / valid_samples
-
-                # Loss Calculation
-                pg_loss1 = -mb_adv.squeeze() * ratio
-                pg_loss2 = -mb_adv.squeeze() * torch.clamp(ratio, 1.0 - self.surrogate_clip_threshold, 1.0 + self.surrogate_clip_threshold)
-                pg_loss_elementwise = torch.max(pg_loss1, pg_loss2)
-                ent_loss_elementwise = -entropy 
-                
-                total_loss_elementwise = pg_loss_elementwise + self.entropy_loss_coefficient * ent_loss_elementwise
-
-                # =========================================================
-                # 3. Apply Mask and NORMALIZE (Mean over valid)
-                # =========================================================
-                masked_loss = total_loss_elementwise * keep_mask
-                
-                # Divide by valid_samples to get the MEAN loss over valid data
-                actor_loss = masked_loss.sum() / (valid_samples + 1e-8)
-
+                # Reset Gradients for this Minibatch
                 self.optimizer[0].zero_grad()
-                actor_loss.backward()
-                nn.utils.clip_grad_norm_(self.agent.actor.parameters(), self.max_grad_norm)
-                self.optimizer[0].step()
+                
+                processed_tasks = 0
+                
+                # Loop through every TARGET task we want to improve
+                for t_idx in range(self.num_tasks):
+                    # 1. Retrieve Pre-Calculated Stats for Target Task
+                    # mb_old_lp_target: LogProb(Action | TargetPolicy_Old)
+                    mb_old_lp_target = all_task_old_logprobs[t_idx][mb_inds]
+                    mb_adv_target = all_task_advantages[t_idx][mb_inds]
+                    
+                    # 2. Calculate Importance Sampling Weights & Mask
+                    # log( P_target / P_behavior )
+                    log_is_weight = mb_old_lp_target - mb_behavior_lp
+                    
+                    is_plausible = (log_is_weight > is_ratio_threshold)
+                    
+                    # Real Data Check: If target task == behavior task, always keep (Real Experience)
+                    is_real = (mb_behavior_id == t_idx)
+                    
+                    keep_mask = (is_real | is_plausible)
+                    
+                    # 3. Filter Batch via Mask (Dynamic Batching)
+                    # We use boolean indexing to keep only valid samples for this task
+                    # This dramatically reduces VRAM usage compared to Super Batch
+                    if not keep_mask.any():
+                        continue
+                        
+                    processed_tasks += 1
+                    
+                    sub_obs = mb_obs[keep_mask]
+                    sub_acc = mb_acc[keep_mask]
+                    sub_act = mb_act[keep_mask]
+                    sub_old_lp = mb_old_lp_target[keep_mask]
+                    sub_adv = mb_adv_target[keep_mask]
+                    
+                    # Construct One-Hot for THIS specific task only
+                    # shape: (SubBatch, NumTasks)
+                    sub_task_hot = self._get_single_task_one_hot(t_idx, sub_obs.shape[0])
+                    
+                    # 4. Forward Pass (Actor) on Valid Subset
+                    new_lp, entropy = self.agent.compute_action_log_probabilities_and_entropy(
+                        sub_obs, sub_act, sub_acc, sub_task_hot, self.device
+                    )
+                    
+                    logratio = new_lp - sub_old_lp
+                    
+                    # [SAFETY] Clamp logratio
+                    logratio = torch.clamp(logratio, max=20.0)
+                    ratio = logratio.exp()
+                    
+                    # 5. PPO Loss Calculation
+                    pg_loss1 = -sub_adv * ratio
+                    pg_loss2 = -sub_adv * torch.clamp(ratio, 1.0 - self.surrogate_clip_threshold, 1.0 + self.surrogate_clip_threshold)
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                    ent_loss = -entropy.mean()
+                    
+                    loss = pg_loss + self.entropy_loss_coefficient * ent_loss
+                    
+                    # Accumulate Gradients
+                    # Note: We treat each task as an independent optimization term in the total loss
+                    loss.backward()
+                    
+                    # Metrics
+                    with torch.no_grad():
+                        approx_kl = ((ratio - 1) - logratio).mean()
+                        clip_frac = ((ratio - 1.0).abs() > self.surrogate_clip_threshold).float().mean()
+                        
+                        actor_loss_hist.append(pg_loss.item())
+                        entropy_hist.append(entropy.mean().item())
+                        kl_hist.append(approx_kl.item())
+                        clip_frac_hist.append(clip_frac.item())
 
-                actor_loss_hist.append(actor_loss.item())
-                entropy_hist.append(entropy.mean().item()) 
-                kl_hist.append(approx_kl.item())
-                clip_frac_hist.append(clip_frac.item())
+                # Step Optimizer (Accumulated gradients from all valid task-sample pairs)
+                if processed_tasks > 0:
+                    nn.utils.clip_grad_norm_(self.agent.actor.parameters(), self.max_grad_norm)
+                    self.optimizer[0].step()
 
         actor_end_time = time.time()
         actor_time = actor_end_time - actor_start_time

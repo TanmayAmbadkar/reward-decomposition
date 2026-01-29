@@ -58,6 +58,7 @@ ENVIRONMENT_UTILITY_MAP = {
         FTNMixedUtility(),
         FTNDistanceUtility(),
     ],
+    "minecart-nsw-speed": [NSWSpeedRatioUtility()],
 }
 
 def set_seed(seed, torch_deterministic=True):
@@ -230,7 +231,7 @@ def run_ppo(
     eval_gamma: float = 0.99,
     gae_lambda: float = 1.0,
     surrogate_clip_threshold: float = 0.2,
-    entropy_loss_coefficient: float = 0.02,
+    entropy_loss_coefficient: float = 0.00,
     policy_gradient_loss_coefficient: float = 1.0,
     value_function_loss_coefficient: float = 0.5,
     normalize_advantages: bool = True,
@@ -294,6 +295,11 @@ def run_ppo(
             lambda: mo_gym.make("fruit-tree-v0", depth = 7) 
             for _ in range(num_envs)
         )
+    elif env_id.startswith("minecart"):
+        envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+            lambda: mo_gym.make("minecart-v0") 
+            for _ in range(num_envs)
+        )
     else:
         # Generic MO-Gym
         envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
@@ -320,6 +326,11 @@ def run_ppo(
     elif env_id.startswith("fruit-tree"):
         eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
             lambda: mo_gym.make("fruit-tree-v0", depth = 7) 
+            for _ in range(num_envs)
+        )
+    elif env_id.startswith("minecart"):
+        eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+            lambda: mo_gym.make("minecart-v0") 
             for _ in range(num_envs)
         )
     else:
