@@ -225,7 +225,7 @@ class ContinuousAgent(BaseAgent):
         )
         self.actor_logstd = nn.Parameter(
             # torch.zeros(1, np.prod(action_space))
-            torch.zeros(1, np.prod(action_space))
+            -torch.ones(1, np.prod(action_space))
         )
         
         # 3) now make a *container* module and stick both parts on it

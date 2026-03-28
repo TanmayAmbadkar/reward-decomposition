@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 from torch.distributions.dirichlet import Dirichlet
 from morl_baselines.common.pareto import ParetoArchive
+from tabulate import tabulate
 
 
 class LinearLRSchedule:
@@ -90,6 +91,17 @@ class PPOLogger:
                 update_results["explained_variance"],
                 global_step,
             )
+            self.writer.add_scalar(
+                "diagnostics/cancellation_rate",
+                update_results["cancellation_rate"],
+                global_step
+            )
+            for pair, sim in update_results["cos_sim_results"].items():
+                self.writer.add_scalar(
+                    f"diagnostics/{pair}",
+                    sim,
+                    global_step
+                )
 
     def write_video(self, frames):
     
@@ -680,7 +692,9 @@ class PPO:
         assert collected_observations.shape[0] == batch_size
         batch_indices = np.arange(batch_size)
         clipping_fractions = []
+        cancellation_rates = []  # NEW
 
+        cos_sim_results = {}
         for _ in range(self.update_epochs):
             np.random.shuffle(batch_indices)
             value_function_losses, all_policy_losses, entropy_losses, kl_div = [], [], [], []
@@ -694,20 +708,20 @@ class PPO:
                 old_logp = collected_action_log_probs[idx]
                 acts_mb = collected_actions[idx]
                 adv_mb = computed_advantages[idx]      # [N, d]
-                w_mb = collected_weights[idx]         # [N, d]
+                w_mb = collected_weights[idx]           # [N, d]
 
                 # --- Get new policy and value estimates ---
                 new_logp, entropy = self.agent.compute_action_log_probabilities_and_entropy(
                     obs_mb, acts_mb, w_mb
                 )
                 new_value = self.agent.estimate_value_from_observation(obs_mb, w_mb)
-                # 3) Importance sampling ratio & KL estimates
+
+                # Importance sampling ratio & KL estimates
                 log_ratio = new_logp - old_logp
                 ratio = log_ratio.exp()
                 with torch.no_grad():
                     old_kl = (-log_ratio).mean()
                     new_kl = ((ratio - 1) - log_ratio).mean()
-                    # clipping fraction
                     clipping_fractions.append(
                         ((ratio - 1.0).abs() > self.surrogate_clip_threshold)
                         .float()
@@ -718,10 +732,10 @@ class PPO:
                 # --- Critic Update (Separate) ---
                 value_function_loss = self.calculate_value_function_loss(
                     new_value,
-                    computed_returns, # Use full returns_mb
+                    computed_returns,
                     previous_value_estimates,
                     idx,
-                    (w_mb != 0).float() # Use mask
+                    (w_mb != 0).float()
                 ) * self.value_function_loss_coefficient
                 
                 self.optimizer[1].zero_grad()
@@ -734,56 +748,143 @@ class PPO:
                 
                 # adv_mb = w_mb * adv_mb  # ENABLE TO REMOVE LSW
                 
-                # 1. Calculate the standard, weighted PPO policy loss (your current method)
+                # 1. Calculate the standard, weighted PPO policy loss
                 if self.normalize_advantages:
                     adv_mb = (adv_mb - adv_mb.mean(dim=0)) / (adv_mb.std(dim=0) + 1e-8)
-                
-                # weighted_adv_mb = adv_mb * w_mb
-                # Summing the losses from each objective's weighted advantage
-                # Note: Your calculate_policy_gradient_loss should handle the sum over objectives
+
+                # =====================================================================
+                # DIAGNOSTIC 1: Advantage Cancellation Rate (Lemma E.1)
+                # Computed AFTER normalization since that is what the surrogate sees.
+                # Measures how much signal ES would destroy relative to LSW.
+                # cancellation = 1 - |ω⊤A| / Σωᵢ|Aᵢ|
+                # Rate of 0 = no conflict, Rate of 1 = complete cancellation
+                # =====================================================================
+                with torch.no_grad():
+                    # What ES feeds into the surrogate: scalarized advantage per sample
+                    scalar_adv = (adv_mb * w_mb).sum(dim=1)           # [N]
+                    # What LSW preserves: sum of weighted absolute advantages per sample
+                    weighted_abs = (adv_mb.abs() * w_mb.abs()).sum(dim=1)  # [N]
+                    # Cancellation rate: fraction of signal lost under ES
+                    nonzero_mask = weighted_abs > 1e-8
+                    cancellation = torch.zeros(adv_mb.shape[0], device=adv_mb.device)
+                    cancellation[nonzero_mask] = 1.0 - (
+                        scalar_adv[nonzero_mask].abs() / weighted_abs[nonzero_mask]
+                    )
+                    cancellation_rates.append(cancellation.mean().item())
+                # =====================================================================
+                # END DIAGNOSTIC 1
+                # =====================================================================
+
                 policy_losses = self.calculate_policy_gradient_loss(
-                    adv_mb,  # Use the weights to scale the advantages
+                    adv_mb,
                     (new_logp - old_logp).exp().reshape(-1, 1)
                 )
                 
-                policy_losses = policy_losses * w_mb # ENABLE FOR LSW
-                policy_losses = policy_losses.mean(dim = 0)  # Sum over the reward dimensions
+                policy_losses = policy_losses * w_mb  # ENABLE FOR LSW
+                policy_losses = policy_losses.mean(dim=0)
+
+                # =====================================================================
+                # DIAGNOSTIC 2: Per-Objective Gradient Cosine Similarity
+                # Computed every 10k global steps to avoid overhead.
+                # Shows that objective conflict genuinely exists during training —
+                # confirming LSW's trust-region bounding is doing meaningful work.
+                # Only computed for multi-objective settings (d > 1).
+                # =====================================================================
+                d = adv_mb.shape[1]
+                if d > 1:
+                    per_obj_grads = []
+                    for i in range(d):
+                        self.optimizer[0].zero_grad()
+                        
+                        # Recompute fresh log probs for this objective
+                        # (graph from main forward pass is already freed at this point)
+                        new_logp_i, _ = self.agent.compute_action_log_probabilities_and_entropy(
+                            obs_mb, acts_mb, w_mb
+                        )
+                        ratio_i = (new_logp_i - old_logp).exp().reshape(-1, 1)
+                        
+                        # Per-objective surrogate on raw normalized advantage (Equation 2)
+                        A_i = adv_mb[:, i:i+1]  # [N, 1]
+                        loss_i = self.calculate_policy_gradient_loss(
+                            A_i, ratio_i
+                        ).mean()
+                        
+                        # Retain graph for all but the last objective
+                        loss_i.backward(retain_graph=(i < d - 1))
+                        
+                        # Extract gradients from shared actor layers only
+                        grads = []
+                        for name, param in self.agent.actor.named_parameters():
+                            if param.grad is not None:
+                                grads.append(param.grad.detach().flatten())
+                        if grads:
+                            per_obj_grads.append(torch.cat(grads))
+                            # Log per-objective gradient norm
+                            grad_norm = torch.norm(torch.cat(grads)).item()
+                            cos_sim_results[f"grad_norm_obj{i}"] = grad_norm
+                    
+                    # Pairwise cosine similarities between all objective gradient pairs
+                    cos_fn = torch.nn.CosineSimilarity(dim=0)
+                    for i in range(d):
+                        for j in range(i + 1, d):
+                            sim = cos_fn(per_obj_grads[i], per_obj_grads[j]).item()
+                            cos_sim_results[f"cos_sim_obj{i}_obj{j}"] = sim
+                    
+                    # Compute combined gradient norm from per-objective gradients
+                    combined_grad = torch.stack(per_obj_grads).sum(dim=0)
+                    combined_grad_norm = torch.norm(combined_grad).item()
+                    cos_sim_results[f"combined_grad_norm_diag2"] = combined_grad_norm
+                    
+                    # Zero grad before the real actor update below
+                    self.optimizer[0].zero_grad()
+                # =====================================================================
+                # END DIAGNOSTIC 2
+                # =====================================================================
 
                 # 2. Calculate the Diversity Penalty
-                # a. Sample distractor weights on the fly
                 noise = torch.randn_like(w_mb) * self.noise_level
                 distractor_noisy = w_mb + noise
                 distractor_clipped = torch.clamp(distractor_noisy, min=0)
-                distractor_weights_mb = distractor_clipped / (torch.sum(distractor_clipped, dim=1, keepdim=True) + 1e-8)
+                distractor_weights_mb = distractor_clipped / (
+                    torch.sum(distractor_clipped, dim=1, keepdim=True) + 1e-8
+                )
 
-                # b. Get action distributions
-                current_action_dist = self.agent.get_action_distribution(torch.hstack([obs_mb, w_mb]))
+                current_action_dist = self.agent.get_action_distribution(
+                    torch.hstack([obs_mb, w_mb])
+                )
                 with torch.no_grad():
-                    distractor_action_dist = self.agent.get_action_distribution(torch.hstack([obs_mb, distractor_weights_mb]))
+                    distractor_action_dist = self.agent.get_action_distribution(
+                        torch.hstack([obs_mb, distractor_weights_mb])
+                    )
 
-                # c. Calculate the actual KL divergence
                 actual_kl_divergence = torch.distributions.kl.kl_divergence(
                     current_action_dist, distractor_action_dist
                 ).mean()
 
-                # d. Calculate the TARGET KL divergence based on weight distance
                 with torch.no_grad():
-                    # Calculate the L1 distance between the preference vectors
                     weight_distance = torch.abs(w_mb - distractor_weights_mb).sum(dim=1).mean()
-                    # Set the target KL. self.diversity_scale is a new hyperparameter (e.g., 0.5)
                     target_kl_divergence = self.diversity_scale * weight_distance
 
-                # 3. Construct the Final Loss
-                # The diversity loss is now the squared error between the actual and target KL.
-                # We want to MINIMIZE this error, so we ADD it to the loss.
-                diversity_loss = self.lambda_diversity * (target_kl_divergence - actual_kl_divergence).pow(2)
+                diversity_loss = self.lambda_diversity * (
+                    target_kl_divergence - actual_kl_divergence
+                ).pow(2)
 
                 ent_loss = self.entropy_loss_coefficient * entropy.mean()
                 
                 total_actor_loss = sum(policy_losses) - ent_loss + diversity_loss
                 
-                # 4. Perform a single backward pass and step for the actor.
+                # 4. Single backward pass and step for the actor
                 total_actor_loss.backward()
+                
+                # Log final combined gradient norm before clipping
+                final_grads = []
+                for name, param in self.agent.actor.named_parameters():
+                    if param.grad is not None:
+                        final_grads.append(param.grad.detach().flatten())
+                if final_grads:
+                    final_grad_norm = torch.norm(torch.cat(final_grads)).item()
+                    cos_sim_results[f"actual_grad_norm"] = final_grad_norm
+                
                 nn.utils.clip_grad_norm_(self.agent.actor.parameters(), self.max_grad_norm)
                 self.optimizer[0].step()
                 
@@ -799,16 +900,34 @@ class PPO:
             np.nan if var_r == 0 else 1 - np.var(actual - predicted) / var_r
         )
 
-        return {
+        update_results = {
             "policy_loss": np.mean(all_policy_losses),
-            # "policy_loss": policy_losses,
             "value_loss": np.mean(value_function_losses),
             "entropy_loss": np.mean(entropy_losses),
-            # "old_approx_kl": old_kl.item(),
             "approx_kl": np.mean(kl_div),
             "clipping_fractions": np.mean(clipping_fractions),
             "explained_variance": explained_var,
+            "cancellation_rate": np.mean(cancellation_rates),  # NEW
+            "cos_sim_results": cos_sim_results,                 # NEW — dict, empty if not computed this update
         }
+        
+        # Format and print results as a nice table
+        table_data = []
+        for key, value in update_results.items():
+            if key == "cos_sim_results":
+                # Handle cosine similarity results separately if not empty
+                if value:
+                    for sim_key, sim_val in value.items():
+                        table_data.append([sim_key, f"{sim_val:.4f}"])
+            else:
+                if isinstance(value, float):
+                    table_data.append([key, f"{value:.6f}"])
+                else:
+                    table_data.append([key, str(value)])
+        
+        print("\n" + tabulate(table_data, headers=["Metric", "Value"], tablefmt="grid"))
+        
+        return update_results
 
 
     def calculate_policy_gradient_loss(self, minibatch_advantages, probability_ratio):
