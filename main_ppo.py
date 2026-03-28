@@ -284,7 +284,7 @@ def run_ppo(
         logger=logger,
         convex=convex,
         scalar_reward=scalar_reward,
-        pareto_archive=pareto_archive
+        pareto_archive=pareto_archive,
     )
     print(ppo.agent)
     # Train the agent

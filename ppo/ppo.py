@@ -819,9 +819,6 @@ class PPO:
                                 grads.append(param.grad.detach().flatten())
                         if grads:
                             per_obj_grads.append(torch.cat(grads))
-                            # Log per-objective gradient norm
-                            grad_norm = torch.norm(torch.cat(grads)).item()
-                            cos_sim_results[f"grad_norm_obj{i}"] = grad_norm
                     
                     # Pairwise cosine similarities between all objective gradient pairs
                     cos_fn = torch.nn.CosineSimilarity(dim=0)
