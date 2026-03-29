@@ -18,3 +18,21 @@ register(
         'cost_objective': False,
     }
 )
+
+register(
+    id='lunar-lander-v1',
+    entry_point='envs.lander:MOLunarLanderEnv',
+    max_episode_steps=1000,
+    kwargs={
+        'continuous': False,
+    }
+)
+
+register(
+    id='lunar-lander-continuous-v1',
+    entry_point='envs.lander:MOLunarLanderEnv',
+    max_episode_steps=1000,
+    kwargs={
+        'continuous': True,
+    }
+)

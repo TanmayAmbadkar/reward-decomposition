@@ -25,6 +25,7 @@ import mo_gymnasium as mo_gym
 from envs.building_env import BuildingEnv_9d
 from envs.utils_building import ParameterGenerator
 from envs.dst import DeepSeaTreasureEnv
+from envs.lander import MOLunarLanderEnv
 from gymnasium.wrappers.vector import NormalizeObservation
 from ppo.utils import RunningMeanStd
 from morl_baselines.common.pareto import ParetoArchive
@@ -37,7 +38,6 @@ from utility_functions import *
 # Environment & Utility Configuration
 # ==========================================
 
-# Map environment IDs to their specific utility function lists
 ENVIRONMENT_UTILITY_MAP = {
     "deep-sea-treasure-1": [DSTDebtUtility()],
     "deep-sea-treasure-3": [
@@ -59,6 +59,14 @@ ENVIRONMENT_UTILITY_MAP = {
         FTNDistanceUtility(),
     ],
     "minecart-nsw-speed": [NSWSpeedRatioUtility()],
+    # Single-utility Lunar Lander experiments (learning curves, Fig 1 equivalent)
+    "lunar-lander-fuel": [LLFuelConstrainedLanding()],
+    "lunar-lander-joint": [LLJointSuccess()],
+    "lunar-lander-3": [
+        LLFuelConstrainedLanding(),
+        LLJointSuccess(),
+        LLSafetyFirst(),
+    ],
 }
 
 def set_seed(seed, torch_deterministic=True):
@@ -258,7 +266,7 @@ def run_ppo(
         print(
             f"rpo_alpha is not used in discrete environments. Ignoring rpo_alpha={rpo_alpha}"
         )
-
+    # After the env_id parameter is received, before environment construction
     # Set up run name and logging
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     run_name = f"{env_id}__{exp_name}__{datetime.now()}__{seed}"
@@ -300,6 +308,11 @@ def run_ppo(
             lambda: mo_gym.make("minecart-v0") 
             for _ in range(num_envs)
         )
+    elif env_id.startswith("lunar-lander"):
+        envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+            [lambda: MOLunarLanderEnv(continuous=not env_is_discrete)
+            for _ in range(num_envs)]
+        )
     else:
         # Generic MO-Gym
         envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
@@ -332,6 +345,11 @@ def run_ppo(
         eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
             lambda: mo_gym.make("minecart-v0") 
             for _ in range(num_envs)
+        )
+    elif env_id.startswith("lunar-lander"):
+        eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+            [lambda: MOLunarLanderEnv(continuous=not env_is_discrete)
+            for _ in range(num_envs)]
         )
     else:
         # Generic MO-Gym (No RecordVideo for internal eval)
