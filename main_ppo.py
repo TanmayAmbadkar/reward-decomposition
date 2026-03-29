@@ -26,6 +26,7 @@ from envs.building_env import BuildingEnv_9d
 from envs.utils_building import ParameterGenerator
 from envs.dst import DeepSeaTreasureEnv
 from envs.lander import MOLunarLanderEnv
+from envs.mo_gym_hopper import MOHopperEnv
 from gymnasium.wrappers.vector import NormalizeObservation
 from ppo.utils import RunningMeanStd
 from morl_baselines.common.pareto import ParetoArchive
@@ -60,13 +61,14 @@ ENVIRONMENT_UTILITY_MAP = {
     ],
     "minecart-nsw-speed": [NSWSpeedRatioUtility()],
     # Single-utility Lunar Lander experiments (learning curves, Fig 1 equivalent)
-    "lunar-lander-fuel": [LLFuelConstrainedLanding()],
+    "lunar-lander-fuel": [LLTrajectoryQuality()],
     "lunar-lander-joint": [LLJointSuccess()],
     "lunar-lander-3": [
-        LLFuelConstrainedLanding(),
+        LLTrajectoryQuality(),
         LLJointSuccess(),
         LLSafetyFirst(),
     ],
+    "hopper-linear": [HopperLinearCalibration()],
 }
 
 def set_seed(seed, torch_deterministic=True):
@@ -125,7 +127,7 @@ def load_and_evaluate_model(
     
     obs, _ = eval_envs.reset()
     if normalize_observations:
-        obs = obs_rms.normalize(obs)
+        obs = (obs - obs_rms.mean) / ((obs_rms.var + 1e-8) ** 0.5)
     obs = torch.tensor(obs, dtype=torch.float32, device=device)
     
     acc_rewards = torch.zeros((num_envs, reward_size), device=device)
@@ -163,7 +165,7 @@ def load_and_evaluate_model(
         
         next_obs, rews, dones, truncs, infos = eval_envs.step(actions)
         if normalize_observations:
-            next_obs = obs_rms.normalize(next_obs)
+            next_obs = (next_obs - obs_rms.mean) / ((obs_rms.var + 1e-8) ** 0.5)
         
         reward_tens = torch.tensor(rews, dtype=torch.float32, device=device).reshape(num_envs, reward_size)
         
@@ -231,22 +233,22 @@ def run_ppo(
     convex: bool = True,
     scalar_reward: bool = False,
     total_timesteps: int = 5000000,
-    num_rollout_steps: int = 2048,
+    num_rollout_steps: int = 512,
     update_epochs: int = 10,
     num_minibatches: int = 32,
     learning_rate: float = 0.0003,
-    gamma: float = 0.995,
-    eval_gamma: float = 0.99,
+    gamma: float = 1.0,
+    eval_gamma: float = 1.0,
     gae_lambda: float = 1.0,
     surrogate_clip_threshold: float = 0.2,
-    entropy_loss_coefficient: float = 0.00,
+    entropy_loss_coefficient: float = 0.02,
     policy_gradient_loss_coefficient: float = 1.0,
     value_function_loss_coefficient: float = 0.5,
     normalize_advantages: bool = True,
-    normalize_observations: bool = False, # Often False for GridWorlds
+    normalize_observations: bool = True, # Often False for GridWorlds
     normalize_rewards: bool = False,
     clip_value_function_loss: bool = False,
-    max_grad_norm: float = 0.5,
+    max_grad_norm: float = 10.0,
     target_kl: float = None,
     anneal_lr: bool = False,
     rpo_alpha: float = None,
@@ -313,6 +315,11 @@ def run_ppo(
             [lambda: MOLunarLanderEnv(continuous=not env_is_discrete)
             for _ in range(num_envs)]
         )
+    elif env_id.startswith("hopper"):
+        envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+            [lambda: MOHopperEnv()
+            for _ in range(num_envs)]
+        )
     else:
         # Generic MO-Gym
         envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
@@ -348,7 +355,12 @@ def run_ppo(
         )
     elif env_id.startswith("lunar-lander"):
         eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            [lambda: MOLunarLanderEnv(continuous=not env_is_discrete)
+            [lambda: gym.make("lunar-lander-v1")
+            for _ in range(num_envs)]
+        )
+    elif env_id.startswith("hopper"):
+        eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
+            [lambda: MOHopperEnv()
             for _ in range(num_envs)]
         )
     else:

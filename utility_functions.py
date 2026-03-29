@@ -227,6 +227,7 @@ class NSWSpeedRatioUtility(UtilityFunction):
             fuel = torch.log(-f + c)
             return (resources - fuel).view(vec_shape[:len(vec_shape) - 1])
 
+
 # ==========================================
 # Multi-Objective Lunar Lander Utilities
 #
@@ -235,346 +236,298 @@ class NSWSpeedRatioUtility(UtilityFunction):
 #   r[..., 1] = fuel_cost       (always <= 0, cumulative engine cost)
 #   r[..., 2] = terminal_reward (+100 safe landing, -100 crash, 0 timeout)
 #
-# Derived objectives:
-#   O1 = (shaping + terminal) / 300
-#        Landing quality. Clean landing ~ 0.93-1.10. Crash ~ -0.25 to -0.64.
-#        Naturally separates crashes from landings via the terminal term.
+# KEY DESIGN DECISION
+# -------------------
+# Utilities are formulated around shaping_reward and fuel_cost ONLY.
+# terminal_reward is used exclusively as a crash detector (binary flag).
 #
-#   O2 = clip(-fuel / 35.8, 0, 1.5)
-#        Fuel efficiency. Scaled so median landed episode = 0.70.
-#        Clipped at 1.5 to prevent anomalous high-fuel episodes dominating.
-#        Efficient landing ~ 0.63-0.70. Wasteful landing ~ 0.82-0.89.
+# Reason: terminal_reward = +100 only appears on successful landings.
+# During early training the agent rarely lands, so utilities that require
+# terminal = +100 to score positively provide no learning signal until
+# the agent can already land — a chicken-and-egg problem.
+#
+# By using shaping as the primary quality signal, the utilities provide
+# meaningful gradient information from the very first episode:
+#   - Crashed episodes:  shaping typically negative, crash flag fires
+#   - Timeout episodes:  shaping near zero or slightly positive
+#   - Good flight:       shaping strongly positive (150-260)
+#
+# The SER/ESR gap argument is fully preserved:
+#   SER can average crash episodes (large negative shaping) against
+#   good flight episodes and look acceptable overall.
+#   ESR penalises every crash episode individually, forcing the policy
+#   to achieve consistent non-crash behavior.
 #
 # Calibrated from 500 heuristic episodes (continuous=True):
-#   Landed: 99.8%  |  shaping p50=212  |  fuel p50=25.07  |  steps p50=197
+#   shaping p10=180  p50=212  p90=236  (landed episodes)
+#   fuel    p10=22   p50=25   p90=32   (landed episodes)
+#   crash rate: 0.2%  (heuristic)
 #
 # Normalisation constants
 # -----------------------
-O1_SCALE = 300.0   # (max shaping ~260) + (terminal +100) gives O1 ~ 1.0-1.2
-O2_SCALE = 35.8    # sets median landed episode to O2 = 0.70
-O2_CLIP  = 1.5     # prevents anomalous episodes from dominating gradients
+SHAPING_SCALE = 200.0   # sets good flight episode to ~1.0
+FUEL_SCALE    = 35.8    # sets median landed episode fuel efficiency to 0.70
+FUEL_CLIP     = 1.5     # prevents anomalous high-fuel episodes dominating
 # ==========================================
-
-
-def _compute_objectives(r):
-    """
-    Compute (O1, O2) from the raw cumulative reward vector.
-    Handles numpy arrays and torch tensors, batched and unbatched.
-
-    O1 = (shaping + terminal) / O1_SCALE
-    O2 = clip(-fuel / O2_SCALE, 0, O2_CLIP)
-    """
-    O1 = (r[..., 0] + r[..., 2]) / O1_SCALE
-    O2 = -r[..., 1] / O2_SCALE
-
+ 
+ 
+def _crashed(r):
+    """Returns boolean mask: True where terminal_reward indicates a crash."""
+    terminal = r[..., 2]
     if isinstance(r, np.ndarray):
-        O2 = np.clip(O2, 0.0, O2_CLIP)
+        return terminal <= -100.0
     else:
-        O2 = torch.clamp(O2, min=0.0, max=O2_CLIP)
-
-    return O1, O2
-
-
-# ==========================================
-# U1 — Fuel-Constrained Landing
-#
-# "Land well, but you have a fuel budget."
-#
-# Mirrors DSTDebtUtility in structure — three branches:
-#   crashed              → crash_penalty  (prison)
-#   landed, fuel ok      → O1 - quality_debt  (surplus)
-#   landed, over budget  → O1 - quality_debt - (excess² + late_fee)
-#
-# fuel_budget=25.0 is the p50 of landed fuel cost, splitting landed
-# episodes roughly 50/50 between on-time and late-fee branches.
-# This is the primary single-utility experiment function.
-#
-# Expected ranges (heuristic policy, continuous):
-#   Good efficient landing : ~0.70-0.81
-#   Good wasteful landing  : ~0.60-0.70 minus late penalty
-#   Crash                  : -2.0 (hard)
-# ==========================================
-
-class LLFuelConstrainedLanding(UtilityFunction):
+        return terminal <= -100.0
+ 
+ 
+def _shaping_norm(r):
+    """Normalised shaping reward. Good flight ~ 1.0, crash ~ -0.5 to -1.0."""
+    return r[..., 0] / SHAPING_SCALE
+ 
+ 
+def _fuel_eff(r):
     """
-    Fuel-constrained landing utility for Lunar Lander.
-
-    Three-branch structure mirroring DSTDebtUtility:
-      1. Crashed (terminal == -100):
-             u = crash_penalty                           [hard failure]
-      2. Landed safely, |fuel_cost| <= fuel_budget:
-             u = O1 - quality_debt                      [surplus quality]
-      3. Landed safely, |fuel_cost| > fuel_budget:
-             u = O1 - quality_debt - (excess² + late_fee)  [penalised quality]
-
+    Normalised fuel efficiency. Higher = less fuel burned.
+    Clipped to [0, FUEL_CLIP] so anomalous episodes don't dominate.
+    """
+    raw = -r[..., 1] / FUEL_SCALE
+    if isinstance(r, np.ndarray):
+        return np.clip(raw, 0.0, FUEL_CLIP)
+    else:
+        return torch.clamp(raw, min=0.0, max=FUEL_CLIP)
+ 
+ 
+# ==========================================
+# U1 — Crash-Penalised Trajectory Quality
+#
+# "Fly well. Don't crash."
+#
+# u = crash_penalty          if crashed
+#     shaping / 200          otherwise
+#
+# The simplest utility that provides signal from episode 1:
+#   - Any non-crash episode gets credit proportional to shaping quality
+#   - Crash episodes get a hard penalty well below any non-crash score
+#
+# SER/ESR gap: SER can average crash episodes (-1.0) against good flight
+# episodes (+1.0) and appear acceptable. ESR penalises every crash,
+# forcing the policy to avoid crashes consistently.
+#
+# This is the primary single-utility experiment function (Fig 1 equivalent).
+#
+# Expected ranges:
+#   Good flight (shaping~212)  :  ~1.06
+#   Poor flight (shaping~0)    :  ~0.0
+#   Crash                      :  -2.0
+# ==========================================
+ 
+class LLTrajectoryQuality(UtilityFunction):
+    """
+    Crash-penalised trajectory quality utility.
+ 
+    u(r) = crash_penalty          if terminal == -100
+           shaping / SHAPING_SCALE  otherwise
+ 
     Parameters
     ----------
-    fuel_budget : float
-        Maximum tolerable absolute fuel cost. Default 25.0 = p50 of landed
-        heuristic episodes, creating a meaningful 50/50 on-time/late split.
-    quality_debt : float
-        Minimum acceptable O1. Episodes landing with poor trajectory quality
-        are still penalised even without a fuel violation. Default 0.2.
     crash_penalty : float
-        Utility for crash episodes. Default -2.0, well below the range of
-        non-crash outcomes to create a hard disincentive.
-    late_fee : float
-        Additive constant in the over-budget fuel penalty. Default 0.05.
+        Utility for crash episodes. Default -2.0, well below the range
+        of non-crash outcomes [-0.5, 1.3] to create a hard disincentive.
     """
-
-    def __init__(
-        self,
-        fuel_budget: float   = 25.0,
-        quality_debt: float  = 0.2,
-        crash_penalty: float = -2.0,
-        late_fee: float      = 0.05,
-    ):
-        self.fuel_budget   = fuel_budget
-        self.quality_debt  = quality_debt
+ 
+    def __init__(self, crash_penalty: float = -2.0):
         self.crash_penalty = crash_penalty
-        self.late_fee      = late_fee
-
+ 
     def __call__(self, r):
-        O1, _    = _compute_objectives(r)
-        terminal = r[..., 2]
-        fuel_abs = -r[..., 1]                   # positive, more = worse
-
-        # Excess is computed in raw fuel units, then normalised for the penalty
-        excess   = fuel_abs - self.fuel_budget
-        excess_n = excess / O2_SCALE            # normalise so penalty is ~O1-scale
-        late_pen = excess_n ** 2 + self.late_fee
-        surplus  = O1 - self.quality_debt
-
+        shaping = _shaping_norm(r)
+        crashed = _crashed(r)
+ 
         if isinstance(r, np.ndarray):
-            crashed     = terminal <= -100.0
-            over_budget = (~crashed) & (excess > 0)
-            return np.select(
-                [crashed, over_budget],
-                [self.crash_penalty, surplus - late_pen],
-                default=surplus,
-            )
+            return np.where(crashed, self.crash_penalty, shaping)
         else:
-            crashed     = terminal <= -100.0
-            over_budget = (~crashed) & (excess > 0)
-            crash_val   = torch.full_like(O1, self.crash_penalty)
-            return torch.where(
-                crashed,
-                crash_val,
-                torch.where(over_budget, surplus - late_pen, surplus),
-            )
-
-
+            crash_val = torch.full_like(shaping, self.crash_penalty)
+            return torch.where(crashed, crash_val, shaping)
+ 
+ 
 # ==========================================
-# U2 — Joint Success
+# U2 — Crash-Penalised Joint Success
 #
-# "Land accurately AND use fuel efficiently, every single time."
+# "Fly well AND use fuel efficiently. Don't crash."
 #
-# u = O1 * O2  with explicit crash guard
+# u = crash_penalty              if crashed
+#     shaping_norm * fuel_eff    otherwise
 #
-# The mathematically cleanest utility for demonstrating the SER/ESR
-# covariance gap (Section 3.3):
+# The product utility makes the SER/ESR covariance gap explicit
+# (Section 3.3 of the paper):
 #
-#   JESR - JSER = Cov(O1, O2)
+#   JESR - JSER = Cov(shaping_norm, fuel_eff)
 #
-# A policy that crashes occasionally (O1 < 0) and is efficient otherwise
-# produces a negative product on crash episodes, dragging ESR down.
-# Under SER these average out. The product makes the covariance term
-# directly measurable in per-episode (O1, O2) scatter plots.
+# A SER policy can mix "good shaping, wasteful fuel" with "poor shaping,
+# efficient fuel" episodes and average to an acceptable score.
+# An ESR policy must achieve both jointly within every episode.
 #
-# Crash episodes get explicit crash_penalty rather than the raw product
-# (which could be small negative for some crashes) to ensure clean
-# separation between crash and non-crash outcomes across both discrete
-# and continuous variants.
+# Crash episodes return a hard penalty rather than the raw product
+# (which could be negative-times-positive = negative, but inconsistently
+# scaled) to ensure clean separation from non-crash outcomes.
 #
-# Expected ranges (heuristic policy, continuous):
-#   Good efficient landing : ~0.59-0.72
-#   Good wasteful landing  : ~0.82-0.99
-#   Crash                  : -1.0 (explicit)
+# Expected ranges:
+#   Good efficient flight  :  ~1.06 * 0.70 = ~0.74
+#   Good wasteful flight   :  ~1.06 * 0.89 = ~0.94
+#   Poor flight            :  ~0.0
+#   Crash                  :  -1.0
 # ==========================================
-
+ 
 class LLJointSuccess(UtilityFunction):
     """
-    Product utility over landing quality and fuel efficiency.
-
-    u(r) = O1 * O2              for non-crash episodes
-           crash_penalty         for crash episodes (terminal == -100)
-
-    where O1 = (shaping + terminal) / 300
-          O2 = clip(-fuel / 35.8, 0, 1.5)
-
-    Both objectives must be jointly high for the product to be large.
-    Directly exposes Cov(O1, O2) — the quantity SER ignores and ESR rewards.
-
+    Crash-penalised product utility over trajectory quality and fuel efficiency.
+ 
+    u(r) = crash_penalty                        if terminal == -100
+           shaping_norm * fuel_eff              otherwise
+ 
+    where shaping_norm = shaping / 200
+          fuel_eff      = clip(-fuel / 35.8, 0, 1.5)
+ 
+    Directly exposes Cov(shaping_norm, fuel_eff) — the quantity SER ignores.
+ 
     Parameters
     ----------
     crash_penalty : float
-        Explicit penalty for crash episodes. Default -1.0. Ensures clean
-        separation from non-crash outcomes in both discrete and continuous
-        variants where raw O1*O2 for crashes may be small negative.
+        Explicit penalty for crash episodes. Default -1.0.
     """
-
+ 
     def __init__(self, crash_penalty: float = -1.0):
         self.crash_penalty = crash_penalty
-
+ 
     def __call__(self, r):
-        O1, O2   = _compute_objectives(r)
-        terminal = r[..., 2]
-        product  = O1 * O2
-
+        shaping  = _shaping_norm(r)
+        fuel     = _fuel_eff(r)
+        crashed  = _crashed(r)
+        product  = shaping * fuel
+ 
         if isinstance(r, np.ndarray):
-            crashed = terminal <= -100.0
-            return np.where(crashed, self.crash_penalty, product)
+            # return np.where(crashed, self.crash_penalty, product)
+            return product
         else:
-            crashed   = terminal <= -100.0
             crash_val = torch.full_like(product, self.crash_penalty)
-            return torch.where(crashed, crash_val, product)
-
-
+            # return torch.where(crashed, crash_val, product)
+            return product
+ 
+ 
 # ==========================================
-# U3 — Safety First
+# U3 — Efficiency Under Safety
 #
-# "I only care about fuel efficiency once safety is guaranteed."
+# "I only care about fuel efficiency once you're flying safely."
 #
-# u = O2               if O1 >= safety_threshold
-#     safety_penalty   otherwise
+# u = crash_penalty        if crashed
+#     poor_flight_penalty  if shaping < safety_threshold (flew poorly)
+#     fuel_eff             otherwise (flew well — measure efficiency)
 #
-# Models a lexicographic-style preference where safety is a hard constraint
-# and fuel efficiency is the secondary objective. The most distinctly
-# safety-critical utility in the portfolio.
+# Three meaningful levels that provide signal throughout training:
+#   Level 1 (early training):  crash vs no-crash distinction
+#   Level 2 (mid training):    poor vs good flight distinction
+#   Level 3 (late training):   fuel efficiency optimisation
 #
-# Under SER: the policy can occasionally fall below the safety threshold
-# as long as the average O1 is above it, keeping average fuel efficiency high.
-# Under ESR: every single episode must clear the threshold or the hard
-# penalty dominates, forcing consistent safety before fuel optimisation.
+# This is the most distinctly safety-critical utility. Under SER the
+# policy can occasionally fly poorly as long as average shaping is above
+# the threshold. Under ESR every episode must clear the safety threshold
+# before fuel efficiency matters.
 #
-# safety_threshold=0.3 corresponds to (shaping + terminal) >= 90.
-# All 35 crashes in the discrete calibration and the 1 in continuous
-# fall below this — confirmed clean separation.
+# safety_threshold=0.0 means any episode with positive net shaping is
+# considered "safe" — a low bar that the agent can clear early in training,
+# giving U3 a meaningful non-crash signal from the start.
 #
-# Expected ranges (heuristic policy, continuous):
-#   Safe episode   : O2 in [0.59, 0.89] → u in [0.59, 0.89]
-#   Unsafe episode : -1.0 (hard)
+# Expected ranges:
+#   Good efficient flight  :  fuel_eff ~ 0.70
+#   Good wasteful flight   :  fuel_eff ~ 0.89
+#   Poor flight (no crash) :  -0.5
+#   Crash                  :  -1.0
 # ==========================================
-
+ 
 class LLSafetyFirst(UtilityFunction):
     """
-    Safety-first utility for Lunar Lander.
-
-    u(r) = O2                    if O1 >= safety_threshold
-           safety_penalty         otherwise
-
-    where O1 = (shaping + terminal) / 300
-          O2 = clip(-fuel / 35.8, 0, 1.5)
-
-    Safety is a hard constraint; fuel efficiency is the objective once
-    safety is met. The starkest demonstration of the ESR/SER gap:
-    SER can average over safety violations, ESR cannot tolerate any.
-
+    Three-level safety-first utility for Lunar Lander.
+ 
+    u(r) = crash_penalty          if terminal == -100      (crashed)
+           poor_flight_penalty    if shaping_norm < threshold  (flew poorly)
+           fuel_eff               otherwise                (flew well)
+ 
+    where shaping_norm = shaping / 200
+          fuel_eff      = clip(-fuel / 35.8, 0, 1.5)
+ 
     Parameters
     ----------
     safety_threshold : float
-        Minimum O1 for an episode to be considered safe. Default 0.3,
-        confirmed to cleanly separate all crashes from all landings in
-        calibration (crashes: O1 in [-0.64, -0.25], landings: O1 > 0.77).
-    safety_penalty : float
-        Utility for unsafe episodes. Default -1.0, well below the O2
-        range of [0.59, 0.89] for safe episodes.
+        Minimum normalised shaping for an episode to be considered safe.
+        Default 0.0 — any positive net shaping clears the bar.
+        Episodes below this are penalised but not as harshly as crashes.
+    poor_flight_penalty : float
+        Penalty for episodes that didn't crash but flew poorly.
+        Default -0.5, between crash_penalty and the fuel_eff range.
+    crash_penalty : float
+        Penalty for crash episodes. Default -1.0.
     """
-
+ 
     def __init__(
         self,
-        safety_threshold: float = 0.3,
-        safety_penalty: float   = -1.0,
+        safety_threshold: float  = 0.0,
+        poor_flight_penalty: float = -0.5,
+        crash_penalty: float     = -1.0,
     ):
-        self.safety_threshold = safety_threshold
-        self.safety_penalty   = safety_penalty
-
+        self.safety_threshold    = safety_threshold
+        self.poor_flight_penalty = poor_flight_penalty
+        self.crash_penalty       = crash_penalty
+ 
     def __call__(self, r):
-        O1, O2 = _compute_objectives(r)
-
+        shaping = _shaping_norm(r)
+        fuel    = _fuel_eff(r)
+        crashed = _crashed(r)
+        flew_poorly = shaping < self.safety_threshold
+ 
         if isinstance(r, np.ndarray):
-            unsafe  = O1 < self.safety_threshold
-            return np.where(unsafe, self.safety_penalty, O2)
+            return np.select(
+                [crashed, flew_poorly],
+                [self.crash_penalty, self.poor_flight_penalty],
+                default=fuel,
+            )
         else:
-            unsafe    = O1 < self.safety_threshold
-            pen_val   = torch.full_like(O2, self.safety_penalty)
-            return torch.where(unsafe, pen_val, O2)
-
-
+            crash_val = torch.full_like(fuel, self.crash_penalty)
+            poor_val  = torch.full_like(fuel, self.poor_flight_penalty)
+            return torch.where(
+                crashed,
+                crash_val,
+                torch.where(flew_poorly, poor_val, fuel),
+            )
+ 
+ 
+ 
 # ==========================================
-# Portfolio and single-utility exports
+# Hopper Calibration Utility
+#
+# Used ONLY for initial training to calibrate reward ranges.
+# Run for 500k-1M steps, then use the trained policy to
+# measure R[0], R[2] distributions for real utility design.
+#
+# Reward vector (cumulative episode return):
+#   r[..., 0] = x_velocity      (forward progress, higher = faster)
+#   r[..., 1] = jump_height     (z distance, mostly ignored)
+#   r[..., 2] = energy_cost     (always <= 0, control cost)
 # ==========================================
-
-# Multi-utility portfolio for multi-task / Table 1 style experiments
-LLANDER_PORTFOLIO = [
-    LLFuelConstrainedLanding(),
-    LLJointSuccess(),
-    LLSafetyFirst(),
-]
-
-# Primary single-utility for learning curve experiments (Fig 1 equivalent)
-LLANDER_SINGLE_UTILITY = LLFuelConstrainedLanding()
-
-
-# ==========================================
-# Smoke test — verifies expected value ranges
-# ==========================================
-if __name__ == "__main__":
-    # Representative episodes based on calibration statistics
-    episodes = np.array([
-        [ 212.0,  -25.0,  100.0],   # good efficient landing  (median)
-        [ 212.0,  -32.0,  100.0],   # good wasteful landing   (p90 fuel)
-        [  50.0,  -20.0, -100.0],   # crash
-        [ 160.0,  -25.0,  100.0],   # marginal landing
-    ], dtype=np.float32)
-
-    labels = [
-        "efficient landing",
-        "wasteful landing ",
-        "crash            ",
-        "marginal landing ",
-    ]
-
-    utilities = [
-        LLFuelConstrainedLanding(),
-        LLJointSuccess(),
-        LLSafetyFirst(),
-    ]
-    names = ["U1_FuelConstrained", "U2_JointSuccess   ", "U3_SafetyFirst    "]
-
-    # Print O1, O2 for each episode
-    print(f"\n{'Episode':<22} {'O1':>7} {'O2':>7}")
-    print("-" * 38)
-    for i, label in enumerate(labels):
-        r = episodes[i]
-        O1 = (r[0] + r[2]) / O1_SCALE
-        O2 = float(np.clip(-r[1] / O2_SCALE, 0.0, O2_CLIP))
-        print(f"{label:<22} {O1:>7.3f} {O2:>7.3f}")
-
-    print(f"\n{'Episode':<22} " + " ".join(f"{n:>20}" for n in names))
-    print("-" * (22 + 21 * len(utilities)))
-    for i, label in enumerate(labels):
-        r = episodes[i]
-        vals = []
-        for u in utilities:
-            v = u(r)
-            vals.append(f"{float(v):>20.4f}")
-        print(f"{label:<22} " + " ".join(vals))
-
-    print("\nBatched numpy:")
-    for u, name in zip(utilities, names):
-        result = u(episodes)
-        arr = result if isinstance(result, np.ndarray) else result.numpy()
-        print(f"  {name}: {arr}")
-
-    print("\nBatched torch:")
-    t_ep = torch.tensor(episodes)
-    for u, name in zip(utilities, names):
-        result = u(t_ep)
-        print(f"  {name}: {result}")
-
-    print("\nExpected approximate values:")
-    print("  efficient landing: U1~0.72  U2~0.67  U3~0.70")
-    print("  wasteful landing:  U1~0.60  U2~0.74  U3~0.74  (U1 pays late fee)")
-    print("  crash:             U1=-2.0  U2=-1.0  U3=-1.0")
-    print("  marginal landing:  U1~0.56  U2~0.55  U3~0.70")
+ 
+ 
+class HopperLinearCalibration(UtilityFunction):
+    """
+    Simple linear utility for calibration training run.
+ 
+    u(r) = R[0] / 100.0
+ 
+    Just forward velocity, normalised loosely so values are
+    in a reasonable range for the critic to learn.
+    Ignore R[1] and R[2] for now.
+ 
+    After training converges, run calibrate_hopper.py to
+    measure the true R[0] and R[2] ranges of a competent policy.
+    """
+ 
+    def __call__(self, r):
+        return r[..., 0] / 100.0
+ 

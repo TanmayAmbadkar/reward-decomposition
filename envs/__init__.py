@@ -6,7 +6,7 @@ register(
     entry_point='envs.mo_gym_hopper:MOHopperEnv',
     max_episode_steps=500,
     kwargs={
-        'cost_objective': False,
+        'cost_objective': True,
     }
 )
 
