@@ -18,7 +18,7 @@ import imageio
 # Custom imports
 from func_to_script import script
 from ppo.agent import ContinuousAgent, DiscreteAgent
-from ppo.ppo import PPO, PPOLogger
+from ppo.ppo import PPO, PPOLogger   # CHANGED: import ESR_PPO
 import envs
 from envs.utils import SyncVectorEnv, RecordEpisodeStatistics
 import mo_gymnasium as mo_gym
@@ -35,6 +35,7 @@ from morl_baselines.common.performance_indicators import hypervolume, sparsity, 
 # Utility Functions
 from utility_functions import *
 
+
 # ==========================================
 # Environment & Utility Configuration
 # ==========================================
@@ -42,16 +43,16 @@ from utility_functions import *
 ENVIRONMENT_UTILITY_MAP = {
     "deep-sea-treasure-1": [DSTDebtUtility()],
     "deep-sea-treasure-3": [
-        DSTGeneralUtility(mode='linear'), 
-        DSTGeneralUtility(mode='threshold'), 
-        DSTGeneralUtility(mode='ratio')
+        DSTGeneralUtility(mode='linear'),
+        DSTGeneralUtility(mode='threshold'),
+        DSTGeneralUtility(mode='ratio'),
     ],
-    "fruit-tree-prod": [FTNProductUtility()],
-    "fruit-tree-max": [FTNMaxUtility()],
-    "fruit-tree-min": [FTNMinUtility()],
+    "fruit-tree-prod":  [FTNProductUtility()],
+    "fruit-tree-max":   [FTNMaxUtility()],
+    "fruit-tree-min":   [FTNMinUtility()],
     "fruit-tree-2prod": [FTN2ProductUtility()],
     "fruit-tree-mixed": [FTNMixedUtility()],
-    "fruit-tree-dist": [FTNDistanceUtility()],
+    "fruit-tree-dist":  [FTNDistanceUtility()],
     "fruit-tree-5": [
         FTNMaxUtility(),
         FTNMinUtility(),
@@ -60,16 +61,18 @@ ENVIRONMENT_UTILITY_MAP = {
         FTNDistanceUtility(),
     ],
     "minecart-nsw-speed": [NSWSpeedRatioUtility()],
-    # Single-utility Lunar Lander experiments (learning curves, Fig 1 equivalent)
-    "lunar-lander-fuel": [LLTrajectoryQuality()],
-    "lunar-lander-joint": [LLJointSuccess()],
+    # Lunar Lander
+    "lunar-lander-quality": [LLTrajectoryQuality()],
+    "lunar-lander-joint":   [LLJointSuccess()],
     "lunar-lander-3": [
         LLTrajectoryQuality(),
         LLJointSuccess(),
         LLSafetyFirst(),
     ],
+    # Hopper
     "hopper-linear": [HopperLinearCalibration()],
 }
+
 
 def set_seed(seed, torch_deterministic=True):
     random.seed(seed)
@@ -78,133 +81,164 @@ def set_seed(seed, torch_deterministic=True):
     torch.backends.cudnn.deterministic = torch_deterministic
 
 
+def _make_envs(env_id, num_envs, run_name=None, record_video=False):
+    """
+    Centralised environment factory.
+    Returns a MOSyncVectorEnv for any supported env_id.
+    Using a single factory avoids duplicating construction logic for
+    training and eval environments.
+    """
+    def _make_one():
+        if env_id == "building":
+            return BuildingEnv_9d(
+                ParameterGenerator(
+                    Building='OfficeLarge',
+                    Weather='Warm_Marine',
+                    Location='ElPaso',
+                )
+            )
+        elif env_id.startswith("deep-sea-treasure"):
+            return DeepSeaTreasureEnv()
+        elif env_id.startswith("fruit-tree"):
+            return mo_gym.make("fruit-tree-v0", depth=7)
+        elif env_id.startswith("minecart"):
+            return mo_gym.make("minecart-v0")
+        elif env_id.startswith("lunar-lander"):
+            # env_is_discrete is not available here — default to continuous
+            # override by passing continuous= explicitly if needed
+            return MOLunarLanderEnv(continuous=True)
+        elif env_id.startswith("hopper"):
+            return MOHopperEnv()
+        else:
+            if record_video and run_name is not None:
+                return gym.wrappers.RecordVideo(
+                    mo_gym.make(env_id, render_mode="rgb_array"),
+                    f"runs/{run_name}/videos",
+                )
+            return mo_gym.make(env_id, render_mode="rgb_array")
+
+    return mo_gym.wrappers.vector.MOSyncVectorEnv(
+        [_make_one for _ in range(num_envs)]
+    )
+
+
 def load_and_evaluate_model(
     run_name,
     env_id,
     env_is_discrete,
     normalize_observations,
     obs_rms,
-    envs,
+    eval_envs,
     num_envs,
     agent_class,
     device,
     model_path,
-    gamma,
     capture_video,
-    eval_task_id=None
+    eval_task_id=None,
 ):
-    # Run comprehensive evaluation matching PPO.evaluate logic
-    eval_episodes = 10
-    eval_envs = envs
+    """
+    Post-training comprehensive evaluation.
+    Accumulates raw (undiscounted) returns then applies utility functions.
+    """
+    eval_episodes  = 10
+    utility_funcs  = ENVIRONMENT_UTILITY_MAP.get(env_id, [lambda r: r.sum(-1)])
+    num_tasks      = len(utility_funcs)
 
     eval_agent = agent_class(eval_envs).to(device)
     eval_agent.load_state_dict(torch.load(model_path, map_location=device))
     eval_agent.eval()
-    frames_per_env = [[] for _ in range(num_envs)]  # one list of frames per env
 
-    # Get Task Size & Utils
-    task_size = eval_agent.task_size
-    utility_funcs = ENVIRONMENT_UTILITY_MAP.get(env_id, None)
-    if utility_funcs is None:
-        utility_funcs = [lambda r: r.sum(-1)] # Default to sum
-        
-    num_tasks = len(utility_funcs)
-    reward_size = eval_agent.reward_size
+    reward_size    = eval_agent.reward_size
+    frames_per_env = [[] for _ in range(num_envs)]
+    results        = {t_id: [] for t_id in range(num_tasks)}
 
-    print(f"--- Starting Comprehensive Evaluation ---")
-    
-    # Dictionary to store results: task_id -> list of utilities
-    results = {t_id: [] for t_id in range(num_tasks)}
-    
-    # We process tasks in chunks based on available eval envs
-    # If eval_task_id is specified, only evaluate that task
     if eval_task_id is not None:
         tasks_to_run = np.repeat([eval_task_id], eval_episodes)
     else:
         tasks_to_run = np.repeat(np.arange(num_tasks), eval_episodes)
-        
+
     total_episodes_needed = len(tasks_to_run)
-    
+
     obs, _ = eval_envs.reset()
-    if normalize_observations:
+    if normalize_observations and obs_rms is not None:
         obs = (obs - obs_rms.mean) / ((obs_rms.var + 1e-8) ** 0.5)
     obs = torch.tensor(obs, dtype=torch.float32, device=device)
-    
-    acc_rewards = torch.zeros((num_envs, reward_size), device=device)
-    acc_gamma = torch.ones((num_envs, 1), device=device)
-    
+
+    # FIXED: raw accumulation — no gamma discounting
+    acc_rewards  = torch.zeros((num_envs, reward_size), device=device)
     active_tasks = torch.zeros(num_envs, dtype=torch.long, device=device)
     env_task_ptr = np.full(num_envs, -1, dtype=np.int32)
-    
-    # Fill initially
+
     params_ptr = 0
     for i in range(num_envs):
         if params_ptr < total_episodes_needed:
             active_tasks[i] = int(tasks_to_run[params_ptr])
             env_task_ptr[i] = params_ptr
-            params_ptr += 1
-    
+            params_ptr     += 1
+
     def get_one_hot_task(task_idx_tensor, batch_size):
         task_one_hot = torch.zeros((batch_size, num_tasks), device=device)
         if num_tasks > 0:
-            task_idx_tensor = task_idx_tensor.long()
-            task_one_hot.scatter_(1, task_idx_tensor.unsqueeze(1), 1.0)
+            task_one_hot.scatter_(1, task_idx_tensor.long().unsqueeze(1), 1.0)
         return task_one_hot
 
     while (env_task_ptr != -1).any():
         task_one_hot = get_one_hot_task(active_tasks, num_envs)
-        
+
         with torch.no_grad():
             actions, _ = eval_agent.predict(
-                obs, 
-                acc_rewards,
-                task_one_hot,
-                deterministic=True, 
-                device=device
+                obs, acc_rewards, task_one_hot,
+                deterministic=True, device=device,
             )
-        
-        next_obs, rews, dones, truncs, infos = eval_envs.step(actions)
-        if normalize_observations:
-            next_obs = (next_obs - obs_rms.mean) / ((obs_rms.var + 1e-8) ** 0.5)
-        
-        reward_tens = torch.tensor(rews, dtype=torch.float32, device=device).reshape(num_envs, reward_size)
-        
-        # Mask out idle environments
-        idle_mask = torch.tensor(env_task_ptr == -1, device=device).unsqueeze(1)
-        reward_tens[idle_mask.squeeze(1)] = 0.0
 
-        acc_rewards += acc_gamma * reward_tens
-        acc_gamma *= gamma
-        
-        is_done = torch.logical_or(torch.tensor(dones), torch.tensor(truncs)).to(device)
-        
+        next_obs, rews, dones, truncs, infos = eval_envs.step(actions)
+
+        if normalize_observations and obs_rms is not None:
+            next_obs = (next_obs - obs_rms.mean) / ((obs_rms.var + 1e-8) ** 0.5)
+
+        reward_tens = torch.tensor(
+            rews, dtype=torch.float32, device=device
+        ).reshape(num_envs, reward_size)
+
+        idle_mask = torch.tensor(env_task_ptr == -1, device=device)
+        reward_tens[idle_mask] = 0.0
+
+        # FIXED: raw accumulation, no gamma
+        acc_rewards += reward_tens
+
+        is_done = torch.logical_or(
+            torch.tensor(dones), torch.tensor(truncs)
+        ).to(device)
+
         if is_done.any():
-            done_indices = torch.where(is_done)[0]
-            for idx in done_indices:
-                if env_task_ptr[idx.item()] != -1:
-                    task_id = active_tasks[idx].item()
+            for idx in torch.where(is_done)[0]:
+                i = idx.item()
+                if env_task_ptr[i] != -1:
+                    task_id   = active_tasks[idx].item()
                     final_vec = acc_rewards[idx]
-                    u_val = utility_funcs[task_id](final_vec).item()
+                    u_val     = utility_funcs[task_id](final_vec).item()
                     results[task_id].append(u_val)
-                    
-                    print(f"Task {task_id} finished. Vec={final_vec.cpu().numpy()}, Utility={u_val:.3f}")
-                    
-                    acc_rewards[idx] = 0
-                    acc_gamma[idx] = 1.0
-                    
+
+                    print(
+                        f"Task {task_id} | "
+                        f"Vec={final_vec.cpu().numpy().round(3)} | "
+                        f"Utility={u_val:.4f}"
+                    )
+
+                    acc_rewards[idx] = 0.0
+
                     if params_ptr < total_episodes_needed:
                         active_tasks[idx] = int(tasks_to_run[params_ptr])
-                        env_task_ptr[idx.item()] = params_ptr
-                        params_ptr += 1
+                        env_task_ptr[i]   = params_ptr
+                        params_ptr       += 1
                     else:
-                        env_task_ptr[idx.item()] = -1 
-        
+                        env_task_ptr[i] = -1
+
         obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
 
         if capture_video:
             all_frames = eval_envs.render()
             for i in range(num_envs):
-                # Only record frames if the environment is active
                 if env_task_ptr[i] != -1:
                     frames_per_env[i].append(all_frames[i])
 
@@ -212,314 +246,259 @@ def load_and_evaluate_model(
 
     print("\n--- Evaluation Summary ---")
     for t_id, vals in results.items():
-        if len(vals) > 0:
-            print(f"Task {t_id}: Min={np.min(vals):.3f} Mean={np.mean(vals):.3f} Max={np.max(vals):.3f} | Returns={vals}")
+        if vals:
+            print(
+                f"Task {t_id}: "
+                f"Min={np.min(vals):.4f}  "
+                f"Mean={np.mean(vals):.4f}  "
+                f"Max={np.max(vals):.4f} | "
+                f"All={[round(v,4) for v in vals]}"
+            )
 
-    # Once done, save each environment's frames to an individual GIF
     if capture_video:
         for i in range(num_envs):
             gif_name = f"gifs/{run_name}_eval_env_{i}.gif"
-            if len(frames_per_env[i]) > 0:
+            if frames_per_env[i]:
                 imageio.mimsave(gif_name, frames_per_env[i], fps=30)
-                print(f"Saved GIF for env {i}: {gif_name}")
-                
+                print(f"Saved GIF: {gif_name}")
+
     return frames_per_env
+
 
 @script
 def run_ppo(
-    env_id: str = "deep-sea-treasure-1", # Default to new ID
-    env_is_discrete: bool = True, # DST is discrete
-    num_envs: int = 4,
-    convex: bool = True,
-    scalar_reward: bool = False,
-    total_timesteps: int = 5000000,
-    num_rollout_steps: int = 512,
-    update_epochs: int = 10,
-    num_minibatches: int = 32,
-    learning_rate: float = 0.0003,
-    gamma: float = 1.0,
-    eval_gamma: float = 1.0,
-    gae_lambda: float = 1.0,
-    surrogate_clip_threshold: float = 0.2,
-    entropy_loss_coefficient: float = 0.02,
-    policy_gradient_loss_coefficient: float = 1.0,
-    value_function_loss_coefficient: float = 0.5,
-    normalize_advantages: bool = True,
-    normalize_observations: bool = True, # Often False for GridWorlds
-    normalize_rewards: bool = False,
-    clip_value_function_loss: bool = False,
-    max_grad_norm: float = 10.0,
-    target_kl: float = None,
-    anneal_lr: bool = False,
-    rpo_alpha: float = None,
-    seed: int = 1,
-    torch_deterministic: bool = True,
-    capture_video: bool = False,
-    use_tensorboard: bool = True,
-    save_model: bool = True,
-    eval_interval: int = 10000,
-    num_eval_episodes: int = 10
+    env_id: str                  = "deep-sea-treasure-1",
+    env_is_discrete: bool        = True,
+    num_envs: int                = 4,
+    total_timesteps: int         = 5000000,
+    # ESR-PPO episode collection params (replaces num_rollout_steps)
+    episodes_per_update: int     = 64*4,
+    min_episodes_per_task: int   = 64,
+    max_episode_steps: int       = 1000,
+    # Optimisation
+    update_epochs: int           = 5,
+    num_minibatches: int         = 8,
+    learning_rate: float         = 3e-3,
+    gamma: float                 = 1.0,       # ESR uses undiscounted returns
+    discount_utility: bool            = True,      # whether to discount utility calculation
+    surrogate_clip_threshold: float  = 0.2,
+    entropy_loss_coefficient: float  = 0.01,
+    max_grad_norm: float         = 0.5,
+    target_kl: float             = None,
+    anneal_lr: bool              = True,
+    normalize_advantages: bool   = False,
+    normalize_observations: bool = False,
+    normalize_rewards: bool      = False,
+    # Counterfactual IS weighting
+    cf_weight_min: float         = 0.1,    # floor IS weight
+    cf_weight_max: float         = 5.0,    # ceiling IS weight
+   # Agent
+    rpo_alpha: float             = None,
+    # Misc
+    seed: int                    = 1,
+    torch_deterministic: bool    = True,
+    capture_video: bool          = False,
+    use_tensorboard: bool        = True,
+    save_model: bool             = True,
+    eval_interval: int           = 5000,
+    num_eval_episodes: int       = 10,
+    
 ):
     """
-    Main function to run the PPO (Proximal Policy Optimization) algorithm.
-    """
+    Main training entry point for ESR-PPO.
 
+    Key differences from standard PPO:
+      - num_rollout_steps replaced by episodes_per_update + min_episodes_per_task
+      - gae_lambda removed (no GAE — MC returns on complete episodes)
+      - traj_clip_threshold added (trajectory-level PPO clip)
+      - counterfactual_quantile added (adaptive IS threshold)
+      - gamma fixed to 1.0 (ESR requires undiscounted returns)
+    """
     if env_is_discrete and rpo_alpha is not None:
-        print(
-            f"rpo_alpha is not used in discrete environments. Ignoring rpo_alpha={rpo_alpha}"
-        )
-    # After the env_id parameter is received, before environment construction
-    # Set up run name and logging
-    exp_name: str = os.path.basename(__file__)[: -len(".py")]
+        print(f"rpo_alpha ignored for discrete environments.")
+
+    exp_name = os.path.basename(__file__)[: -len(".py")]
     run_name = f"{env_id}__{exp_name}__{datetime.now()}__{seed}"
     set_seed(seed, torch_deterministic)
 
-    # Set up device
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    # ==========================
-    # Environment Initialization
-    # ==========================
-    
-    # 1. Select Utility Functions based on Env ID map
+    # -----------------------------------------------------------------------
+    # Utility functions
+    # -----------------------------------------------------------------------
     utility_functions = ENVIRONMENT_UTILITY_MAP.get(env_id, None)
     if utility_functions is None:
-        # Fallback / Warning
-        print(f"Warning: No utility functions mapped for {env_id}. Defaulting to Sum.")
-        
-    # 2. Select Environment Constructor (User Specified Logic)
-    if env_id == "building":
-        envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            lambda: BuildingEnv_9d(ParameterGenerator(Building='OfficeLarge', Weather='Warm_Marine', Location='ElPaso')) 
-            for _ in range(num_envs)
-        )
-    elif env_id.startswith("deep-sea-treasure"):
-        # Map variants to specific env args if needed, or just use base
-        envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            lambda: DeepSeaTreasureEnv() 
-            for _ in range(num_envs)
-        )
-    elif env_id.startswith("fruit-tree"):
-        envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            lambda: mo_gym.make("fruit-tree-v0", depth = 7) 
-            for _ in range(num_envs)
-        )
-    elif env_id.startswith("minecart"):
-        envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            lambda: mo_gym.make("minecart-v0") 
-            for _ in range(num_envs)
-        )
-    elif env_id.startswith("lunar-lander"):
-        envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            [lambda: MOLunarLanderEnv(continuous=not env_is_discrete)
-            for _ in range(num_envs)]
-        )
-    elif env_id.startswith("hopper"):
-        envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            [lambda: MOHopperEnv()
-            for _ in range(num_envs)]
-        )
-    else:
-        # Generic MO-Gym
-        envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            lambda: gym.wrappers.RecordVideo(mo_gym.make(env_id, render_mode = "rgb_array"), f"runs/{run_name}/videos") for _ in range(num_envs)
-        )
-        
-    if normalize_observations:
-        envs = NormalizeObservation(envs)
-    envs = mo_gym.wrappers.vector.MORecordEpisodeStatistics(envs, gamma=eval_gamma)
+        print(f"Warning: No utility functions for {env_id}. Defaulting to sum.")
+        utility_functions = [lambda r: r.sum(-1)]
 
-    # 3. Create Evaluation Environments (Mirroring User Logic)
-    # We replicate the construction logic to ensure eval envs match training envs exactly.
-    # Note: We skip RecordVideo for eval_envs to reduce I/O overhead during periodic eval.
-    if env_id == "building":
-        eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            lambda: BuildingEnv_9d(ParameterGenerator(Building='OfficeLarge', Weather='Warm_Marine', Location='ElPaso')) 
-            for _ in range(num_envs)
-        )
-    elif env_id.startswith("deep-sea-treasure"):
-        eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            lambda: DeepSeaTreasureEnv() 
-            for _ in range(num_envs)
-        )
-    elif env_id.startswith("fruit-tree"):
-        eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            lambda: mo_gym.make("fruit-tree-v0", depth = 7) 
-            for _ in range(num_envs)
-        )
-    elif env_id.startswith("minecart"):
-        eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            lambda: mo_gym.make("minecart-v0") 
-            for _ in range(num_envs)
-        )
-    elif env_id.startswith("lunar-lander"):
-        eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            [lambda: gym.make("lunar-lander-v1")
-            for _ in range(num_envs)]
-        )
-    elif env_id.startswith("hopper"):
-        eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            [lambda: MOHopperEnv()
-            for _ in range(num_envs)]
-        )
-    else:
-        # Generic MO-Gym (No RecordVideo for internal eval)
-        eval_envs = mo_gym.wrappers.vector.MOSyncVectorEnv(
-            lambda: mo_gym.make(env_id, render_mode = "rgb_array") for _ in range(num_envs)
-        )
+    # -----------------------------------------------------------------------
+    # Environments
+    # -----------------------------------------------------------------------
+    training_envs = _make_envs(env_id, num_envs, run_name, record_video=False)
+    eval_envs_raw = _make_envs(env_id, num_envs, run_name, record_video=False)
 
     if normalize_observations:
-        eval_envs = NormalizeObservation(eval_envs)
-    eval_envs = mo_gym.wrappers.vector.MORecordEpisodeStatistics(eval_envs, gamma=eval_gamma)
+        training_envs = NormalizeObservation(training_envs)
+        eval_envs_raw = NormalizeObservation(eval_envs_raw)
 
-    print(f"Env: {env_id}, Reward Shape: {envs.rewards_shape}")
-    print(f"Obs Space: {envs.observation_space}, Action Space: {envs.action_space}")
-    print(f"Selected Utility Functions: {len(utility_functions) if utility_functions else 0}")
-
-    # Set up agent
-    
-    reward_size = envs.rewards_shape[-1]
-    
-    # Task Size = Number of Utility Functions
-    task_size = len(utility_functions) if utility_functions else 0
-    
-    agent_class = (
-        partial(DiscreteAgent, reward_size=reward_size, task_size=task_size)
-        if env_is_discrete
-        else partial(ContinuousAgent, rpo_alpha=rpo_alpha, reward_size=reward_size, task_size=task_size)
+    # FIXED: always gamma=1.0 for MORecordEpisodeStatistics so dr field
+    # contains raw undiscounted returns (needed for utility evaluation)
+    training_envs = mo_gym.wrappers.vector.MORecordEpisodeStatistics(
+        training_envs, gamma=1.0
+    )
+    eval_envs_wrapped = mo_gym.wrappers.vector.MORecordEpisodeStatistics(
+        eval_envs_raw, gamma=1.0
     )
 
-    if "mario" in env_id or "rgb" in env_id:
-        agent_class = partial(CNNDiscreteAgent, reward_size=reward_size, task_size=task_size)
+    reward_size = training_envs.rewards_shape[-1]
+    task_size   = len(utility_functions)
 
-    agent = agent_class(envs).to(device)
+    print(f"Env: {env_id}")
+    print(f"Reward shape: {training_envs.rewards_shape}")
+    print(f"Obs space:    {training_envs.observation_space}")
+    print(f"Action space: {training_envs.action_space}")
+    print(f"Utility functions: {task_size}")
 
-    # Optimizer
-    # Define actor parameters
-    # actor_params = list(agent.actor.parameters()) + list(agent.actor_head.parameters() if env_is_discrete else agent.actor.parameters())
-    
-    # Define critic parameters
-    # critic_params = list(agent.critic_body.parameters()) + list(agent.critic_utility_head.parameters()) + list(agent.critic_returns_head.parameters())
+    # -----------------------------------------------------------------------
+    # Agent
+    # -----------------------------------------------------------------------
+    agent_class = (
+        partial(DiscreteAgent,   reward_size=reward_size, task_size=task_size)
+        if env_is_discrete
+        else partial(ContinuousAgent, rpo_alpha=rpo_alpha,
+                     reward_size=reward_size, task_size=task_size)
+    )
+    agent = agent_class(training_envs).to(device)
 
     optimizer = [
-        torch.optim.Adam(agent.actor.parameters(), lr=learning_rate, eps=1e-5),
-        torch.optim.Adam(agent.critic.parameters(), lr=learning_rate, eps=1e-5)
+        torch.optim.Adam(agent.actor.parameters(),  lr=learning_rate, eps=1e-5),
+        torch.optim.Adam(agent.critic.parameters(), lr=learning_rate, eps=1e-5),
     ]
 
-    if normalize_rewards:
-        reward_rms = RunningMeanStd(reward_size)
+    reward_rms = RunningMeanStd(reward_size) if normalize_rewards else None
+    logger     = PPOLogger(run_name, use_tensorboard, reward_size=reward_size)
 
-    logger = PPOLogger(run_name, use_tensorboard, reward_size=reward_size)
-    
-    pareto_archive = ParetoArchive()
-    ppo = PPO(
-        agent=agent,
-        optimizer=optimizer,
-        envs=envs,
-        eval_envs=eval_envs, # Pass the separate eval environments
-        utility_functions=utility_functions, 
-        env_is_discrete=env_is_discrete,
-        reward_size=reward_size,
-        learning_rate=learning_rate,
-        num_rollout_steps=num_rollout_steps,
-        num_envs=num_envs,
-        gamma=gamma,
-        gae_lambda=gae_lambda,
-        surrogate_clip_threshold=surrogate_clip_threshold,
-        entropy_loss_coefficient=entropy_loss_coefficient,
-        value_function_loss_coefficient=value_function_loss_coefficient,
-        policy_gradient_loss_coefficient = policy_gradient_loss_coefficient,
-        max_grad_norm=max_grad_norm,
-        update_epochs=update_epochs,
-        num_minibatches=num_minibatches,
-        normalize_advantages=normalize_advantages,
-        reward_rms=reward_rms if normalize_rewards else None,
-        clip_value_function_loss=clip_value_function_loss,
-        target_kl=target_kl,
-        anneal_lr=anneal_lr,
-        seed=seed,
-        logger=logger,
-        convex=convex,
-        scalar_reward=scalar_reward,
-        pareto_archive=pareto_archive,
-        eval_interval=eval_interval,
-        num_eval_episodes=num_eval_episodes
+    # -----------------------------------------------------------------------
+    # ESR-PPO (CHANGED: was PPO, now ESR_PPO)
+    # -----------------------------------------------------------------------
+    esr_ppo = PPO(
+        agent                    = agent,
+        optimizer                = optimizer,
+        envs                     = training_envs,
+        eval_envs                = eval_envs_wrapped,
+        utility_functions        = utility_functions,
+        env_is_discrete          = env_is_discrete,
+        reward_size              = reward_size,
+        learning_rate            = learning_rate,
+        # Episode collection
+        episodes_per_update      = episodes_per_update,
+        min_episodes_per_task    = min_episodes_per_task,
+        max_episode_steps        = max_episode_steps,
+        # Optimisation
+        update_epochs            = update_epochs,
+        num_minibatches          = num_minibatches,
+        surrogate_clip_threshold = surrogate_clip_threshold,
+        entropy_loss_coefficient = entropy_loss_coefficient,
+        max_grad_norm            = max_grad_norm,
+        normalize_advantages     = normalize_advantages,
+        target_kl                = target_kl,
+        anneal_lr                = anneal_lr,
+        # Counterfactual
+        cf_weight_min            = cf_weight_min,
+        cf_weight_max            = cf_weight_max,
+        # Return discounting
+        discount_utility         = discount_utility,
+       # Misc
+        gamma                    = gamma,
+        seed                     = seed,
+        logger                   = logger,
+        eval_interval            = eval_interval,
+        num_eval_episodes        = num_eval_episodes,
+        total_timesteps          = total_timesteps,
     )
-    
-    # Train the agent
-    trained_agent = ppo.learn(total_timesteps)
 
+    # -----------------------------------------------------------------------
+    # Training
+    # -----------------------------------------------------------------------
+    trained_agent = esr_ppo.learn(total_timesteps)
+
+    # -----------------------------------------------------------------------
+    # Save model + final evaluation
+    # -----------------------------------------------------------------------
     if save_model:
-        if not os.path.exists(f"runs/{run_name}"):
-            os.mkdir(f"runs/{run_name}")
-        model_path = f"runs/{run_name}/{exp_name}.rl_model"
+        os.makedirs(f"runs/{run_name}", exist_ok=True)
+        model_path   = f"runs/{run_name}/{exp_name}.rl_model"
         hparams_path = f"runs/{run_name}/hparams.json"
-        
+
         obs_rms = None
         if normalize_observations:
             stats_path = f"runs/{run_name}/norm_stats.pkl"
-            obs_rms = envs.env.obs_rms
+            obs_rms    = training_envs.env.obs_rms
             pickle.dump(obs_rms, open(stats_path, "wb"))
-            
-        
-        hparams_to_json = {
-            "env_id": env_id,
-            "env_is_discrete": env_is_discrete,
-            "num_envs": num_envs,
-            "convex": convex,
-            "scalar_reward": scalar_reward,
-            "total_timesteps": total_timesteps,
-            "num_rollout_steps": num_rollout_steps,
-            "update_epochs": update_epochs,
-            "num_minibatches": num_minibatches,
-            "learning_rate": learning_rate,
-            "gamma": gamma,
-            "gae_lambda": gae_lambda,
-            "surrogate_clip_threshold": surrogate_clip_threshold,
-            "entropy_loss_coefficient": entropy_loss_coefficient,
-            "value_function_loss_coefficient": value_function_loss_coefficient,
-            "policy_gradient_loss_coefficient": policy_gradient_loss_coefficient,
-            "normalize_advantages": normalize_advantages,
-            "normalize_observations": normalize_observations,
-            "normalize_rewards": normalize_rewards,
-            "clip_value_function_loss": clip_value_function_loss,
-            "max_grad_norm": max_grad_norm,
-            "target_kl": target_kl,
-            "anneal_lr": anneal_lr,
-            "rpo_alpha": rpo_alpha,
-            "seed": seed,
-            "eval_interval": eval_interval,
-            "num_eval_episodes": num_eval_episodes
+
+        hparams = {
+            "env_id":                    env_id,
+            "env_is_discrete":           env_is_discrete,
+            "num_envs":                  num_envs,
+            "total_timesteps":           total_timesteps,
+            "episodes_per_update":       episodes_per_update,
+            "min_episodes_per_task":     min_episodes_per_task,
+            "max_episode_steps":         max_episode_steps,
+            "update_epochs":             update_epochs,
+            "num_minibatches":           num_minibatches,
+            "learning_rate":             learning_rate,
+            "gamma":                     gamma,
+            "discount_utility":          discount_utility,
+            "surrogate_clip_threshold":  surrogate_clip_threshold,
+            "entropy_loss_coefficient":  entropy_loss_coefficient,
+            "max_grad_norm":             max_grad_norm,
+            "normalize_advantages":      normalize_advantages,
+            "normalize_observations":    normalize_observations,
+            "normalize_rewards":         normalize_rewards,
+            "target_kl":                 target_kl,
+            "anneal_lr":                 anneal_lr,
+            "cf_weight_min":             cf_weight_min,
+            "cf_weight_max":             cf_weight_max,
+            "discount_utility":          discount_utility,
+           "rpo_alpha":                 rpo_alpha,
+            "seed":                      seed,
+            "eval_interval":             eval_interval,
+            "num_eval_episodes":         num_eval_episodes,
         }
         with open(hparams_path, "w") as f:
-            json.dump(hparams_to_json, f, indent = 4)
-        torch.save(trained_agent.state_dict(), model_path)
-        print(f"Model saved to {model_path}")
+            json.dump(hparams, f, indent=4)
 
-        # 1. Visual Evaluation (GIFs)
-        # Note: We reuse training envs for visual check at end to save re-instantiation
+        torch.save(trained_agent.state_dict(), model_path)
+        print(f"Model saved: {model_path}")
+
+        # Final comprehensive evaluation
+        final_eval_envs = _make_envs(env_id, num_envs)
+        if normalize_observations:
+            final_eval_envs = NormalizeObservation(final_eval_envs)
+        final_eval_envs = mo_gym.wrappers.vector.MORecordEpisodeStatistics(
+            final_eval_envs, gamma=1.0
+        )
+
         frames = load_and_evaluate_model(
-            run_name,
-            env_id,
-            env_is_discrete,
-            normalize_observations,
-            envs.env.obs_rms if normalize_observations else None,
-            envs,
-            num_envs,
-            agent_class,
-            device,
-            model_path,
-            eval_gamma,
-            capture_video,
+            run_name         = run_name,
+            env_id           = env_id,
+            env_is_discrete  = env_is_discrete,
+            normalize_observations = normalize_observations,
+            obs_rms          = obs_rms,
+            eval_envs        = final_eval_envs,
+            num_envs         = num_envs,
+            agent_class      = agent_class,
+            device           = device,
+            model_path       = model_path,
+            capture_video    = capture_video,
         )
 
         if capture_video:
             logger.write_video(frames)
-        
-    # Close environments
-    envs.close()
-    eval_envs.close()
+
+    training_envs.close()
+    eval_envs_wrapped.close()
 
 
 if __name__ == "__main__":

@@ -1,12 +1,62 @@
+"""
+ESR-PPO: Episode-Level Policy Gradient for Expected Scalarized Return
+
+Core algorithmic design
+-----------------------
+1. EPISODE-LEVEL COLLECTION
+   The unit of experience is a complete episode, not a fixed rollout window.
+   Utility is always evaluated on realized complete trajectory returns — no
+   mid-episode projection, no vector critic bootstrapping into utility.
+
+2. PER-STEP BASELINES WITH TRAJECTORY-LEVEL UTILITY
+   The utility head b(s_t, acc_t, task) is trained to predict E[u(R) | s_t, acc_t]
+   from any mid-episode state. It is evaluated at every step t within an episode,
+   giving a different baseline for each timestep while the utility target
+   u(R(τ)) remains the complete realized trajectory utility throughout.
+   This provides variance reduction without introducing bias (standard baseline
+   identity), and improves credit assignment for long-horizon tasks.
+
+3. PER-STEP PPO CLIPPING WITH TRAJECTORY-LEVEL ADVANTAGE
+   Policy ratio: ρ_t = π_new(a_t) / π_old(a_t) — per step, stays near 1.
+   Advantage: A_t = u(R(τ)) - b(s_t, acc_t) — trajectory utility, per-step baseline.
+   Loss: mean_t[ max(-ρ_t·A_t, -clip(ρ_t, 1±ε)·A_t) ]
+   Avoids the trajectory-sum explosion where exp(Σ log_ratios) blows up for
+   long episodes (e.g. T=1000 in Hopper).
+
+4. CLIPPED IS WEIGHTING FOR COUNTERFACTUAL REUSE
+   w(τ) = clip(exp(mean_log_ratio), w_min, w_max)
+   Pre-applied to advantages before the actor update. Every trajectory
+   contributes — no hard cutoff. On-policy trajectories get w=1.0 exactly.
+   Off-policy trajectories are smoothly downweighted or upweighted within
+   bounds. This replaces the previous quantile hard-cutoff which introduced
+   uncharacterizable bias and was batch-distribution-dependent.
+
+5. RAW ACCUMULATION (acc_gamma REMOVED)
+   acc_rewards accumulates raw per-step rewards with no gamma scaling.
+   discount_utility=True enables gamma^t weighting for environments where
+   utilities were calibrated against discounted returns (e.g. FTN, DST).
+
+6. BOTH OPTIMIZERS SCHEDULED
+   Linear LR annealing applied to both actor and critic optimizers.
+
+7. PARALLEL ENVIRONMENTS WITH ROUND-ROBIN TASK ASSIGNMENT
+   All num_envs environments step simultaneously. Tasks are assigned
+   round-robin to guarantee even coverage and minimise idle environments.
+"""
+
 from uuid import uuid4
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
-from typing import Dict, List, Optional, Tuple, Union, Callable, Any
+from typing import Dict, List, Optional, Callable, Any
 from torch.utils.tensorboard import SummaryWriter
 
+
+# ---------------------------------------------------------------------------
+# Logger (unchanged interface, minor additions)
+# ---------------------------------------------------------------------------
 
 class PPOLogger:
     def __init__(self, run_name=None, use_tensorboard=False, reward_size=1):
@@ -16,83 +66,204 @@ class PPOLogger:
             self.writer = SummaryWriter(f"runs/{run_name}")
         self.reward_size = reward_size
 
-    def log_rollout_step(self, infos, global_step, active_task_id=0, active_utility_val=0.0):
-        if "episode" in infos:
-            if 'dr' in infos['episode']:
-                non_zero_rews = infos['episode']['dr'][infos['_episode']]
-            elif 'r' in infos['episode']:
-                scalar_ret = infos['episode']['r'][infos['_episode']]
-                non_zero_rews = scalar_ret.reshape(-1, 1).repeat(1, self.reward_size)
-            else:
-                return
-
-            print(f"step={global_step}, task={active_task_id}, utility={active_utility_val:.3f}, vec={non_zero_rews.mean(axis=0)}", flush=True)
-
-            if self.use_tensorboard:
-                self.writer.add_scalar("charts/episodic_length", infos['episode']['l'][infos['_episode']].mean(), global_step)
-                self.writer.add_scalar("charts/episodic_utility", active_utility_val, global_step)
-                if isinstance(active_task_id, (int, float, np.integer, torch.Tensor)):
-                    if isinstance(active_task_id, torch.Tensor):
-                        active_task_id = active_task_id.item()
-                    self.writer.add_scalar(f"charts/utility_task_{active_task_id}", active_utility_val, global_step)
-                for i in range(self.reward_size):
-                    self.writer.add_scalar(f"charts/vec_reward_obj_{i}", non_zero_rews[:, i].mean(), global_step)
+    def log_episode(self, global_step, task_id, utility, realized_return, ep_length):
+        print(
+            f"step={global_step}  task={task_id}  "
+            f"utility={utility:.4f}  len={ep_length}  "
+            f"return={np.round(realized_return, 3)}",
+            flush=True,
+        )
+        if self.use_tensorboard:
+            self.writer.add_scalar("charts/episodic_utility", utility, global_step)
+            self.writer.add_scalar(f"charts/utility_task_{task_id}", utility, global_step)
+            self.writer.add_scalar("charts/episodic_length", ep_length, global_step)
+            for i in range(self.reward_size):
+                self.writer.add_scalar(
+                    f"charts/realized_return_obj_{i}", realized_return[i], global_step
+                )
 
     def log_policy_update(self, stats, global_step):
         if self.use_tensorboard:
             for k, v in stats.items():
-                self.writer.add_scalar(f"losses/{k}", v, global_step)
+                if isinstance(v, float) and not np.isnan(v):
+                    self.writer.add_scalar(f"losses/{k}", v, global_step)
 
     def log_evaluation(self, global_step, min_util, mean_util, max_util, task_id):
-        print(f"EVAL step={global_step} | Task={task_id} | Min={min_util:.3f} Mean={mean_util:.3f} Max={max_util:.3f}", flush=True)
+        print(
+            f"EVAL step={global_step} | Task={task_id} | "
+            f"Min={min_util:.4f}  Mean={mean_util:.4f}  Max={max_util:.4f}",
+            flush=True,
+        )
         if self.use_tensorboard:
             self.writer.add_scalar(f"eval/utility_min_task_{task_id}", min_util, global_step)
             self.writer.add_scalar(f"eval/utility_mean_task_{task_id}", mean_util, global_step)
             self.writer.add_scalar(f"eval/utility_max_task_{task_id}", max_util, global_step)
 
 
+# ---------------------------------------------------------------------------
+# Episode buffer — stores one complete episode
+# ---------------------------------------------------------------------------
+
+class Episode:
+    """
+    Container for a single complete episode.
+    All quantities are exact — no estimation, no projection.
+
+    Performance notes
+    -----------------
+    Tensors are pre-converted once at construction time (Fix 4).
+    This avoids repeated torch.tensor() copies inside every update call.
+    Future returns are computed via vectorised cumsum (Fix 3) rather
+    than a Python loop over timesteps.
+    """
+    __slots__ = [
+        'task_id',        # int
+        'obs',            # (T, obs_dim)       numpy — kept for env reset compatibility
+        'actions',        # (T, act_dim)|(T,)  numpy
+        'logprobs',       # (T,)               numpy
+        'rewards',        # (T, reward_size)   numpy
+        'acc_rewards',    # (T, reward_size)   numpy
+        'realized_return',# (reward_size,)     numpy — exact cumulative return
+        'utility',        # scalar             float — exact u(realized_return)
+        'length',         # int
+        # Pre-converted tensors (populated by to_device after construction)
+        'obs_t',          # (T, obs_dim)       torch.float32
+        'actions_t',      # (T, act_dim)|(T,)  torch.float32
+        'logprobs_t',     # (T,)               torch.float32
+        'acc_t',          # (T, reward_size)   torch.float32
+        'future_returns', # (T, reward_size)   numpy  — MC future return from each step
+    ]
+
+    def __init__(self, task_id, obs, actions, logprobs, rewards, acc_rewards,
+                 gamma=1.0, discount_utility=False):
+        self.task_id         = task_id
+        self.obs             = np.array(obs,         dtype=np.float32)
+        self.actions         = np.array(actions,     dtype=np.float32)
+        self.logprobs        = np.array(logprobs,    dtype=np.float32)
+        self.rewards         = np.array(rewards,     dtype=np.float32)
+        self.acc_rewards     = np.array(acc_rewards, dtype=np.float32)
+        self.length          = len(rewards)
+        self.utility         = None
+
+        # Realized return: sum or discounted sum
+        if discount_utility and gamma < 1.0:
+            T      = self.length
+            gammas = gamma ** np.arange(T)
+            self.realized_return = (gammas[:, None] * self.rewards).sum(axis=0)
+        else:
+            self.realized_return = self.rewards.sum(axis=0)
+
+        # Fix 3: Vectorised future return computation via reversed cumsum.
+        # future_returns[t] = sum of rewards from step t onward.
+        # np.cumsum on the reversed array then re-reversed gives this in O(T)
+        # instead of O(T^2) from the previous loop with ep.rewards[t:].sum().
+        if discount_utility and gamma < 1.0:
+            T      = self.length
+            # Build discount-weighted future returns vectorised
+            gammas = gamma ** np.arange(T)  # (T,)
+            # future_returns[t] = sum_{k=t}^{T-1} gamma^{k-t} * r_k
+            # = sum_{k=0}^{T-1-t} gamma^k * r_{t+k}
+            # Computed by: for each t, shift-and-discount. Efficient via loop
+            # over the T rows — still O(T^2) but unavoidable for discount case.
+            # For the common undiscounted case (below) we use O(T) cumsum.
+            future_returns = np.zeros_like(self.rewards)
+            for t in range(T - 1, -1, -1):
+                if t == T - 1:
+                    future_returns[t] = self.rewards[t]
+                else:
+                    future_returns[t] = self.rewards[t] + gamma * future_returns[t + 1]
+            self.future_returns = future_returns
+        else:
+            # Fix 3: O(T) reversed cumsum — replaces O(T^2) loop
+            # cumsum on reversed rewards, then re-reverse
+            self.future_returns = np.cumsum(self.rewards[::-1], axis=0)[::-1].copy()
+
+        # Pre-converted tensors initialised to None — populated by to_device()
+        self.obs_t      = None
+        self.actions_t  = None
+        self.logprobs_t = None
+        self.acc_t      = None
+
+    def to_device(self, device: torch.device) -> 'Episode':
+        """
+        Fix 4: Convert numpy arrays to tensors ONCE at episode creation.
+        Called immediately after the episode is finalised in collect_episodes.
+        Subsequent calls to _compute_trajectory_advantages and _train_actor
+        use the pre-converted tensors directly, avoiding repeated copies.
+        """
+        self.obs_t      = torch.tensor(self.obs,         dtype=torch.float32, device=device)
+        self.actions_t  = torch.tensor(self.actions,     dtype=torch.float32, device=device)
+        self.logprobs_t = torch.tensor(self.logprobs,    dtype=torch.float32, device=device)
+        self.acc_t      = torch.tensor(self.acc_rewards, dtype=torch.float32, device=device)
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Core ESR-PPO algorithm
+# ---------------------------------------------------------------------------
+
 class PPO:
+    """
+    Episode-level ESR-PPO.
+
+    Collects complete episodes, evaluates utility on exact realized returns,
+    updates policy with trajectory-level PPO clipping, and reuses trajectories
+    across tasks via trajectory-level importance weighting.
+    """
+
     def __init__(
         self,
         agent,
-        optimizer,
-        envs,
+        optimizer,                          # list: [actor_opt, critic_opt]
+        envs,                               # vectorized training envs
         eval_envs=None,
         utility_functions=None,
         env_is_discrete=False,
         reward_size=1,
         learning_rate=3e-4,
-        num_rollout_steps=2048,
-        num_envs=1,
-        gamma=0.99,
-        gae_lambda=0.95,
+        # Episode collection
+        episodes_per_update=16,             # complete episodes per policy update
+        min_episodes_per_task=4,            # minimum episodes per task per update
+        max_episode_steps=1000,             # hard cap per episode
+        # PPO
+        update_epochs=5,
+        num_minibatches=8,
         surrogate_clip_threshold=0.2,
         entropy_loss_coefficient=0.001,
-        value_function_loss_coefficient=0.5,
         max_grad_norm=0.5,
-        update_epochs=10,
-        num_minibatches=32,
         normalize_advantages=True,
-        reward_rms=None,
-        clip_value_function_loss=True,
         target_kl=None,
         anneal_lr=True,
+        # Counterfactual reuse — clipped IS weighting
+        # Replaces the previous quantile hard-cutoff rule.
+        # Every trajectory contributes to the gradient but is weighted by
+        # w(τ) = clip(exp(mean_log_ratio), cf_weight_min, cf_weight_max).
+        # On-policy trajectories get w=1.0 (mean_log_ratio=0).
+        # Off-policy trajectories get w<1 if unlikely, w>1 if more likely.
+        # Clipping bounds variance (w_max) and prevents zero-weight dropout (w_min).
+        # This is the trajectory-level analogue of PPO's per-step clipping.
+        cf_weight_min=0.1,    # floor IS weight — limits off-policy influence
+        cf_weight_max=5.0,    # ceiling IS weight — prevents variance explosion
+        # Return discounting
+        gamma=1.0,                          # ESR uses undiscounted returns by default
+        discount_utility=False,             # if True: accumulate gamma^t * r_t (discounted)
+                                            # if False: accumulate r_t (undiscounted, default)
+                                            # Use True for FTN/DST where utilities were
+                                            # calibrated with gamma=0.995.
+                                            # Use False for Hopper/LunarLander calibrated
+                                            # against raw undiscounted returns.
         seed=1,
         logger=None,
-        convex=False,
-        scalar_reward=False,
-        pareto_archive=None,
-        policy_gradient_loss_coefficient=1.0,
         eval_interval=10000,
         num_eval_episodes=10,
-        total_timesteps=1000000,   # PATCH 1+5: required for LR scheduler
+        total_timesteps=1000000,
     ):
-        self.agent = agent
-        self.optimizer = optimizer
-        self.envs = envs
-        self.eval_envs = eval_envs
-        self.reward_size = reward_size
-        self.env_is_discrete = env_is_discrete
+        self.agent            = agent
+        self.optimizer        = optimizer
+        self.envs             = envs
+        self.eval_envs        = eval_envs
+        self.reward_size      = reward_size
+        self.env_is_discrete  = env_is_discrete
 
         if utility_functions is None:
             self.utility_functions = [lambda r: r.sum(-1)]
@@ -100,619 +271,720 @@ class PPO:
             self.utility_functions = utility_functions
         self.num_tasks = len(self.utility_functions)
 
-        self.num_rollout_steps = num_rollout_steps
-        self.num_envs = num_envs
-        self.batch_size = num_envs * num_rollout_steps
-        self.num_minibatches = num_minibatches
-        self.minibatch_size = self.batch_size // num_minibatches
+        # Episode collection params
+        self.episodes_per_update   = episodes_per_update
+        self.min_episodes_per_task = min_episodes_per_task
+        self.max_episode_steps     = max_episode_steps
 
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        self.surrogate_clip_threshold = surrogate_clip_threshold
-        self.entropy_loss_coefficient = entropy_loss_coefficient
-        self.policy_gradient_loss_coefficient = policy_gradient_loss_coefficient
-        self.value_function_loss_coefficient = value_function_loss_coefficient
-        self.max_grad_norm = max_grad_norm
-        self.update_epochs = update_epochs
-        self.normalize_advantages = normalize_advantages
-        self.reward_rms = reward_rms
-        self.clip_value_function_loss = clip_value_function_loss
-        self.target_kl = target_kl
+        # PPO params
+        self.update_epochs              = update_epochs
+        self.num_minibatches            = num_minibatches
+        self.surrogate_clip_threshold   = surrogate_clip_threshold
+        # traj_clip_threshold removed: per-step clipping uses surrogate_clip_threshold.
+        # traj_clip_threshold was only needed for the (now removed) trajectory-level
+        # ratio, which caused exponential variance growth with episode length.
+        self.entropy_loss_coefficient   = entropy_loss_coefficient
+        self.max_grad_norm              = max_grad_norm
+        self.normalize_advantages       = normalize_advantages
+        self.target_kl                  = target_kl
+
+        # Counterfactual IS weighting bounds
+        self.cf_weight_min = cf_weight_min
+        self.cf_weight_max = cf_weight_max
+
+        # Return accumulation mode
+        self.gamma            = gamma
+        self.discount_utility = discount_utility
+        self.seed             = seed
+        self.eval_interval   = eval_interval
+        self.num_eval_episodes = num_eval_episodes
+        self.total_timesteps = total_timesteps
+        self._global_step    = 0
+        self.next_eval_step  = 0
 
         self.device = next(agent.parameters()).device
         self.logger = logger or PPOLogger(reward_size=reward_size)
-        self.seed = seed
-        self._global_step = 0
 
-        # PATCH 1: store total_timesteps so LR scheduler can reference it
-        self.total_timesteps = total_timesteps
-        self.scalar_reward = scalar_reward
-
-        self.eval_interval = eval_interval
-        self.num_eval_episodes = num_eval_episodes
-
+        # CHANGE 6: schedule BOTH optimizers
         self.anneal_lr = anneal_lr
         if self.anneal_lr:
-            num_updates = self.total_timesteps // self.num_envs // self.num_rollout_steps
-            self.lr_scheduler = torch.optim.lr_scheduler.LinearLR(
-                self.optimizer[0], start_factor=1.0, end_factor=0.0, total_iters=num_updates
-            )
+            # Estimate total updates: total_timesteps / avg_episode_len / episodes_per_update
+            # Use conservative estimate of 200 steps/episode
+            estimated_updates = total_timesteps // (200 * episodes_per_update)
+            self.lr_schedulers = [
+                torch.optim.lr_scheduler.LinearLR(
+                    opt, start_factor=1.0, end_factor=0.1,
+                    total_iters=max(estimated_updates, 1)
+                )
+                for opt in self.optimizer
+            ]
         else:
-            self.lr_scheduler = None
+            self.lr_schedulers = None
 
-    def _get_one_hot_task(self, task_idx_tensor, batch_size):
-        return F.one_hot(task_idx_tensor.long(), num_classes=self.num_tasks).float()
+        # Running advantage statistics per task (for stable normalization)
+        self._adv_stats = {
+            t: {'mean': 0.0, 'std': 1.0}
+            for t in range(self.num_tasks)
+        }
 
-    def _get_single_task_one_hot(self, task_idx, batch_size):
-        task_one_hot = torch.zeros((batch_size, self.num_tasks), device=self.device)
-        if self.num_tasks > 0:
-            task_one_hot[:, task_idx] = 1.0
-        return task_one_hot
+    # -----------------------------------------------------------------------
+    # Episode-level collection with parallel environments
+    # -----------------------------------------------------------------------
+
+    def collect_episodes(self) -> List[Episode]:
+        """
+        Collect complete episodes across all parallel environments until every
+        task has at least min_episodes_per_task complete episodes.
+
+        Parallelism
+        -----------
+        All num_envs environments step simultaneously each iteration.
+        Wall-clock collection time scales as ~1/num_envs relative to a
+        single-environment setup for long-horizon tasks like Hopper.
+
+        Task assignment — round-robin
+        -----------------------------
+        Tasks are assigned round-robin rather than randomly to guarantee
+        even coverage. With num_tasks=3 and num_envs=8:
+          env 0 → task 0, env 1 → task 1, env 2 → task 2,
+          env 3 → task 0, env 4 → task 1, env 5 → task 2, ...
+        This minimises idle environments waiting for a single slow task
+        to accumulate its required episodes.
+
+        On episode completion each environment immediately starts a new
+        episode on the next task in the round-robin sequence, so all
+        environments stay active throughout collection.
+
+        ESR correctness
+        ---------------
+        Each episode's utility is computed from its own complete realized
+        return — no information is shared between parallel environments.
+        The round-robin assignment affects which task each episode serves
+        but not the correctness of the utility computation.
+        """
+        task_counts   = {t: 0 for t in range(self.num_tasks)}
+        episodes      = []
+        num_envs      = self.envs.num_envs
+
+        # Global round-robin counter — shared across all envs
+        # Ensures tasks are filled evenly regardless of episode length variance
+        rr_counter = 0
+
+        def next_task() -> int:
+            nonlocal rr_counter
+            task = rr_counter % self.num_tasks
+            rr_counter += 1
+            return task
+
+        # Per-environment episode buffers
+        ep_obs      = [[] for _ in range(num_envs)]
+        ep_actions  = [[] for _ in range(num_envs)]
+        ep_logprobs = [[] for _ in range(num_envs)]
+        ep_rewards  = [[] for _ in range(num_envs)]
+        ep_acc      = [[] for _ in range(num_envs)]
+
+        # Accumulated reward per env — raw or discounted depending on discount_utility
+        acc_rewards  = np.zeros((num_envs, self.reward_size), dtype=np.float32)
+        ep_steps     = np.zeros(num_envs, dtype=np.int32)
+
+        # Round-robin initial task assignment
+        active_tasks = np.array([next_task() for _ in range(num_envs)], dtype=np.int32)
+
+        obs, _ = self.envs.reset(seed=self.seed + self._global_step)
+
+        while not all(
+            task_counts[t] >= self.min_episodes_per_task
+            for t in range(self.num_tasks)
+        ):
+            # ---- Forward pass across all envs simultaneously ----
+            task_idx_t   = torch.tensor(active_tasks, dtype=torch.long, device=self.device)
+            task_one_hot = F.one_hot(task_idx_t, num_classes=self.num_tasks).float()
+            obs_t        = torch.tensor(obs,         dtype=torch.float32, device=self.device)
+            acc_t        = torch.tensor(acc_rewards, dtype=torch.float32, device=self.device)
+
+            with torch.no_grad():
+                actions, logprobs = self.agent.sample_action_and_compute_log_prob(
+                    obs_t, acc_t, task_one_hot,
+                    deterministic=False, device=self.device,
+                )
+
+            actions_np  = actions.cpu().numpy()
+            logprobs_np = logprobs.cpu().numpy()
+
+            # Store pre-step state for every active env
+            for i in range(num_envs):
+                ep_acc[i].append(acc_rewards[i].copy())
+                ep_obs[i].append(obs[i].copy())
+                ep_actions[i].append(actions_np[i].copy())
+                ep_logprobs[i].append(float(logprobs_np[i]))
+
+            # ---- Parallel environment step ----
+            next_obs, rewards, terminations, truncations, _ = self.envs.step(actions_np)
+            self._global_step += num_envs
+
+            # Accumulate rewards for each env
+            for i in range(num_envs):
+                ep_rewards[i].append(rewards[i].copy())
+                if self.discount_utility and self.gamma < 1.0:
+                    acc_rewards[i] += (self.gamma ** ep_steps[i]) * rewards[i]
+                else:
+                    acc_rewards[i] += rewards[i]
+                ep_steps[i] += 1
+
+            # ---- Handle episode completions ----
+            dones = np.logical_or(terminations, truncations)
+            dones = np.logical_or(dones, ep_steps >= self.max_episode_steps)
+
+            for i in np.where(dones)[0]:
+                # Build and store the completed episode
+                ep = Episode(
+                    task_id          = int(active_tasks[i]),
+                    obs              = ep_obs[i],
+                    actions          = ep_actions[i],
+                    logprobs         = ep_logprobs[i],
+                    rewards          = ep_rewards[i],
+                    acc_rewards      = ep_acc[i],
+                    gamma            = self.gamma,
+                    discount_utility = self.discount_utility,
+                )
+                # Fix 4: convert to tensors once here — avoids repeated
+                # torch.tensor() copies in every subsequent update call
+                ep.to_device(self.device)
+                ep.utility = float(
+                    self.utility_functions[ep.task_id](
+                        torch.tensor(ep.realized_return, dtype=torch.float32,
+                                     device=self.device)
+                    ).item()
+                )
+
+                episodes.append(ep)
+                task_counts[ep.task_id] += 1
+
+                self.logger.log_episode(
+                    self._global_step, ep.task_id,
+                    ep.utility, ep.realized_return, ep.length,
+                )
+
+                # Reset this environment's buffers immediately
+                ep_obs[i], ep_actions[i]            = [], []
+                ep_logprobs[i], ep_rewards[i], ep_acc[i] = [], [], []
+                acc_rewards[i] = np.zeros(self.reward_size, dtype=np.float32)
+                ep_steps[i]    = 0
+
+                # Round-robin task assignment for next episode on this env
+                active_tasks[i] = next_task()
+
+            obs = next_obs
+
+        return episodes
+
+    # -----------------------------------------------------------------------
+    # CHANGE 2: Decoupled baseline training (terminal steps only)
+    # -----------------------------------------------------------------------
+
+    def _train_baseline(self, episodes: List[Episode]) -> dict:
+        """
+        Train the critic on complete episode data.
+
+        Utility head — trained on ALL steps with the SAME target per episode.
+        Vector head  — trained on ALL steps with MC future return targets.
+
+        Performance fixes applied here:
+          Fix 3: future_returns pre-computed in Episode.__init__ via cumsum.
+          Fix 4: pre-converted tensors (ep.obs_t, ep.acc_t) used directly.
+        Both avoid Python loops and repeated numpy→torch copies.
+        """
+        # Collect per-episode tensors — concatenate across episodes once
+        all_obs_list,  all_acc_list  = [], []
+        all_task_list, all_util_list = [], []
+        all_vec_list                 = []
+
+        for ep in episodes:
+            T   = ep.length
+            tid = ep.task_id
+
+            # Fix 4: use pre-converted tensors directly (no torch.tensor() here)
+            all_obs_list.append(ep.obs_t)                           # (T, obs_dim)
+            all_acc_list.append(ep.acc_t)                           # (T, reward_size)
+            all_task_list.append(
+                torch.full((T,), tid, dtype=torch.long, device=self.device)
+            )
+
+            # Utility target: same scalar for every step in this episode
+            all_util_list.append(
+                torch.full((T, 1), ep.utility, dtype=torch.float32, device=self.device)
+            )
+
+            # Fix 3: future_returns already computed in Episode.__init__ via cumsum
+            all_vec_list.append(
+                torch.tensor(ep.future_returns, dtype=torch.float32, device=self.device)
+            )
+
+        # Single concatenation — one large tensor per field
+        b_obs  = torch.cat(all_obs_list,  dim=0)
+        b_acc  = torch.cat(all_acc_list,  dim=0)
+        b_task = F.one_hot(
+            torch.cat(all_task_list), num_classes=self.num_tasks
+        ).float()
+        b_util = torch.cat(all_util_list, dim=0)
+        b_vec  = torch.cat(all_vec_list,  dim=0)
+
+        n       = b_obs.shape[0]
+        mb_size = max(1, n // self.num_minibatches)
+
+        critic_losses = []
+        ev_util_first = None
+        ev_vec_first  = None
+
+        for epoch in range(self.update_epochs):
+            perm = torch.randperm(n, device=self.device)
+            for start in range(0, n, mb_size):
+                idx = perm[start:start + mb_size]
+
+                pred_util, pred_vec = self.agent.estimate_value_from_observation(
+                    b_obs[idx], b_acc[idx], b_task[idx], device=self.device
+                )
+
+                loss_util = 0.5 * ((pred_util - b_util[idx]) ** 2).mean()
+                loss_vec  = 0.5 * ((pred_vec  - b_vec[idx])  ** 2).mean()
+
+                if epoch == 0 and start == 0:
+                    with torch.no_grad():
+                        y_u   = b_util[idx].flatten()
+                        yh_u  = pred_util.detach().flatten()
+                        var_u = torch.var(y_u)
+                        ev_util_first = (
+                            float('nan') if var_u == 0
+                            else (1.0 - torch.var(y_u - yh_u) / var_u).item()
+                        )
+                        y_v   = b_vec[idx].flatten()
+                        yh_v  = pred_vec.detach().flatten()
+                        var_v = torch.var(y_v)
+                        ev_vec_first = (
+                            float('nan') if var_v == 0
+                            else (1.0 - torch.var(y_v - yh_v) / var_v).item()
+                        )
+
+                total_loss = loss_util + loss_vec
+                self.optimizer[1].zero_grad()
+                total_loss.backward()
+                nn.utils.clip_grad_norm_(
+                    self.agent.critic.parameters(), self.max_grad_norm
+                )
+                self.optimizer[1].step()
+                critic_losses.append(total_loss.item())
+
+        return {
+            'critic_loss':        float(np.mean(critic_losses)),
+            'explained_var_util': ev_util_first if ev_util_first is not None else float('nan'),
+            'explained_var_vec':  ev_vec_first  if ev_vec_first  is not None else float('nan'),
+        }
+
+    # -----------------------------------------------------------------------
+    # CHANGE 3+4: Trajectory-level PPO + trajectory-level counterfactual reuse
+    # -----------------------------------------------------------------------
+
+    def _compute_trajectory_advantages(
+        self, episodes: List[Episode]
+    ) -> Dict[int, List[Dict]]:
+        """
+        Compute IS-weighted per-step advantages for all episodes × all tasks.
+
+        Performance fixes applied here:
+          Fix 1: batch across ALL tasks in a single forward pass per episode.
+                 Previously: num_tasks sequential passes of size (T, obs_dim).
+                 Now: one pass of size (num_tasks*T, obs_dim) with task_hot stacked.
+                 Reduces forward pass count from (num_episodes × num_tasks) to
+                 num_episodes, giving ~num_tasks× speedup on this step.
+          Fix 4: use pre-converted tensors ep.obs_t, ep.acc_t, ep.actions_t,
+                 ep.logprobs_t — no torch.tensor() copies inside this loop.
+
+        Two-level IS correction (unchanged):
+          Trajectory level: w(τ) = clip(exp(mean_log_ratio), w_min, w_max)
+          Step level:       clip(ρ_step, 1±ε)  applied in _train_actor
+        """
+        task_data = {t: [] for t in range(self.num_tasks)}
+
+        # Pre-build task index tensors for stacking — reused across episodes
+        task_ids_per_ep = torch.arange(
+            self.num_tasks, dtype=torch.long, device=self.device
+        )
+
+        with torch.no_grad():
+            for ep in episodes:
+                T = ep.length
+
+                # Fix 4: use pre-converted tensors — no copy here
+                obs_t  = ep.obs_t       # (T, obs_dim)
+                act_t  = ep.actions_t   # (T, act_dim)
+                acc_t  = ep.acc_t       # (T, reward_size)
+                beh_lp = ep.logprobs_t  # (T,)
+
+                # Fix 1: batch across all tasks simultaneously
+                # Repeat each episode's data num_tasks times and assign
+                # each block a different task one-hot.
+                #
+                # obs_rep shape:  (num_tasks * T, obs_dim)
+                # task_hot shape: (num_tasks * T, num_tasks)
+                #
+                # Block 0: steps 0..T-1 with task_hot = [1,0,0]
+                # Block 1: steps T..2T-1 with task_hot = [0,1,0]
+                # ...
+                obs_rep  = obs_t.repeat(self.num_tasks, 1)
+                acc_rep  = acc_t.repeat(self.num_tasks, 1)
+                act_rep  = act_t.repeat(self.num_tasks, 1) if act_t.dim() > 1 \
+                           else act_t.repeat(self.num_tasks)
+                beh_rep  = beh_lp.repeat(self.num_tasks)   # (num_tasks * T,)
+
+                # Task one-hot: repeat each task index T times, then concatenate
+                task_ids = task_ids_per_ep.repeat_interleave(T)  # (num_tasks * T,)
+                task_hot = F.one_hot(task_ids, num_classes=self.num_tasks).float()
+
+                # Single forward pass for ALL tasks
+                target_lp_all, _ = self.agent.compute_action_log_probabilities_and_entropy(
+                    obs_rep, act_rep, acc_rep, task_hot, self.device
+                )   # shape: (num_tasks * T,)
+
+                baselines_all, _ = self.agent.estimate_value_from_observation(
+                    obs_rep, acc_rep, task_hot, device=self.device
+                )   # shape: (num_tasks * T, 1)
+
+                # Split results back into per-task blocks
+                target_lp_split  = target_lp_all.view(self.num_tasks, T)    # (K, T)
+                baselines_split  = baselines_all.view(self.num_tasks, T)     # (K, T)
+                beh_lp_block     = beh_lp.unsqueeze(0).expand(self.num_tasks, T)  # (K, T)
+
+                for target_task in range(self.num_tasks):
+                    target_lp = target_lp_split[target_task]   # (T,)
+                    baselines  = baselines_split[target_task]   # (T,)
+
+                    # Trajectory-level IS weight
+                    mean_log_ratio = (target_lp - beh_lp).mean()
+                    cf_weight = float(torch.clamp(
+                        mean_log_ratio.exp(),
+                        min=self.cf_weight_min,
+                        max=self.cf_weight_max,
+                    ))
+
+                    # Realized utility — exact
+                    target_util = self.utility_functions[target_task](
+                        torch.tensor(ep.realized_return, dtype=torch.float32,
+                                     device=self.device)
+                    ).item()
+
+                    # IS-weighted per-step advantages
+                    advantages_t = cf_weight * (target_util - baselines.detach())  # (T,)
+
+                    task_data[target_task].append({
+                        'cf_weight':      cf_weight,
+                        'mean_log_ratio': mean_log_ratio.item(),
+                        'advantages_t':   advantages_t,
+                        'obs':            obs_t,
+                        'actions':        act_t,
+                        'acc_rewards':    acc_t,
+                        'behavior_lp':    beh_lp,
+                        'target_lp_old':  target_lp,
+                        'length':         T,
+                        'is_real':        (ep.task_id == target_task),
+                    })
+
+        return task_data
+
+    def _normalize_advantages(self, task_id: int, advantages_t: torch.Tensor) -> torch.Tensor:
+        """
+        Running EMA normalization — now operates on the full concatenated
+        batch for a task rather than one trajectory at a time (Fix 5).
+        """
+        stats      = self._adv_stats[task_id]
+        alpha      = 0.05
+        batch_mean = advantages_t.mean().item()
+        batch_std  = advantages_t.std().item()
+        stats['mean'] = (1 - alpha) * stats['mean'] + alpha * batch_mean
+        stats['std']  = max(
+            (1 - alpha) * stats['std'] + alpha * batch_std, 0.1
+        )
+        return (advantages_t - stats['mean']) / (stats['std'] + 1e-8)
+
+    def _train_actor(self, task_data: Dict[int, List[Dict]]) -> Dict[str, float]:
+        """
+        Update actor using per-step PPO with IS-weighted trajectory advantages.
+
+        Performance fixes applied here:
+          Fix 2: concatenate ALL episodes for a given task into one large
+                 tensor before the forward pass, then do ONE forward+backward
+                 per task per epoch rather than (num_episodes) separate calls.
+                 Reduces backward() calls from (epochs × tasks × episodes) to
+                 (epochs × tasks), giving ~num_episodes× speedup on this step.
+          Fix 5: advantage normalisation applied once to the full concatenated
+                 batch rather than per-trajectory, eliminating per-episode
+                 mean/std calls inside the inner loop.
+
+        Gradient structure (unchanged):
+            ∇L = mean_t[ clip(ρ_step, 1±ε) · w(τ) · A_t ]
+        """
+        actor_losses, entropies, kl_vals, clip_fracs, cf_weights = [], [], [], [], []
+
+        for epoch in range(self.update_epochs):
+            for target_task in range(self.num_tasks):
+                trajs = task_data[target_task]
+                if not trajs:
+                    continue
+
+                # Fix 2: concatenate all episodes for this task into one batch
+                # Shape of each: (sum_of_T_across_episodes, ...)
+                b_obs     = torch.cat([d['obs']          for d in trajs], dim=0)
+                b_acc     = torch.cat([d['acc_rewards']  for d in trajs], dim=0)
+                b_act     = torch.cat([d['actions']      for d in trajs], dim=0) \
+                            if trajs[0]['actions'].dim() > 1 \
+                            else torch.cat([d['actions'] for d in trajs])
+                b_old_lp  = torch.cat([d['target_lp_old'] for d in trajs])
+                b_adv     = torch.cat([d['advantages_t']  for d in trajs])
+                b_lengths = [d['length'] for d in trajs]
+                total_T   = b_obs.shape[0]
+
+                # Fix 5: normalise across the full task batch — one mean/std call
+                if self.normalize_advantages:
+                    b_adv = self._normalize_advantages(target_task, b_adv)
+
+                # Task one-hot for full batch
+                task_hot = F.one_hot(
+                    torch.full((total_T,), target_task, dtype=torch.long,
+                               device=self.device),
+                    num_classes=self.num_tasks
+                ).float()
+
+                # Fix 2: ONE forward+backward per task per epoch
+                self.optimizer[0].zero_grad()
+
+                new_lp, entropy = self.agent.compute_action_log_probabilities_and_entropy(
+                    b_obs, b_act, b_acc, task_hot, self.device
+                )
+
+                log_ratios     = new_lp - b_old_lp
+                step_ratios    = log_ratios.exp()
+                clipped_ratios = torch.clamp(
+                    step_ratios,
+                    1.0 - self.surrogate_clip_threshold,
+                    1.0 + self.surrogate_clip_threshold,
+                )
+
+                pg_loss  = torch.max(
+                    -step_ratios    * b_adv,
+                    -clipped_ratios * b_adv,
+                ).mean()
+
+                ent_loss = -entropy.mean()
+                loss     = pg_loss + self.entropy_loss_coefficient * ent_loss
+                loss.backward()
+
+                # Early stopping check before stepping
+                with torch.no_grad():
+                    approx_kl = ((step_ratios - 1) - log_ratios).mean().item()
+                    clip_frac = (
+                        (step_ratios - 1.0).abs() > self.surrogate_clip_threshold
+                    ).float().mean().item()
+                    mean_cf = float(np.mean([d['cf_weight'] for d in trajs]))
+
+                    actor_losses.append(pg_loss.item())
+                    entropies.append(entropy.mean().item())
+                    kl_vals.append(approx_kl)
+                    clip_fracs.append(clip_frac)
+                    cf_weights.append(mean_cf)
+
+                if self.target_kl is not None and abs(approx_kl) > self.target_kl:
+                    # Zero the accumulated gradient and skip step if KL too large
+                    self.optimizer[0].zero_grad()
+                    continue
+
+                nn.utils.clip_grad_norm_(
+                    self.agent.actor.parameters(), self.max_grad_norm
+                )
+                self.optimizer[0].step()
+
+        return {
+            'actor_loss':    float(np.mean(actor_losses))  if actor_losses else 0.0,
+            'entropy':       float(np.mean(entropies))     if entropies    else 0.0,
+            'approx_kl':     float(np.mean(kl_vals))       if kl_vals      else 0.0,
+            'clip_fraction': float(np.mean(clip_fracs))    if clip_fracs   else 0.0,
+            'mean_cf_weight':float(np.mean(cf_weights))    if cf_weights   else 1.0,
+        }
+
+    # -----------------------------------------------------------------------
+    # Evaluation
+    # -----------------------------------------------------------------------
 
     def evaluate(self):
         if self.eval_envs is None:
             return
 
-        print(f"--- Starting Evaluation at Step {self._global_step} ---")
+        print(f"--- Evaluation at Step {self._global_step} ---")
         self.agent.eval()
         n_eval_envs = self.eval_envs.num_envs
 
-        results = {t_id: [] for t_id in range(self.num_tasks)}
-
+        results      = {t: [] for t in range(self.num_tasks)}
         tasks_to_run = np.repeat(np.arange(self.num_tasks), self.num_eval_episodes)
-        total_episodes_needed = len(tasks_to_run)
+        total_needed = len(tasks_to_run)
 
-        obs, _ = self.eval_envs.reset(seed=self.seed + 1000 + int(self._global_step))
-        obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        obs, _ = self.eval_envs.reset(seed=self.seed + 999)
+        obs    = torch.tensor(obs, dtype=torch.float32, device=self.device)
 
-        # PATCH 3: Accumulate with gamma=1.0 in eval.
-        # Utility functions (e.g. O1 = (shaping + terminal) / 300) require
-        # raw undiscounted cumulative returns. Discounting with gamma=0.995
-        # over ~200 steps reduces terminal +100 to ~60, distorting utilities.
-        acc_rewards = torch.zeros((n_eval_envs, self.reward_size), device=self.device)
+        # Accumulate returns — with or without discounting matching training
+        acc_rewards  = np.zeros((n_eval_envs, self.reward_size), dtype=np.float32)
 
-        active_tasks = torch.zeros(n_eval_envs, dtype=torch.long, device=self.device)
-        env_task_ptr = np.full(n_eval_envs, -1, dtype=np.int32)
+        # Per-environment step counter for gamma^t scaling when discount_utility=True
+        eval_steps   = np.zeros(n_eval_envs, dtype=np.int32)
+
+        active_tasks = np.zeros(n_eval_envs, dtype=np.int64)
+        ptr          = np.full(n_eval_envs, -1, dtype=np.int32)
 
         params_ptr = 0
         for i in range(n_eval_envs):
-            if params_ptr < total_episodes_needed:
+            if params_ptr < total_needed:
                 active_tasks[i] = int(tasks_to_run[params_ptr])
-                env_task_ptr[i] = params_ptr
-                params_ptr += 1
+                ptr[i]          = params_ptr
+                params_ptr     += 1
 
-        while (env_task_ptr != -1).any():
-            task_one_hot = self._get_one_hot_task(active_tasks, n_eval_envs)
+        while (ptr != -1).any():
+            task_t    = torch.tensor(active_tasks, dtype=torch.long, device=self.device)
+            task_hot  = F.one_hot(task_t, num_classes=self.num_tasks).float()
+            acc_t     = torch.tensor(acc_rewards, dtype=torch.float32, device=self.device)
 
             with torch.no_grad():
-                action, _ = self.agent.sample_action_and_compute_log_prob(
-                    obs, acc_rewards, task_one_hot, deterministic=False, device=self.device
+                actions, _ = self.agent.sample_action_and_compute_log_prob(
+                    obs, acc_t, task_hot, deterministic=False, device=self.device
                 )
 
-            next_obs, reward, terminations, truncations, infos = self.eval_envs.step(action.cpu().numpy())
+            next_obs, reward, terms, truncs, _ = self.eval_envs.step(actions.cpu().numpy())
 
-            reward_tens = torch.tensor(reward, dtype=torch.float32, device=self.device).reshape(n_eval_envs, self.reward_size)
+            reward_np = np.array(reward, dtype=np.float32).reshape(
+                n_eval_envs, self.reward_size
+            )
 
-            # Mask idle environments
-            idle_mask = torch.tensor(env_task_ptr == -1, device=self.device)
-            reward_tens[idle_mask] = 0.0
+            # Zero out idle environments
+            idle_mask          = (ptr == -1)
+            reward_np[idle_mask] = 0.0
 
-            # PATCH 3: no gamma discounting in eval accumulator
-            acc_rewards += reward_tens
+            # Accumulate — consistent with training collection
+            if self.discount_utility and self.gamma < 1.0:
+                # gamma^t per environment, broadcast over reward_size
+                discount = (self.gamma ** eval_steps).reshape(n_eval_envs, 1)
+                acc_rewards += discount * reward_np
+            else:
+                acc_rewards += reward_np
 
-            is_done = torch.logical_or(
-                torch.tensor(terminations), torch.tensor(truncations)
-            ).to(self.device)
+            # Increment step counters for active environments only
+            eval_steps[~idle_mask] += 1
 
-            if is_done.any():
-                done_indices = torch.where(is_done)[0]
-                for idx in done_indices:
-                    if env_task_ptr[idx.item()] != -1:
-                        task_id = active_tasks[idx].item()
-                        final_vec = acc_rewards[idx]
-                        u_val = self.utility_functions[task_id](final_vec).item()
-                        results[task_id].append(u_val)
+            is_done = np.logical_or(terms, truncs)
+            for i in np.where(is_done)[0]:
+                if ptr[i] != -1:
+                    tid   = int(active_tasks[i])
+                    r_vec = torch.tensor(
+                        acc_rewards[i], dtype=torch.float32, device=self.device
+                    )
+                    u_val = self.utility_functions[tid](r_vec).item()
+                    results[tid].append(u_val)
 
-                        acc_rewards[idx] = 0.0
+                    # Reset this environment's buffers
+                    acc_rewards[i] = np.zeros(self.reward_size, dtype=np.float32)
+                    eval_steps[i]  = 0
 
-                        if params_ptr < total_episodes_needed:
-                            active_tasks[idx] = int(tasks_to_run[params_ptr])
-                            env_task_ptr[idx.item()] = params_ptr
-                            params_ptr += 1
-                        else:
-                            env_task_ptr[idx.item()] = -1
+                    if params_ptr < total_needed:
+                        active_tasks[i] = int(tasks_to_run[params_ptr])
+                        ptr[i]          = params_ptr
+                        params_ptr     += 1
+                    else:
+                        ptr[i] = -1
 
             obs = torch.tensor(next_obs, dtype=torch.float32, device=self.device)
 
         for t_id, vals in results.items():
-            if len(vals) > 0:
+            if vals:
                 self.logger.log_evaluation(
-                    self._global_step, np.min(vals), np.mean(vals), np.max(vals), t_id
+                    self._global_step,
+                    np.min(vals), np.mean(vals), np.max(vals),
+                    t_id,
                 )
 
         self.agent.train()
         print("--- Evaluation Complete ---")
 
-    def learn(self, total_timesteps):
-        num_updates = total_timesteps // self.batch_size
+    # -----------------------------------------------------------------------
+    # Main training loop
+    # -----------------------------------------------------------------------
 
-        obs, _ = self.envs.reset(seed=self.seed)
-        obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
+    def learn(self, total_timesteps: int):
+        """
+        Main training loop.
 
-        acc_rewards = torch.zeros((self.num_envs, self.reward_size), device=self.device)
-        acc_gamma = torch.ones((self.num_envs, 1), device=self.device)
-        active_task_indices = torch.randint(0, self.num_tasks, (self.num_envs,), device=self.device)
+        Each iteration:
+          1. Collect complete episodes (episode-level, exact utility)
+          2. Train baseline on all steps — utility head + vector head
+          3. Compute per-step advantages using utility head as baseline
+          4. Update actor with per-step PPO + counterfactual reuse
+          5. Step LR schedulers
+        """
+        while self._global_step < total_timesteps:
 
-        done = torch.zeros(self.num_envs, device=self.device)
-        truncated = torch.zeros(self.num_envs, device=self.device)
-
-        self.next_eval_step = 0
-
-        for update in range(num_updates):
-            if self.anneal_lr and self.lr_scheduler:
-                self.lr_scheduler.step()
-
-            storage = self.collect_rollouts(
-                obs, acc_rewards, acc_gamma, done, truncated, active_task_indices
-            )
-
-            obs = storage['next_obs']
-            acc_rewards = storage['next_acc_rewards']
-            acc_gamma = storage['next_acc_gamma']
-            done = storage['next_done']
-            truncated = storage['next_truncated']
-            active_task_indices = storage['next_task_indices']
-
-            update_stats = self.update(storage)
-            self.logger.log_policy_update(update_stats, self._global_step)
-
-        self.evaluate()
-        return self.agent
-
-    def _initialize_storage(self):
-        collected_observations = torch.zeros(
-            (self.num_rollout_steps, self.num_envs) + self.envs.single_observation_space.shape,
-            device=self.device
-        )
-        action_shape = () if self.env_is_discrete else self.envs.single_action_space.shape
-        actions = torch.zeros(
-            (self.num_rollout_steps, self.num_envs) + action_shape, device=self.device
-        )
-        action_log_probabilities = torch.zeros(
-            (self.num_rollout_steps, self.num_envs), device=self.device
-        )
-        rewards = torch.zeros(
-            (self.num_rollout_steps, self.num_envs, self.reward_size), device=self.device
-        )
-        is_episode_terminated = torch.zeros(
-            (self.num_rollout_steps, self.num_envs), device=self.device
-        )
-        is_episode_truncated = torch.zeros(
-            (self.num_rollout_steps, self.num_envs), device=self.device
-        )
-        observation_vector_values = torch.zeros(
-            (self.num_rollout_steps, self.num_envs, self.reward_size), device=self.device
-        )
-        acc_rewards_storage = torch.zeros(
-            (self.num_rollout_steps, self.num_envs, self.reward_size), device=self.device
-        )
-        acc_gamma_storage = torch.ones(
-            (self.num_rollout_steps, self.num_envs, 1), device=self.device
-        )
-        task_id_storage = torch.zeros(
-            (self.num_rollout_steps, self.num_envs), dtype=torch.long, device=self.device
-        )
-        behavior_util_storage = torch.zeros(
-            (self.num_rollout_steps, self.num_envs, 1), device=self.device
-        )
-        return (
-            collected_observations, actions, action_log_probabilities, rewards,
-            is_episode_terminated, is_episode_truncated, observation_vector_values,
-            acc_rewards_storage, acc_gamma_storage, task_id_storage, behavior_util_storage
-        )
-
-    def collect_rollouts(self, obs, acc_rewards, acc_gamma, done, truncated, active_task_indices):
-        (
-            collected_observations, actions, action_log_probabilities, rewards,
-            is_episode_terminated, is_episode_truncated, observation_vector_values,
-            acc_rewards_storage, acc_gamma_storage, task_id_storage, behavior_util_storage
-        ) = self._initialize_storage()
-
-        active_task_indices = active_task_indices.to(self.device)
-
-        for step in range(self.num_rollout_steps):
-
+            # Periodic evaluation
             if self._global_step >= self.next_eval_step:
                 self.evaluate()
                 self.next_eval_step += self.eval_interval
 
-            collected_observations[step] = obs
-            acc_rewards_storage[step] = acc_rewards
-            acc_gamma_storage[step] = acc_gamma
-            is_episode_terminated[step] = done
-            is_episode_truncated[step] = truncated
-            task_id_storage[step] = active_task_indices
-
-            task_one_hot = self._get_one_hot_task(active_task_indices, self.num_envs)
-
-            with torch.no_grad():
-                action, logprob = self.agent.sample_action_and_compute_log_prob(
-                    obs, acc_rewards, task_one_hot, deterministic=False, device=self.device
-                )
-                _, vec_value = self.agent.estimate_value_from_observation(
-                    obs, acc_rewards, task_one_hot, device=self.device
-                )
-                behavior_util, _ = self.agent.estimate_value_from_observation(
-                    obs, acc_rewards, task_one_hot, device=self.device
-                )
-
-                observation_vector_values[step] = vec_value
-                behavior_util_storage[step] = behavior_util
-
-            actions[step] = action
-            action_log_probabilities[step] = logprob
-
-            next_obs, reward, terminations, truncations, infos = self.envs.step(action.cpu().numpy())
-            self._global_step += self.num_envs
-
-            if self.reward_rms is not None:
-                rewards_reshaped = reward.reshape(-1, self.reward_size)
-                self.reward_rms.update(rewards_reshaped)
-                reward = self.reward_rms.normalize(rewards_reshaped).reshape(
-                    self.num_envs, self.reward_size
-                )
-
-            reward_tens = torch.tensor(reward, dtype=torch.float32, device=self.device).reshape(
-                self.num_envs, self.reward_size
-            )
-            rewards[step] = reward_tens
-
-            acc_rewards = acc_rewards + acc_gamma * reward_tens
-            acc_gamma = acc_gamma * self.gamma
-
-            done = torch.tensor(terminations, dtype=torch.float32, device=self.device)
-            truncated = torch.tensor(truncations, dtype=torch.float32, device=self.device)
-            is_done = torch.logical_or(done, truncated)
-
-            if "episode" in infos:
-                if 'dr' in infos['episode']:
-                    final_vec_ret = infos['episode']['dr'][infos['_episode']]
-                elif 'r' in infos['episode']:
-                    scalar_ret = infos['episode']['r'][infos['_episode']]
-                    final_vec_ret = scalar_ret.reshape(-1, 1).repeat(1, self.reward_size)
-                else:
-                    final_vec_ret = None
-
-                if final_vec_ret is not None:
-                    finished_env_indices = np.where(infos['_episode'])[0]
-                    if len(finished_env_indices) > 0:
-                        finished_tasks = active_task_indices[finished_env_indices].cpu().numpy()
-                        finished_vecs = torch.tensor(
-                            final_vec_ret, device=self.device, dtype=torch.float32
-                        )
-                        for j, env_idx in enumerate(finished_env_indices):
-                            task_idx = int(finished_tasks[j])
-                            util_val = self.utility_functions[task_idx](finished_vecs[j]).item()
-                            self.logger.log_rollout_step(
-                                infos, self._global_step,
-                                active_task_id=task_idx,
-                                active_utility_val=util_val
-                            )
-
-            if is_done.any():
-                mask = (~is_done).unsqueeze(1)
-                acc_rewards = acc_rewards * mask
-                acc_gamma = acc_gamma * mask
-                acc_gamma[~mask.squeeze(1)] = 1.0
-
-                new_tasks = torch.randint(0, self.num_tasks, (self.num_envs,), device=self.device)
-                active_task_indices = torch.where(is_done, new_tasks, active_task_indices)
-
-            obs = torch.tensor(next_obs, dtype=torch.float32, device=self.device)
-
-        task_one_hot = self._get_one_hot_task(active_task_indices, self.num_envs)
-        with torch.no_grad():
-            _, next_aux_val = self.agent.estimate_value_from_observation(
-                obs, acc_rewards, task_one_hot, device=self.device
-            )
-
-        storage = {
-            'obs': collected_observations,
-            'actions': actions,
-            'logprobs': action_log_probabilities,
-            'rewards': rewards,
-            'dones': is_episode_terminated,
-            'truncated': is_episode_truncated,
-            'values': observation_vector_values,
-            'acc_rewards_in': acc_rewards_storage,
-            'acc_gamma_in': acc_gamma_storage,
-            'task_ids': task_id_storage,
-            'behavior_util': behavior_util_storage,
-            'next_aux_val': next_aux_val,
-            'next_obs': obs,
-            'next_acc_rewards': acc_rewards,
-            'next_acc_gamma': acc_gamma,
-            'next_done': done,
-            'next_truncated': truncated,
-            'next_task_indices': active_task_indices,
-        }
-        return storage
-
-    def update(self, storage):
-        vec_returns = self.compute_vector_returns(
-            storage['rewards'], storage['dones'], storage['truncated'],
-            storage['next_aux_val'], storage['next_done']
-        )
-
-        b_obs = self._flatten(storage['obs'])
-        b_acc = self._flatten(storage['acc_rewards_in'])
-        b_gamma = self._flatten(storage['acc_gamma_in'])
-        b_actions = self._flatten(storage['actions'])
-        b_vec_returns = self._flatten(vec_returns)
-        b_task_ids = self._flatten(storage['task_ids'])
-
-        b_projected_total_vec = b_acc + b_gamma * b_vec_returns
-        util_sample = self.utility_functions[0](b_projected_total_vec)
-        print(f"UTILITY TARGETS: mean={util_sample.mean():.2f} "
-            f"std={util_sample.std():.2f} "
-            f"min={util_sample.min():.2f} "
-            f"max={util_sample.max():.2f}")
-        print(f"PROJECTED VEC shaping: mean={b_projected_total_vec[:,0].mean():.2f} "
-            f"min={b_projected_total_vec[:,0].min():.2f} "
-            f"max={b_projected_total_vec[:,0].max():.2f}")
-        print(f"PROJECTED VEC terminal: mean={b_projected_total_vec[:,2].mean():.2f} "
-            f"min={b_projected_total_vec[:,2].min():.2f} "
-            f"max={b_projected_total_vec[:,2].max():.2f}")
-
-        # =====================================================
-        # PRE-CALCULATE ADVANTAGES (Using OLD Critic)
-        # =====================================================
-        all_task_advantages = []
-        all_task_old_logprobs = []
-
-        precalc_start_time = time.time()
-
-        with torch.no_grad():
-            for task_i in range(self.num_tasks):
-                task_hot = self._get_single_task_one_hot(task_i, self.batch_size)
-
-                target_util = self.utility_functions[task_i](b_projected_total_vec)
-                if target_util.ndim == 1:
-                    target_util = target_util.unsqueeze(1)
-
-                baseline, _ = self.agent.estimate_value_from_observation(
-                    b_obs, b_acc, task_hot, device=self.device
-                )
-
-                adv = target_util - baseline
-                if self.normalize_advantages:
-                    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-
-                all_task_advantages.append(adv)
-
-                old_lp, _ = self.agent.compute_action_log_probabilities_and_entropy(
-                    b_obs, b_actions, b_acc, task_hot, self.device
-                )
-                all_task_old_logprobs.append(old_lp)
-
-        precalc_time = time.time() - precalc_start_time
-
-        # =====================================================
-        # PHASE 1: CRITIC UPDATE
-        # =====================================================
-        critic_loss_hist = []
-        explained_var_util = []
-        explained_var_vec = []
-
-        critic_start_time = time.time()
-
-        inds = np.arange(self.batch_size)
-        for epoch in range(self.update_epochs):
-            np.random.shuffle(inds)
-            for start in range(0, self.batch_size, self.minibatch_size):
-                mb_inds = inds[start:start + self.minibatch_size]
-
-                mb_obs = b_obs[mb_inds]
-                mb_acc = b_acc[mb_inds]
-                mb_projected_vec = b_projected_total_vec[mb_inds]
-                mb_vec_ret = b_vec_returns[mb_inds]
-                mb_task_ids = b_task_ids[mb_inds]
-
-                mb_task_hot_behavior = self._get_one_hot_task(mb_task_ids, len(mb_inds))
-
-                mb_target_utils = torch.zeros(len(mb_inds), 1, device=self.device)
-                unique_tasks = torch.unique(mb_task_ids)
-
-                for t_id in unique_tasks:
-                    mask = (mb_task_ids == t_id)
-                    task_vecs = mb_projected_vec[mask]
-                    task_utils = self.utility_functions[t_id.item()](task_vecs)
-                    if len(task_utils.shape) == 1:
-                        task_utils = task_utils.unsqueeze(1)
-                    mb_target_utils[mask] = task_utils
-
-                pred_utility, pred_vec = self.agent.estimate_value_from_observation(
-                    mb_obs, mb_acc, mb_task_hot_behavior, device=self.device
-                )
-
-                loss_util = 0.5 * ((pred_utility - mb_target_utils) ** 2).mean()
-                loss_vec = 0.5 * ((pred_vec - mb_vec_ret) ** 2).mean()
-                total_critic_loss = loss_util + loss_vec
-
-                if epoch == 0 and start == 0:
-                    y_true = mb_target_utils.flatten()
-                    y_pred = pred_utility.flatten()
-                    var_y = torch.var(y_true)
-                    ev_u = float('nan') if var_y == 0 else (
-                        1 - torch.var(y_true - y_pred) / var_y
-                    ).item()
-                    explained_var_util.append(ev_u)
-
-                    y_true_v = mb_vec_ret.flatten()
-                    y_pred_v = pred_vec.flatten()
-                    var_y_v = torch.var(y_true_v)
-                    ev_v = float('nan') if var_y_v == 0 else (
-                        1 - torch.var(y_true_v - y_pred_v) / var_y_v
-                    ).item()
-                    explained_var_vec.append(ev_v)
-
-                self.optimizer[1].zero_grad()
-                total_critic_loss.backward()
-                nn.utils.clip_grad_norm_(self.agent.critic.parameters(), self.max_grad_norm)
-                self.optimizer[1].step()
-
-                critic_loss_hist.append(total_critic_loss.item())
-
-        critic_time = time.time() - critic_start_time
-
-        # =====================================================
-        # PHASE 2: ACTOR UPDATE (Vectorized Counterfactual)
-        # =====================================================
-        actor_start_time = time.time()
-
-        actor_loss_hist = []
-        entropy_hist = []
-        kl_hist = []
-        clip_frac_hist = []
-
-        b_behavior_lp = self._flatten(storage['logprobs'])
-
-        total_real_samples = self.batch_size
-        inds = np.arange(total_real_samples)
-
-        is_ratio_threshold = np.log(0.01)
-
-        for _ in range(self.update_epochs):
-            np.random.shuffle(inds)
-            for start in range(0, total_real_samples, self.minibatch_size):
-                mb_inds = inds[start:start + self.minibatch_size]
-
-                mb_obs = b_obs[mb_inds]
-                mb_acc = b_acc[mb_inds]
-                mb_act = b_actions[mb_inds]
-                mb_behavior_lp = b_behavior_lp[mb_inds]
-                mb_behavior_id = b_task_ids[mb_inds]
-
-                self.optimizer[0].zero_grad()
-
-                processed_tasks = 0
-
-                for t_idx in range(self.num_tasks):
-                    mb_old_lp_target = all_task_old_logprobs[t_idx][mb_inds]
-                    mb_adv_target = all_task_advantages[t_idx][mb_inds]
-
-                    log_is_weight = mb_old_lp_target - mb_behavior_lp
-                    is_plausible = (log_is_weight > is_ratio_threshold)
-                    is_real = (mb_behavior_id == t_idx)
-                    keep_mask = (is_real | is_plausible)
-
-                    if not keep_mask.any():
-                        continue
-
-                    processed_tasks += 1
-
-                    sub_obs = mb_obs[keep_mask]
-                    sub_acc = mb_acc[keep_mask]
-                    sub_act = mb_act[keep_mask]
-                    sub_old_lp = mb_old_lp_target[keep_mask]
-                    sub_adv = mb_adv_target[keep_mask]
-
-                    sub_task_hot = self._get_single_task_one_hot(t_idx, sub_obs.shape[0])
-
-                    new_lp, entropy = self.agent.compute_action_log_probabilities_and_entropy(
-                        sub_obs, sub_act, sub_acc, sub_task_hot, self.device
-                    )
-
-                    logratio = new_lp - sub_old_lp
-                    logratio = torch.clamp(logratio, max=20.0)
-                    ratio = logratio.exp()
-
-                    pg_loss1 = -sub_adv * ratio
-                    pg_loss2 = -sub_adv * torch.clamp(
-                        ratio,
-                        1.0 - self.surrogate_clip_threshold,
-                        1.0 + self.surrogate_clip_threshold
-                    )
-                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-                    ent_loss = -entropy.mean()
-
-                    loss = pg_loss + self.entropy_loss_coefficient * ent_loss
-                    loss.backward()
-
-                    with torch.no_grad():
-                        approx_kl = ((ratio - 1) - logratio).mean()
-                        clip_frac = (
-                            (ratio - 1.0).abs() > self.surrogate_clip_threshold
-                        ).float().mean()
-
-                        actor_loss_hist.append(pg_loss.item())
-                        entropy_hist.append(entropy.mean().item())
-                        kl_hist.append(approx_kl.item())
-                        clip_frac_hist.append(clip_frac.item())
-
-                if processed_tasks > 0:
-                    nn.utils.clip_grad_norm_(self.agent.actor.parameters(), self.max_grad_norm)
-                    self.optimizer[0].step()
-
-        actor_time = time.time() - actor_start_time
-
-        metrics = {
-            "actor_loss": np.mean(actor_loss_hist),
-            "critic_loss": np.mean(critic_loss_hist),
-            "entropy": np.mean(entropy_hist),
-            "approx_kl": np.mean(kl_hist),
-            "clip_fraction": np.mean(clip_frac_hist),
-            "explained_var_utility": np.mean(explained_var_util) if explained_var_util else 0,
-            "explained_var_vector": np.mean(explained_var_vec) if explained_var_vec else 0,
-        }
-
-        print("-" * 45)
-        print(f"{'Metric':<25} | {'Value':<15}")
-        print("-" * 45)
-        for k, v in metrics.items():
-            print(f"{k:<25} | {v: .6f}")
-        print(f"{'Actor Time':<25} | {actor_time: .6f}")
-        print(f"{'Critic Time':<25} | {critic_time: .6f}")
-        print("-" * 45)
-
-        return metrics
-
-    def _flatten(self, tensor):
-        return tensor.reshape((-1,) + tensor.shape[2:])
-
-    def compute_vector_returns(self, rewards, dones, truncated, next_value, next_done):
-        """
-        PATCH 2: Correct truncation handling.
-        - Terminated episodes (done=1, truncated=0): do NOT bootstrap
-        - Truncated episodes (done=0, truncated=1): SHOULD bootstrap
-          (episode cut by time limit, not a true terminal state)
-        - next_done here is the termination flag for the state AFTER the rollout
-        """
-        T = self.num_rollout_steps
-        returns = torch.zeros_like(rewards, device=self.device)
-
-        # Bootstrap from next state unless truly terminated
-        next_val = next_value * (1.0 - next_done).unsqueeze(1)
-
-        for t in reversed(range(T)):
-            # real_done: true terminal — mask out future returns
-            real_done = dones[t] * (1.0 - truncated[t])
-            cont_mask = (1.0 - real_done).unsqueeze(1)
-            returns[t] = rewards[t] + self.gamma * cont_mask * next_val
-            next_val = returns[t]
-
-        return returns
-
-    def calculate_policy_gradient_loss(self, minibatch_advantages, probability_ratio):
-        unclipped = minibatch_advantages * probability_ratio
-        clipped = minibatch_advantages * torch.clamp(
-            probability_ratio,
-            1 - self.surrogate_clip_threshold,
-            1 + self.surrogate_clip_threshold,
-        )
-        return -torch.min(unclipped, clipped)
-
-    def calculate_critic_loss(self, new_util_val, util_tgt, new_vec_val, vec_ret):
-        util_loss = 0.5 * ((new_util_val - util_tgt) ** 2).mean()
-        vec_loss = 0.5 * ((new_vec_val - vec_ret) ** 2).mean()
-        return util_loss, vec_loss
+            t0 = time.time()
+
+            # 1. Collect complete episodes — exact realized returns
+            episodes = self.collect_episodes()
+            collect_time = time.time() - t0
+
+            t1 = time.time()
+
+            # 2. Train both critic heads on all steps
+            critic_stats = self._train_baseline(episodes)
+            critic_time  = time.time() - t1
+
+            t2 = time.time()
+
+            # 3+4. Per-step advantages + actor update with counterfactual reuse
+            task_data   = self._compute_trajectory_advantages(episodes)
+            actor_stats = self._train_actor(task_data)
+            actor_time  = time.time() - t2
+
+            # 5. Step both LR schedulers
+            if self.anneal_lr and self.lr_schedulers:
+                for sched in self.lr_schedulers:
+                    sched.step()
+
+            stats = {
+                **critic_stats,
+                **actor_stats,
+                'episodes_collected': len(episodes),
+            }
+            self.logger.log_policy_update(stats, self._global_step)
+
+            ev_util = critic_stats['explained_var_util']
+            ev_vec  = critic_stats['explained_var_vec']
+
+            print("-" * 50)
+            print(f"{'Step':<25} | {self._global_step}")
+            print(f"{'Critic Loss':<25} | {critic_stats['critic_loss']:.6f}")
+            print(f"{'Expl Var (Utility)':<25} | "
+                  f"{ev_util:.4f}" if not np.isnan(ev_util) else
+                  f"{'Expl Var (Utility)':<25} | nan")
+            print(f"{'Expl Var (Vector)':<25} | "
+                  f"{ev_vec:.4f}" if not np.isnan(ev_vec) else
+                  f"{'Expl Var (Vector)':<25} | nan")
+            print(f"{'Actor Loss':<25} | {actor_stats['actor_loss']:.6f}")
+            print(f"{'Entropy':<25} | {actor_stats['entropy']:.6f}")
+            print(f"{'Approx KL':<25} | {actor_stats['approx_kl']:.6f}")
+            print(f"{'Clip Fraction':<25} | {actor_stats['clip_fraction']:.6f}")
+            print(f"{'Mean CF Weight':<25} | {actor_stats['mean_cf_weight']:.4f}")
+            print(f"{'Episodes':<25} | {len(episodes)}")
+            print(f"{'Collect Time':<25} | {collect_time:.3f}s")
+            print(f"{'Critic Time':<25} | {critic_time:.3f}s")
+            print(f"{'Actor Time':<25} | {actor_time:.3f}s")
+            print("-" * 50)
+
+        # Final evaluation
+        self.evaluate()
+        return self.agent
