@@ -321,12 +321,6 @@ class PPO:
         else:
             self.lr_schedulers = None
 
-        # Running advantage statistics per task (for stable normalization)
-        self._adv_stats = {
-            t: {'mean': 0.0, 'std': 1.0}
-            for t in range(self.num_tasks)
-        }
-
     # -----------------------------------------------------------------------
     # Episode-level collection with parallel environments
     # -----------------------------------------------------------------------
@@ -536,43 +530,70 @@ class PPO:
         ev_util_first = None
         ev_vec_first  = None
 
+        # Compute explained variance BEFORE any training, across the full dataset.
+        # Computing on the first minibatch is unreliable because steps within a
+        # single episode share the same utility target — a small minibatch may
+        # contain steps from only one or two episodes, giving near-zero variance
+        # in y_true and a meaningless EV value.
+        with torch.no_grad():
+            pred_util_full, pred_vec_full = self.agent.estimate_value_from_observation(
+                b_obs, b_acc, b_task, device=self.device
+            )
+            # EV computed in original (denormalised) scale — meaningful for logging
+            y_u   = b_util.flatten()
+            yh_u  = pred_util_full.detach().flatten()
+            var_u = torch.var(y_u)
+            ev_util_first = (
+                float('nan') if var_u == 0
+                else (1.0 - torch.var(y_u - yh_u) / var_u).item()
+            )
+            y_v   = b_vec.flatten()
+            yh_v  = pred_vec_full.detach().flatten()
+            var_v = torch.var(y_v)
+            ev_vec_first = (
+                float('nan') if var_v == 0
+                else (1.0 - torch.var(y_v - yh_v) / var_v).item()
+            )
+
         for epoch in range(self.update_epochs):
             perm = torch.randperm(n, device=self.device)
             for start in range(0, n, mb_size):
                 idx = perm[start:start + mb_size]
 
-                pred_util, pred_vec = self.agent.estimate_value_from_observation(
+                # Pass 1: utility head — independent forward + backward.
+                # Use estimate_value_normalized to get raw network output in
+                # PopArt-normalised space, then compare against normalised target.
+                # This keeps the MSE loss near unit scale regardless of return magnitude.
+                pred_util_norm, _ = self.agent.estimate_value_normalized(
                     b_obs[idx], b_acc[idx], b_task[idx], device=self.device
                 )
-
-                loss_util = 0.5 * ((pred_util - b_util[idx]) ** 2).mean()
-                loss_vec  = 0.5 * ((pred_vec  - b_vec[idx])  ** 2).mean()
-
-                if epoch == 0 and start == 0:
-                    with torch.no_grad():
-                        y_u   = b_util[idx].flatten()
-                        yh_u  = pred_util.detach().flatten()
-                        var_u = torch.var(y_u)
-                        ev_util_first = (
-                            float('nan') if var_u == 0
-                            else (1.0 - torch.var(y_u - yh_u) / var_u).item()
-                        )
-                        y_v   = b_vec[idx].flatten()
-                        yh_v  = pred_vec.detach().flatten()
-                        var_v = torch.var(y_v)
-                        ev_vec_first = (
-                            float('nan') if var_v == 0
-                            else (1.0 - torch.var(y_v - yh_v) / var_v).item()
-                        )
-
-                total_loss = loss_util + loss_vec
+                target_util_norm = self.agent.popart_util.normalize(b_util[idx])
+                loss_util = 0.5 * ((pred_util_norm - target_util_norm.detach()) ** 2).mean()
                 self.optimizer[1].zero_grad()
-                total_loss.backward()
+                loss_util.backward()
                 nn.utils.clip_grad_norm_(
                     self.agent.critic.parameters(), self.max_grad_norm
                 )
                 self.optimizer[1].step()
-                critic_losses.append(total_loss.item())
+                # Update PopArt statistics and rescale output layer weights AFTER step.
+                # The rescaling preserves the denormalised function under the new statistics.
+                self.agent.popart_util.update_and_rescale(b_util[idx].detach())
+
+                # Pass 2: vector head — fresh forward pass after optimizer step.
+                _, pred_vec_norm = self.agent.estimate_value_normalized(
+                    b_obs[idx], b_acc[idx], b_task[idx], device=self.device
+                )
+                target_vec_norm = self.agent.popart_returns.normalize(b_vec[idx])
+                loss_vec = 0.5 * ((pred_vec_norm - target_vec_norm.detach()) ** 2).mean()
+                self.optimizer[1].zero_grad()
+                loss_vec.backward()
+                nn.utils.clip_grad_norm_(
+                    self.agent.critic.parameters(), self.max_grad_norm
+                )
+                self.optimizer[1].step()
+                self.agent.popart_returns.update_and_rescale(b_vec[idx].detach())
+
+                critic_losses.append((loss_util + loss_vec).item())
 
         return {
             'critic_loss':        float(np.mean(critic_losses)),
@@ -650,9 +671,8 @@ class PPO:
                 )   # shape: (num_tasks * T, 1)
 
                 # Split results back into per-task blocks
-                target_lp_split  = target_lp_all.view(self.num_tasks, T)    # (K, T)
-                baselines_split  = baselines_all.view(self.num_tasks, T)     # (K, T)
-                beh_lp_block     = beh_lp.unsqueeze(0).expand(self.num_tasks, T)  # (K, T)
+                target_lp_split = target_lp_all.view(self.num_tasks, T)  # (K, T)
+                baselines_split = baselines_all.view(self.num_tasks, T)   # (K, T)
 
                 for target_task in range(self.num_tasks):
                     target_lp = target_lp_split[target_task]   # (T,)
@@ -673,7 +693,7 @@ class PPO:
                     ).item()
 
                     # IS-weighted per-step advantages
-                    advantages_t = cf_weight * (target_util - baselines.detach())  # (T,)
+                    advantages_t = cf_weight * (target_util - baselines)  # (T,)
 
                     task_data[target_task].append({
                         'cf_weight':      cf_weight,
@@ -686,24 +706,86 @@ class PPO:
                         'target_lp_old':  target_lp,
                         'length':         T,
                         'is_real':        (ep.task_id == target_task),
+                        'episode_utility': target_util,  # scalar — needed for episode-level normalization
                     })
 
         return task_data
 
-    def _normalize_advantages(self, task_id: int, advantages_t: torch.Tensor) -> torch.Tensor:
+    def _normalize_advantages(self, task_id: int, advantages_t: torch.Tensor,
+                              episode_lengths: list) -> torch.Tensor:
         """
-        Running EMA normalization — now operates on the full concatenated
-        batch for a task rather than one trajectory at a time (Fix 5).
+        Normalize advantages using episode-level utility statistics.
+
+        WHY PER-STEP NORMALIZATION FAILS HERE
+        --------------------------------------
+        Within a single episode of length T, the utility target u(R(τ)) is
+        identical for all T steps. The advantage is A_t = u(R(τ)) - b(s_t, g_t).
+        Per-step normalization computes mean and std across all T steps of the
+        concatenated batch. Since u(R(τ)) is constant within each episode,
+        the normalization cancels the utility signal entirely:
+
+            Ã_t = (A_t - mean) / std
+                = (b_mean - b(s_t, g_t)) / std_t[b]
+
+        Every episode — good or bad — produces normalized advantages with zero
+        mean and unit variance. The policy cannot distinguish good episodes from
+        bad ones. This is why KL ≈ 0 and clip_fraction ≈ 0: the gradient signal
+        is structurally zero regardless of episode quality.
+
+        THE FIX: episode-level normalization
+        ------------------------------------
+        Normalize using the mean and std of episode-level utility values across
+        the batch. This preserves the inter-episode signal (which episodes were
+        above/below average) while allowing the baseline to provide within-episode
+        credit assignment via the b(s_t, g_t) term.
+
+        The normalized advantage at step t of episode i is:
+            Ã_t = (u(R(τ_i)) - b(s_t, g_t) - μ_util) / σ_util
+
+        where μ_util and σ_util are computed across episode utilities in the batch.
+        This equals:
+            Ã_t = (u(R(τ_i)) - μ_util) / σ_util   ← episode quality signal
+                  - b(s_t, g_t) / σ_util            ← within-episode credit
+
+        Both terms survive normalization. The utility value no longer cancels.
         """
-        stats      = self._adv_stats[task_id]
-        alpha      = 0.05
-        batch_mean = advantages_t.mean().item()
-        batch_std  = advantages_t.std().item()
-        stats['mean'] = (1 - alpha) * stats['mean'] + alpha * batch_mean
-        stats['std']  = max(
-            (1 - alpha) * stats['std'] + alpha * batch_std, 0.1
-        )
-        return (advantages_t - stats['mean']) / (stats['std'] + 1e-8)
+        if not episode_lengths:
+            return advantages_t
+
+        # Reconstruct episode-level utility values from the concatenated advantages.
+        # advantages_t[t] = u(R(τ)) - b(s_t, g_t) for episode i containing step t.
+        # The utility for episode i = mean_t[A_t] + mean_t[b(s_t,g_t)].
+        # We only need the utility values to get μ and σ — extract them by noting
+        # that within episode i, u(R(τ_i)) is constant, so:
+        #     mean_t_in_episode_i[A_t + b_t] = u(R(τ_i))   if we had b_t separately.
+        # Since we don't have b_t separately here, use A_t mean per episode as a
+        # proxy: mean_t[A_t] = u(R(τ_i)) - mean_t[b_t].
+        # The scale we want is just σ of u values across episodes, which is well
+        # approximated by the std of per-episode advantage means times a correction.
+        # Simpler and equivalent: track the episode utilities in task_data and pass
+        # them here directly.
+
+        # Extract per-episode mean advantage — each is u(R(τ_i)) - mean_b_i
+        ep_means = []
+        start = 0
+        for L in episode_lengths:
+            ep_means.append(advantages_t[start:start + L].mean())
+            start += L
+        ep_means_t = torch.stack(ep_means)   # (num_episodes,)
+
+        # Use the cross-episode std of these means as the normalization scale.
+        # This preserves inter-episode signal while keeping gradients stable.
+        if len(ep_means_t) < 2:
+            # Single episode: cannot compute meaningful std — use global std
+            std = advantages_t.std().clamp(min=1e-8)
+            return (advantages_t - advantages_t.mean()) / std
+
+        ep_std = ep_means_t.std().clamp(min=1e-8)
+        ep_mean = ep_means_t.mean()
+
+        # Subtract the cross-episode mean from every step, scale by cross-episode std.
+        # The within-episode variation from the baseline is preserved at its natural scale.
+        return (advantages_t - ep_mean) / ep_std
 
     def _train_actor(self, task_data: Dict[int, List[Dict]]) -> Dict[str, float]:
         """
@@ -742,9 +824,11 @@ class PPO:
                 b_lengths = [d['length'] for d in trajs]
                 total_T   = b_obs.shape[0]
 
-                # Fix 5: normalise across the full task batch — one mean/std call
+                # Episode-level normalization — preserves the inter-episode utility
+                # signal that per-step normalization would cancel out. See
+                # _normalize_advantages docstring for the full explanation.
                 if self.normalize_advantages:
-                    b_adv = self._normalize_advantages(target_task, b_adv)
+                    b_adv = self._normalize_advantages(target_task, b_adv, b_lengths)
 
                 # Task one-hot for full batch
                 task_hot = F.one_hot(

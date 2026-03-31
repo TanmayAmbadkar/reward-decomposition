@@ -529,5 +529,5 @@ class HopperLinearCalibration(UtilityFunction):
     """
  
     def __call__(self, r):
-        return r[..., 0] / 100.0
+        return r[..., 0] + r[..., 1] + 1e-3*r[..., 2]
  

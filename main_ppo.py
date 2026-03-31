@@ -90,7 +90,7 @@ def _make_envs(env_id, num_envs, run_name=None, record_video=False):
     """
     def _make_one():
         if env_id == "building":
-            return BuildingEnv_9d(
+            env = BuildingEnv_9d(
                 ParameterGenerator(
                     Building='OfficeLarge',
                     Weather='Warm_Marine',
@@ -98,24 +98,24 @@ def _make_envs(env_id, num_envs, run_name=None, record_video=False):
                 )
             )
         elif env_id.startswith("deep-sea-treasure"):
-            return DeepSeaTreasureEnv()
+            env = DeepSeaTreasureEnv(render_mode="rgb_array")
         elif env_id.startswith("fruit-tree"):
-            return mo_gym.make("fruit-tree-v0", depth=7)
+            env = mo_gym.make("fruit-tree-v0", depth=7, render_mode="rgb_array")
         elif env_id.startswith("minecart"):
-            return mo_gym.make("minecart-v0")
+            env = mo_gym.make("minecart-v0", render_mode="rgb_array")
         elif env_id.startswith("lunar-lander"):
-            # env_is_discrete is not available here — default to continuous
-            # override by passing continuous= explicitly if needed
-            return MOLunarLanderEnv(continuous=True)
+            env = MOLunarLanderEnv(continuous=True, render_mode="rgb_array")
         elif env_id.startswith("hopper"):
-            return MOHopperEnv()
+            env = MOHopperEnv(render_mode="rgb_array")
         else:
-            if record_video and run_name is not None:
-                return gym.wrappers.RecordVideo(
-                    mo_gym.make(env_id, render_mode="rgb_array"),
-                    f"runs/{run_name}/videos",
-                )
-            return mo_gym.make(env_id, render_mode="rgb_array")
+            env = mo_gym.make(env_id, render_mode="rgb_array")
+
+        if record_video and run_name is not None:
+            return gym.wrappers.RecordVideo(
+                env,
+                f"runs/{run_name}/videos",
+            )
+        return env
 
     return mo_gym.wrappers.vector.MOSyncVectorEnv(
         [_make_one for _ in range(num_envs)]
@@ -288,7 +288,7 @@ def run_ppo(
     anneal_lr: bool              = True,
     normalize_advantages: bool   = True,
     normalize_observations: bool = True,
-    normalize_rewards: bool      = True,
+    normalize_rewards: bool      = False,
     # Counterfactual IS weighting
     cf_weight_min: float         = 0.1,    # floor IS weight
     cf_weight_max: float         = 5.0,    # ceiling IS weight
@@ -297,10 +297,10 @@ def run_ppo(
     # Misc
     seed: int                    = 1,
     torch_deterministic: bool    = True,
-    capture_video: bool          = False,
+    capture_video: bool          = True,
     use_tensorboard: bool        = True,
     save_model: bool             = True,
-    eval_interval: int           = 5000,
+    eval_interval: int           = 10000,
     num_eval_episodes: int       = 10,
     
 ):
@@ -336,7 +336,7 @@ def run_ppo(
     # Environments
     # -----------------------------------------------------------------------
     training_envs = _make_envs(env_id, num_envs, run_name, record_video=False)
-    eval_envs_raw = _make_envs(env_id, num_envs, run_name, record_video=False)
+    eval_envs_raw = _make_envs(env_id, num_envs, run_name, record_video=True)
 
     if normalize_observations:
         training_envs = NormalizeObservation(training_envs)
