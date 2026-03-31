@@ -286,9 +286,9 @@ def run_ppo(
     max_grad_norm: float         = 0.5,
     target_kl: float             = None,
     anneal_lr: bool              = True,
-    normalize_advantages: bool   = False,
-    normalize_observations: bool = False,
-    normalize_rewards: bool      = False,
+    normalize_advantages: bool   = True,
+    normalize_observations: bool = True,
+    normalize_rewards: bool      = True,
     # Counterfactual IS weighting
     cf_weight_min: float         = 0.1,    # floor IS weight
     cf_weight_max: float         = 5.0,    # ceiling IS weight
