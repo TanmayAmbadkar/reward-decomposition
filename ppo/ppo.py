@@ -88,10 +88,11 @@ class PPOLogger:
                 if isinstance(v, float) and not np.isnan(v):
                     self.writer.add_scalar(f"losses/{k}", v, global_step)
 
-    def log_evaluation(self, global_step, min_util, mean_util, max_util, task_id):
+    def log_evaluation(self, global_step, min_util, mean_util, max_util, mean_vec, std_vec, task_id):
         print(
             f"EVAL step={global_step} | Task={task_id} | "
-            f"Min={min_util:.4f}  Mean={mean_util:.4f}  Max={max_util:.4f}",
+            f"Min={min_util:.4f}  Mean={mean_util:.4f}  Max={max_util:.4f} | "
+            f"Mean Vec={np.round(mean_vec, 3)} | Std Vec={np.round(std_vec, 3)}",
             flush=True,
         )
         if self.use_tensorboard:
@@ -257,6 +258,7 @@ class PPO:
         eval_interval=10000,
         num_eval_episodes=10,
         total_timesteps=1000000,
+        ser_mode=False,   
     ):
         self.agent            = agent
         self.optimizer        = optimizer
@@ -295,6 +297,7 @@ class PPO:
         # Return accumulation mode
         self.gamma            = gamma
         self.discount_utility = discount_utility
+        self.ser_mode         = ser_mode  # ablation flag — see __init__ docstring
         self.seed             = seed
         self.eval_interval   = eval_interval
         self.num_eval_episodes = num_eval_episodes
@@ -686,14 +689,51 @@ class PPO:
                         max=self.cf_weight_max,
                     ))
 
-                    # Realized utility — exact
-                    target_util = self.utility_functions[target_task](
-                        torch.tensor(ep.realized_return, dtype=torch.float32,
-                                     device=self.device)
-                    ).item()
-
-                    # IS-weighted per-step advantages
-                    advantages_t = cf_weight * (target_util - baselines)  # (T,)
+                    if self.ser_mode:
+                        # SER ablation: apply utility to the bootstrapped vector
+                        # value estimate rather than the realized MC return.
+                        # This replicates what a standard actor-critic does:
+                        # the critic predicts E[R | s_t, g_t], and utility is
+                        # applied to that expectation — optimising u(E[R])
+                        # instead of E[u(R)]. The gap is the covariance term
+                        # (Section 3.3): Cov[u, R] which bootstrapping ignores.
+                        # acc_t[t] + bootstrapped_vec[t] approximates the
+                        # expected total return from this state, which is what
+                        # a standard critic targets.
+                        _, bootstrapped_vec = self.agent.estimate_value_from_observation(
+                            obs_rep[target_task * T:(target_task + 1) * T],
+                            acc_rep[target_task * T:(target_task + 1) * T],
+                            task_hot[target_task * T:(target_task + 1) * T],
+                            device=self.device,
+                        )
+                        # Per-step SER target: u(g_t + bootstrapped_future)
+                        # This is what the bootstrapped critic implicitly optimises
+                        ser_projected = (
+                            acc_t +
+                            bootstrapped_vec.squeeze(-1)
+                            if bootstrapped_vec.dim() > 1
+                            else acc_t + bootstrapped_vec.unsqueeze(-1)
+                        )
+                        # Evaluate utility per step on the bootstrapped projection
+                        target_util_per_step = torch.stack([
+                            self.utility_functions[target_task](ser_projected[t])
+                            for t in range(T)
+                        ])  # (T,)
+                        advantages_t = cf_weight * (
+                            target_util_per_step - baselines.squeeze(-1)
+                            if baselines.dim() > 1 else
+                            target_util_per_step - baselines
+                        )
+                        # For logging: use mean of per-step SER targets
+                        target_util = target_util_per_step.mean().item()
+                    else:
+                        # ESR (default): realized utility from exact MC return
+                        target_util = self.utility_functions[target_task](
+                            torch.tensor(ep.realized_return, dtype=torch.float32,
+                                         device=self.device)
+                        ).item()
+                        # IS-weighted per-step advantages
+                        advantages_t = cf_weight * (target_util - baselines)  # (T,)
 
                     task_data[target_task].append({
                         'cf_weight':      cf_weight,
@@ -714,78 +754,68 @@ class PPO:
     def _normalize_advantages(self, task_id: int, advantages_t: torch.Tensor,
                               episode_lengths: list) -> torch.Tensor:
         """
-        Normalize advantages using episode-level utility statistics.
+        Two-stage advantage normalization for episode-level utility targets.
 
-        WHY PER-STEP NORMALIZATION FAILS HERE
-        --------------------------------------
-        Within a single episode of length T, the utility target u(R(τ)) is
-        identical for all T steps. The advantage is A_t = u(R(τ)) - b(s_t, g_t).
-        Per-step normalization computes mean and std across all T steps of the
-        concatenated batch. Since u(R(τ)) is constant within each episode,
-        the normalization cancels the utility signal entirely:
+        PROBLEM
+        -------
+        When the baseline b(s_t, g_t) is poor (common early in training on
+        long-horizon tasks like Hopper), A_t = u(R(τ)) - b(s_t, g_t) is
+        dominated by the large positive utility value. All advantages in the
+        batch have the same sign. The policy gradient pushes probability up on
+        every action regardless of episode quality — no learning signal.
 
-            Ã_t = (A_t - mean) / std
-                = (b_mean - b(s_t, g_t)) / std_t[b]
+        Simple per-step normalization does not fix this: since u(R(τ)) is
+        constant within each episode, normalization across all steps cancels the
+        utility signal algebraically (see earlier docstring).
 
-        Every episode — good or bad — produces normalized advantages with zero
-        mean and unit variance. The policy cannot distinguish good episodes from
-        bad ones. This is why KL ≈ 0 and clip_fraction ≈ 0: the gradient signal
-        is structurally zero regardless of episode quality.
+        SOLUTION: two-stage normalization
+        -----------------------------------
+        Stage 1 — within-episode centering:
+            A_t_c = A_t - mean_{t in episode i}(A_t)
+                  = mean_b_i - b(s_t, g_t)
+            Removes the baseline-prediction-error offset. Works regardless of
+            baseline quality because it only uses within-episode statistics.
+            After this stage, each episode has zero mean advantages.
 
-        THE FIX: episode-level normalization
-        ------------------------------------
-        Normalize using the mean and std of episode-level utility values across
-        the batch. This preserves the inter-episode signal (which episodes were
-        above/below average) while allowing the baseline to provide within-episode
-        credit assignment via the b(s_t, g_t) term.
+        Stage 2 — cross-episode quality signal:
+            A_t_final = A_t_c + (ep_mean_i - μ_ep) / σ_ep
+            Adds back a normalized episode-quality signal so the policy can
+            distinguish good episodes (high utility) from bad ones.
+            ep_mean_i = mean_t[A_t] for episode i = u(R(τ_i)) - mean_b_i,
+            which is a monotone proxy for episode utility.
 
-        The normalized advantage at step t of episode i is:
-            Ã_t = (u(R(τ_i)) - b(s_t, g_t) - μ_util) / σ_util
-
-        where μ_util and σ_util are computed across episode utilities in the batch.
-        This equals:
-            Ã_t = (u(R(τ_i)) - μ_util) / σ_util   ← episode quality signal
-                  - b(s_t, g_t) / σ_util            ← within-episode credit
-
-        Both terms survive normalization. The utility value no longer cancels.
+        When baseline is perfect: Stage 1 provides fine-grained credit
+        assignment; Stage 2 provides coarse episode-level signal.
+        When baseline is random: Stage 1 contributes noise (but small, bounded
+        by baseline range); Stage 2 still correctly discriminates episodes.
         """
         if not episode_lengths:
             return advantages_t
 
-        # Reconstruct episode-level utility values from the concatenated advantages.
-        # advantages_t[t] = u(R(τ)) - b(s_t, g_t) for episode i containing step t.
-        # The utility for episode i = mean_t[A_t] + mean_t[b(s_t,g_t)].
-        # We only need the utility values to get μ and σ — extract them by noting
-        # that within episode i, u(R(τ_i)) is constant, so:
-        #     mean_t_in_episode_i[A_t + b_t] = u(R(τ_i))   if we had b_t separately.
-        # Since we don't have b_t separately here, use A_t mean per episode as a
-        # proxy: mean_t[A_t] = u(R(τ_i)) - mean_t[b_t].
-        # The scale we want is just σ of u values across episodes, which is well
-        # approximated by the std of per-episode advantage means times a correction.
-        # Simpler and equivalent: track the episode utilities in task_data and pass
-        # them here directly.
-
-        # Extract per-episode mean advantage — each is u(R(τ_i)) - mean_b_i
+        result = torch.zeros_like(advantages_t)
         ep_means = []
         start = 0
+
+        # Stage 1: within-episode centering
         for L in episode_lengths:
-            ep_means.append(advantages_t[start:start + L].mean())
+            ep_slice = advantages_t[start:start + L]
+            ep_mean  = ep_slice.mean()
+            ep_means.append(ep_mean)
+            result[start:start + L] = ep_slice - ep_mean
             start += L
-        ep_means_t = torch.stack(ep_means)   # (num_episodes,)
 
-        # Use the cross-episode std of these means as the normalization scale.
-        # This preserves inter-episode signal while keeping gradients stable.
-        if len(ep_means_t) < 2:
-            # Single episode: cannot compute meaningful std — use global std
-            std = advantages_t.std().clamp(min=1e-8)
-            return (advantages_t - advantages_t.mean()) / std
+        # Stage 2: cross-episode quality signal
+        if len(ep_means) >= 2:
+            ep_means_t = torch.stack(ep_means)
+            util_mean  = ep_means_t.mean()
+            util_std   = ep_means_t.std().clamp(min=1e-8)
+            start = 0
+            for i, L in enumerate(episode_lengths):
+                quality = (ep_means_t[i] - util_mean) / util_std
+                result[start:start + L] += quality
+                start += L
 
-        ep_std = ep_means_t.std().clamp(min=1e-8)
-        ep_mean = ep_means_t.mean()
-
-        # Subtract the cross-episode mean from every step, scale by cross-episode std.
-        # The within-episode variation from the baseline is preserved at its natural scale.
-        return (advantages_t - ep_mean) / ep_std
+        return result
 
     def _train_actor(self, task_data: Dict[int, List[Dict]]) -> Dict[str, float]:
         """
@@ -820,70 +850,89 @@ class PPO:
                             if trajs[0]['actions'].dim() > 1 \
                             else torch.cat([d['actions'] for d in trajs])
                 b_old_lp  = torch.cat([d['target_lp_old'] for d in trajs])
-                b_adv     = torch.cat([d['advantages_t']  for d in trajs])
+                b_adv_raw = torch.cat([d['advantages_t']  for d in trajs])
                 b_lengths = [d['length'] for d in trajs]
                 total_T   = b_obs.shape[0]
 
                 # Episode-level normalization — preserves the inter-episode utility
-                # signal that per-step normalization would cancel out. See
-                # _normalize_advantages docstring for the full explanation.
+                # signal that per-step normalization would cancel out. Computed once
+                # on the full batch before minibatch shuffling so episode boundaries
+                # are intact for the within-episode centering step.
                 if self.normalize_advantages:
-                    b_adv = self._normalize_advantages(target_task, b_adv, b_lengths)
+                    b_adv = self._normalize_advantages(target_task, b_adv_raw, b_lengths)
+                else:
+                    b_adv = b_adv_raw
 
-                # Task one-hot for full batch
-                task_hot = F.one_hot(
-                    torch.full((total_T,), target_task, dtype=torch.long,
-                               device=self.device),
-                    num_classes=self.num_tasks
-                ).float()
+                # Minibatch shuffling. Processing the full batch as one gradient step
+                # averages over total_T terms — with normalized advantages in [-3,3],
+                # this mean is numerically tiny and the effective gradient magnitude
+                # is ~1/total_T of what it would be per sample. Minibatches restore
+                # gradient magnitude to a usable scale, the same reason standard PPO
+                # uses minibatches. num_minibatches controls the tradeoff between
+                # gradient noise (small batches) and gradient magnitude (large batches).
+                mb_size = max(1, total_T // self.num_minibatches)
+                perm    = torch.randperm(total_T, device=self.device)
 
-                # Fix 2: ONE forward+backward per task per epoch
-                self.optimizer[0].zero_grad()
+                for mb_start in range(0, total_T, mb_size):
+                    mb_idx = perm[mb_start:mb_start + mb_size]
 
-                new_lp, entropy = self.agent.compute_action_log_probabilities_and_entropy(
-                    b_obs, b_act, b_acc, task_hot, self.device
-                )
+                    mb_obs     = b_obs[mb_idx]
+                    mb_acc     = b_acc[mb_idx]
+                    mb_act     = b_act[mb_idx] if b_act.dim() > 1 else b_act[mb_idx]
+                    mb_old_lp  = b_old_lp[mb_idx]
+                    mb_adv     = b_adv[mb_idx]
 
-                log_ratios     = new_lp - b_old_lp
-                step_ratios    = log_ratios.exp()
-                clipped_ratios = torch.clamp(
-                    step_ratios,
-                    1.0 - self.surrogate_clip_threshold,
-                    1.0 + self.surrogate_clip_threshold,
-                )
+                    # Task one-hot for this minibatch
+                    task_hot = F.one_hot(
+                        torch.full((mb_idx.shape[0],), target_task, dtype=torch.long,
+                                   device=self.device),
+                        num_classes=self.num_tasks
+                    ).float()
 
-                pg_loss  = torch.max(
-                    -step_ratios    * b_adv,
-                    -clipped_ratios * b_adv,
-                ).mean()
-
-                ent_loss = -entropy.mean()
-                loss     = pg_loss + self.entropy_loss_coefficient * ent_loss
-                loss.backward()
-
-                # Early stopping check before stepping
-                with torch.no_grad():
-                    approx_kl = ((step_ratios - 1) - log_ratios).mean().item()
-                    clip_frac = (
-                        (step_ratios - 1.0).abs() > self.surrogate_clip_threshold
-                    ).float().mean().item()
-                    mean_cf = float(np.mean([d['cf_weight'] for d in trajs]))
-
-                    actor_losses.append(pg_loss.item())
-                    entropies.append(entropy.mean().item())
-                    kl_vals.append(approx_kl)
-                    clip_fracs.append(clip_frac)
-                    cf_weights.append(mean_cf)
-
-                if self.target_kl is not None and abs(approx_kl) > self.target_kl:
-                    # Zero the accumulated gradient and skip step if KL too large
                     self.optimizer[0].zero_grad()
-                    continue
 
-                nn.utils.clip_grad_norm_(
-                    self.agent.actor.parameters(), self.max_grad_norm
-                )
-                self.optimizer[0].step()
+                    new_lp, entropy = self.agent.compute_action_log_probabilities_and_entropy(
+                        mb_obs, mb_act, mb_acc, task_hot, self.device
+                    )
+
+                    log_ratios     = new_lp - mb_old_lp
+                    step_ratios    = log_ratios.exp()
+                    clipped_ratios = torch.clamp(
+                        step_ratios,
+                        1.0 - self.surrogate_clip_threshold,
+                        1.0 + self.surrogate_clip_threshold,
+                    )
+
+                    pg_loss  = torch.max(
+                        -step_ratios    * mb_adv,
+                        -clipped_ratios * mb_adv,
+                    ).mean()
+
+                    ent_loss = -entropy.mean()
+                    loss     = pg_loss + self.entropy_loss_coefficient * ent_loss
+                    loss.backward()
+
+                    with torch.no_grad():
+                        approx_kl = ((step_ratios - 1) - log_ratios).mean().item()
+                        clip_frac = (
+                            (step_ratios - 1.0).abs() > self.surrogate_clip_threshold
+                        ).float().mean().item()
+                        mean_cf = float(np.mean([d['cf_weight'] for d in trajs]))
+
+                        actor_losses.append(pg_loss.item())
+                        entropies.append(entropy.mean().item())
+                        kl_vals.append(approx_kl)
+                        clip_fracs.append(clip_frac)
+                        cf_weights.append(mean_cf)
+
+                    if self.target_kl is not None and abs(approx_kl) > self.target_kl:
+                        self.optimizer[0].zero_grad()
+                        break
+
+                    nn.utils.clip_grad_norm_(
+                        self.agent.actor.parameters(), self.max_grad_norm
+                    )
+                    self.optimizer[0].step()
 
         return {
             'actor_loss':    float(np.mean(actor_losses))  if actor_losses else 0.0,
@@ -906,6 +955,7 @@ class PPO:
         n_eval_envs = self.eval_envs.num_envs
 
         results      = {t: [] for t in range(self.num_tasks)}
+        vec_results  = {t: [] for t in range(self.num_tasks)}
         tasks_to_run = np.repeat(np.arange(self.num_tasks), self.num_eval_episodes)
         total_needed = len(tasks_to_run)
 
@@ -968,6 +1018,7 @@ class PPO:
                     )
                     u_val = self.utility_functions[tid](r_vec).item()
                     results[tid].append(u_val)
+                    vec_results[tid].append(r_vec.cpu().numpy())
 
                     # Reset this environment's buffers
                     acc_rewards[i] = np.zeros(self.reward_size, dtype=np.float32)
@@ -986,7 +1037,7 @@ class PPO:
             if vals:
                 self.logger.log_evaluation(
                     self._global_step,
-                    np.min(vals), np.mean(vals), np.max(vals),
+                    np.min(vals), np.mean(vals), np.max(vals), np.mean(vec_results[t_id], axis=0), np.std(vec_results[t_id], axis=0),
                     t_id,
                 )
 

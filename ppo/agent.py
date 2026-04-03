@@ -304,6 +304,12 @@ class DiscreteAgent(BaseAgent):
         util_norm    = self.critic_utility_head(features)
         returns_norm = self.critic_returns_head(features)
         return self.popart_util.denormalize(util_norm), self.popart_returns.denormalize(returns_norm)
+    
+    def sample_action_and_compute_log_prob(self, observations, accumulated_reward, task_id=None, deterministic=False, device="cpu"):
+        dist = self.get_action_distribution(observations, accumulated_reward, task_id, device)
+        action = dist.mean if deterministic else dist.rsample()
+        log_prob = dist.log_prob(action).sum(1)
+        return action, log_prob
 
     def estimate_value_normalized(self, observation, accumulated_reward, task_id=None, device="cpu"):
         """
@@ -362,7 +368,7 @@ class ContinuousAgent(BaseAgent):
 
         for _ in range(self.num_tasks):
             self.actor_means.append(layer_init(nn.Linear(64, self.action_dim), std=1.0))
-            self.actor_logstds.append(nn.Parameter(torch.zeros(1, self.action_dim)))
+            self.actor_logstds.append(-nn.Parameter(torch.ones(1, self.action_dim)))
 
         # --- CRITIC ---
         self.critic_body = nn.Sequential(

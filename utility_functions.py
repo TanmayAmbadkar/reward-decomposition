@@ -529,5 +529,380 @@ class HopperLinearCalibration(UtilityFunction):
     """
  
     def __call__(self, r):
-        return r[..., 0] + r[..., 1] + 1e-3*r[..., 2]
+        alive = r[..., 2] > -400
+        return torch.where(alive, r[..., 0] + r[..., 1] + 1e-3 * r[..., 2], r[..., 2])
+
+
+ 
+class HopperEfficiency(UtilityFunction):
+    """
+    Simple linear utility for calibration training run.
+ 
+    u(r) = R[0] / 100.0
+ 
+    Just forward velocity, normalised loosely so values are
+    in a reasonable range for the critic to learn.
+    Ignore R[1] and R[2] for now.
+ 
+    After training converges, run calibrate_hopper.py to
+    measure the true R[0] and R[2] ranges of a competent policy.
+    """
+ 
+    def __call__(self, r):
+        return (r[..., 0] + r[..., 1]) / (1e-6 + abs(r[..., 2]))
+
+
+ 
+class HopperProduct(UtilityFunction):
+    """
+    Simple linear utility for calibration training run.
+ 
+    u(r) = R[0] / 100.0
+ 
+    Just forward velocity, normalised loosely so values are
+    in a reasonable range for the critic to learn.
+    Ignore R[1] and R[2] for now.
+ 
+    After training converges, run calibrate_hopper.py to
+    measure the true R[0] and R[2] ranges of a competent policy.
+    """
+ 
+    def __call__(self, r):
+        alive = r[..., 2] > -400
+        return torch.where(alive, r[..., 0] * r[..., 1] + 1e-3 * r[..., 2], r[..., 2])
+ 
+ 
+# ==========================================
+# Multi-Objective Ant Utilities
+#
+# Input reward vector (cumulative episode return):
+#   r[..., 0] = x_velocity   (forward/right progress, positive = moving right)
+#   r[..., 1] = y_velocity   (lateral progress, positive = moving up the plane)
+#   r[..., 2] = control_cost (always <= 0, cumulative action effort)
+#
+# NOTE: Healthy reward has been removed. The agent receives no per-step
+# survival bonus — it must discover locomotion to get any reward at all.
+# This creates the same exploration challenge as Hopper without alive bonus.
+#
+# KEY DESIGN PRINCIPLES
+# ---------------------
+# 1. All utilities are non-linear to expose the ESR/SER gap.
+# 2. Utilities with threshold structure (like DST/Hopper) create a hard
+#    per-episode requirement that SER cannot satisfy in expectation.
+# 3. Utilities with product structure expose the covariance gap directly:
+#    ESR requires E[u(R)] != u(E[R]) by Jensen's inequality.
+# 4. The directional utility exploits Ant's unique 2D velocity structure —
+#    unavailable in Hopper/Cheetah — making the SER failure mode
+#    geometrically interpretable: SER ant wanders, ESR ant navigates.
+#
+# CALIBRATION NOTES
+# -----------------
+# Run AntLinearCalibration for 500k steps first to establish typical
+# per-episode return ranges. From a competent policy on standard Ant-v5:
+#   R_x per episode: ~100-500 (good forward policy)
+#   R_y per episode: ~-100 to +100 (lateral variation)
+#   R_ctrl per episode: ~-50 to -200 (depends on gait)
+# Without healthy reward these ranges will be lower — calibrate first.
+# ==========================================
+ 
+# ==========================================
+# AntLinearCalibration
+#
+# Used ONLY for initial training to calibrate reward ranges.
+# Run for 500k-1M steps with this utility, then measure
+# R_x, R_y, R_ctrl distributions to set threshold constants
+# for the real utility functions below.
+# ==========================================
+ 
+class AntLinearCalibration(UtilityFunction):
+    """
+    Simple linear utility for calibration run.
+ 
+    u(r) = R_x / 100.0
+ 
+    Just forward velocity loosely normalised. After training
+    converges, measure the true R_x, R_y, R_ctrl distributions
+    to calibrate the threshold and product utilities below.
+    """
+    def __call__(self, r):
+        if isinstance(r, np.ndarray):
+            return r[..., 0] / 100.0
+        return r[..., 0] / 100.0
+ 
+ 
+# ==========================================
+# U1 — Directional Navigation with Threshold
+#
+# "Move right. Not just fast — specifically right."
+#
+# u = -|speed|             if NOT moving predominantly in X direction
+#      R_x + R_y + w*R_ctrl  otherwise
+#
+# The directional condition: x_velocity > |y_velocity|
+# This requires the ant to move more in X than Y within each episode.
+#
+# WHY ESR/SER GAP IS LARGE HERE
+# ------------------------------
+# SER optimises E[R_x] + E[R_y] independently. A SER policy can satisfy
+# this by moving predominantly in Y in some episodes and X in others —
+# both expectations are positive, but the directionality constraint is
+# never met within any single trajectory.
+#
+# ESR explicitly optimises P(R_x > |R_y| AND speed is high) per episode.
+# The SER failure mode is visually interpretable: the SER ant wanders
+# in random directions, the ESR ant consistently moves right.
+#
+# This is structurally identical to DST and Hopper threshold utilities
+# but exploits Ant's unique 2D velocity space — no other standard
+# MuJoCo environment has this property.
+#
+# Expected ranges (after calibration):
+#   Good directional episode  : ~4-8
+#   Non-directional episode   : ~-2 to -5
+# ==========================================
+ 
+class AntDirectional(UtilityFunction):
+    """
+    Directional navigation utility for MO-Ant.
+ 
+    u(r) = -|R_x + R_y|          if R_x <= |R_y|  (not going right enough)
+            R_x + R_y + w*R_ctrl  otherwise
+ 
+    Parameters
+    ----------
+    ctrl_weight : float
+        Weight on control cost. Default 1e-3 keeps it small but present.
+    """
+    def __init__(self, ctrl_weight: float = 1e-4):
+        self.w = ctrl_weight
+ 
+    def __call__(self, r):
+        x    = r[..., 0]
+        y    = r[..., 1]
+        ctrl = r[..., 2]
+ 
+        speed = x + y
+        is_directional = x > y.abs() if isinstance(r, torch.Tensor) else (x > np.abs(y))
+ 
+        reward = speed + self.w * ctrl
+ 
+        if isinstance(r, np.ndarray):
+            penalty = -np.abs(speed)
+            return np.where(is_directional, reward, penalty)
+        else:
+            penalty = -torch.abs(speed)
+            return torch.where(is_directional, reward, penalty)
+ 
+ 
+# ==========================================
+# U2 — Speed-Efficiency Product
+#
+# "Move fast AND efficiently. Both must happen in the same episode."
+#
+# u = sqrt(R_x^2 + R_y^2) * clamp(1 + w * R_ctrl, 0, 2)
+#
+# The product of unsigned speed and a normalised efficiency term.
+# R_ctrl is negative, so (1 + w * R_ctrl) is in (0, 1) for reasonable
+# control costs — clamped to avoid negative efficiency from extreme actions.
+#
+# WHY ESR/SER GAP IS LARGE HERE
+# ------------------------------
+# The product utility directly exposes Cov(speed, efficiency):
+#   ESR - SER = Cov(speed, efficiency)
+# Speed and efficiency are negatively correlated within episodes
+# (fast gaits require more torque = higher control cost).
+# SER optimises E[speed] * E[efficiency] and ignores this covariance.
+# ESR requires E[speed * efficiency] — the policy must find a gait
+# that is simultaneously fast AND cheap, not just fast on average.
+#
+# Analogous to FTN product utility but in physical locomotion.
+#
+# Expected ranges (after calibration):
+#   Fast efficient episode  : ~3-6
+#   Fast wasteful episode   : ~1-2
+#   Slow efficient episode  : ~0.5-1
+# ==========================================
+ 
+class AntSpeedEfficiency(UtilityFunction):
+    """
+    Speed-efficiency product utility for MO-Ant.
+ 
+    u(r) = speed * efficiency
+ 
+    where speed      = sqrt(R_x^2 + R_y^2).clamp(min=0)
+          efficiency = clamp(1.0 + ctrl_weight * R_ctrl, 0, 2)
+ 
+    Parameters
+    ----------
+    ctrl_weight : float
+        Scales control cost into efficiency term. Default 1e-2.
+        Set based on calibration so median episode efficiency ~ 0.7.
+    """
+    def __init__(self, ctrl_weight: float = 1e-2):
+        self.w = ctrl_weight
+ 
+    def __call__(self, r):
+        x    = r[..., 0]
+        y    = r[..., 1]
+        ctrl = r[..., 2]
+ 
+        if isinstance(r, np.ndarray):
+            speed      = np.sqrt(x**2 + y**2).clip(min=0)
+            efficiency = np.clip(1.0 + self.w * ctrl, 0.0, 2.0)
+        else:
+            speed      = torch.sqrt(x**2 + y**2).clamp(min=0)
+            efficiency = torch.clamp(1.0 + self.w * ctrl, min=0.0, max=2.0)
+ 
+        return speed * efficiency
+ 
+ 
+# ==========================================
+# U3 — Multi-Task Navigation Portfolio
+#
+# Three simultaneous utility functions sharing one pool of trajectories.
+# Designed to demonstrate counterfactual reuse on a physically meaningful
+# continuous control task — analogous to FTN Multi-Utility but for Ant.
+#
+# Task 0: AntNavigateRight   — maximise X velocity, ignore Y
+# Task 1: AntNavigateDiagonal — maximise X + Y jointly (45-degree heading)
+# Task 2: AntNavigateEfficient — maximise X + Y subject to control threshold
+#
+# WHY REUSE MATTERS HERE
+# ----------------------
+# All three tasks involve the same physical gait — the ant must move.
+# An episode where the ant moves right fast (Task 0) is also informative
+# for Task 1 (it has high X+Y) and Task 2 (if control cost is low).
+# Without reuse, each task trains independently on 1/3 of the budget.
+# With IS-weighted reuse, each task learns from all trajectories.
+#
+# This is the argument from the FTN no-reuse ablation (−24.247 vs −4.106
+# on penalty utility) replicated in continuous control.
+# ==========================================
+ 
+class AntNavigateRight(UtilityFunction):
+    """
+    Task 0: Navigate right — maximise X velocity.
+ 
+    u(r) = R_x + w * R_ctrl
+ 
+    Simple directional objective. High ESR/SER gap only if combined
+    with threshold or product structure; here it serves as the
+    near-linear anchor task in the multi-task portfolio.
+    """
+    def __init__(self, ctrl_weight: float = 1e-3):
+        self.w = ctrl_weight
+ 
+    def __call__(self, r):
+        return r[..., 0] + self.w * r[..., 2]
+ 
+ 
+class AntNavigateDiagonal(UtilityFunction):
+    """
+    Task 1: Navigate diagonally — maximise X + Y jointly.
+ 
+    u(r) = R_x + R_y + w * R_ctrl  if (R_x + R_y) > threshold
+           R_ctrl                   otherwise (went backwards overall)
+ 
+    Threshold ensures the agent must make net positive progress —
+    episodes where the ant moves backward in both axes get no credit.
+    The per-episode threshold creates an ESR/SER gap: SER can average
+    forward and backward episodes; ESR penalises backward episodes directly.
+ 
+    Parameters
+    ----------
+    progress_threshold : float
+        Minimum (R_x + R_y) per episode to be considered progress.
+        Set based on calibration — default -20.0 is a loose bar.
+    ctrl_weight : float
+        Weight on control cost. Default 1e-3.
+    """
+    def __init__(self, progress_threshold: float = -20.0, ctrl_weight: float = 1e-3):
+        self.threshold = progress_threshold
+        self.w = ctrl_weight
+ 
+    def __call__(self, r):
+        x    = r[..., 0]
+        y    = r[..., 1]
+        ctrl = r[..., 2]* 1e-3
+ 
+        speed    = x + y
+        is_progress = speed > self.threshold
+        reward   = speed + self.w * ctrl
+ 
+        if isinstance(r, np.ndarray):
+            return np.where(is_progress, reward, ctrl)
+        else:
+            return torch.where(is_progress, reward, ctrl)
+ 
+ 
+class AntNavigateEfficient(UtilityFunction):
+    """
+    Task 2: Navigate efficiently — speed subject to control cost threshold.
+ 
+    u(r) = R_x + R_y + w * R_ctrl  if R_ctrl > ctrl_threshold
+           R_ctrl                   otherwise (too expensive)
+ 
+    The control threshold creates a hard per-episode efficiency requirement.
+    SER can average expensive and cheap episodes; ESR penalises every
+    expensive episode, forcing the policy to find efficient gaits consistently.
+ 
+    Parameters
+    ----------
+    ctrl_threshold : float
+        Maximum (most negative) allowable control cost per episode.
+        Default -100.0 — episodes burning more than this get penalised.
+        Set based on calibration of typical R_ctrl range.
+    ctrl_weight : float
+        Weight on control cost in the reward case. Default 1e-3.
+    """
+    def __init__(self, ctrl_threshold: float = -100.0, ctrl_weight: float = 1e-3):
+        self.threshold = ctrl_threshold
+        self.w = ctrl_weight
+ 
+    def __call__(self, r):
+        x    = r[..., 0]
+        y    = r[..., 1]
+        ctrl = r[..., 2]* 1e-3
+ 
+        is_efficient = ctrl > self.threshold
+        reward = x + y + self.w * ctrl
+ 
+        if isinstance(r, np.ndarray):
+            return np.where(is_efficient, reward, ctrl)
+        else:
+            return torch.where(is_efficient, reward, ctrl)
+ 
+ 
+# ==========================================
+# Convenience: collect the multi-task portfolio
+# ==========================================
+ 
+def get_ant_multitask_utilities(
+    progress_threshold: float = -20.0,
+    ctrl_threshold: float = -12.0,
+    ctrl_weight: float = 1e-4,
+):
+    """
+    Returns the three-task portfolio for multi-utility ESR-PPO training.
+ 
+    Usage:
+        utility_fns = get_ant_multitask_utilities()
+        ppo = PPO(agent, optimizer, envs, utility_functions=utility_fns, ...)
+ 
+    Parameters
+    ----------
+    progress_threshold : float
+        Passed to AntNavigateDiagonal. Set after calibration.
+    ctrl_threshold : float
+        Passed to AntNavigateEfficient. Set after calibration.
+    ctrl_weight : float
+        Control cost weight shared across all three tasks.
+    """
+    return [
+        AntNavigateRight(ctrl_weight=ctrl_weight),
+        AntNavigateDiagonal(progress_threshold=progress_threshold,
+                            ctrl_weight=ctrl_weight),
+        AntNavigateEfficient(ctrl_threshold=ctrl_threshold,
+                             ctrl_weight=ctrl_weight),
+    ]
  

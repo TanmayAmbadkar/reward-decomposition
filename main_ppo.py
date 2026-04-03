@@ -27,6 +27,7 @@ from envs.utils_building import ParameterGenerator
 from envs.dst import DeepSeaTreasureEnv
 from envs.lander import MOLunarLanderEnv
 from envs.mo_gym_hopper import MOHopperEnv
+from envs.mo_gym_ant import MOAntEnv
 from gymnasium.wrappers.vector import NormalizeObservation
 from ppo.utils import RunningMeanStd
 from morl_baselines.common.pareto import ParetoArchive
@@ -71,6 +72,16 @@ ENVIRONMENT_UTILITY_MAP = {
     ],
     # Hopper
     "hopper-linear": [HopperLinearCalibration()],
+    "hopper-efficiency": [HopperEfficiency()],
+    "hopper-prod": [HopperProduct()],
+    "hopper-3": [
+        HopperLinearCalibration(),
+        HopperEfficiency(),
+        HopperProduct(),
+    ],
+    "ant-directional": [AntDirectional()],
+    "ant-efficiency": [AntSpeedEfficiency()],
+    "ant-3": get_ant_multitask_utilities()
 }
 
 
@@ -107,6 +118,8 @@ def _make_envs(env_id, num_envs, run_name=None, record_video=False):
             env = MOLunarLanderEnv(continuous=True, render_mode="rgb_array")
         elif env_id.startswith("hopper"):
             env = MOHopperEnv(render_mode="rgb_array")
+        elif env_id.startswith("ant"):
+            env = MOAntEnv(render_mode="none")
         else:
             env = mo_gym.make(env_id, render_mode="rgb_array")
 
@@ -272,11 +285,11 @@ def run_ppo(
     num_envs: int                = 4,
     total_timesteps: int         = 5000000,
     # ESR-PPO episode collection params (replaces num_rollout_steps)
-    episodes_per_update: int     = 64*4,
-    min_episodes_per_task: int   = 64,
+    episodes_per_update: int     = 32*4,
+    min_episodes_per_task: int   = 32,
     max_episode_steps: int       = 1000,
     # Optimisation
-    update_epochs: int           = 5,
+    update_epochs: int           = 10,
     num_minibatches: int         = 8,
     learning_rate: float         = 3e-3,
     gamma: float                 = 1.0,       # ESR uses undiscounted returns
@@ -297,11 +310,11 @@ def run_ppo(
     # Misc
     seed: int                    = 1,
     torch_deterministic: bool    = True,
-    capture_video: bool          = True,
+    capture_video: bool          = False,
     use_tensorboard: bool        = True,
     save_model: bool             = True,
     eval_interval: int           = 10000,
-    num_eval_episodes: int       = 10,
+    num_eval_episodes: int       = 5,
     
 ):
     """
@@ -321,7 +334,8 @@ def run_ppo(
     run_name = f"{env_id}__{exp_name}__{datetime.now()}__{seed}"
     set_seed(seed, torch_deterministic)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     print(f"Using device: {device}")
 
     # -----------------------------------------------------------------------
@@ -336,7 +350,7 @@ def run_ppo(
     # Environments
     # -----------------------------------------------------------------------
     training_envs = _make_envs(env_id, num_envs, run_name, record_video=False)
-    eval_envs_raw = _make_envs(env_id, num_envs, run_name, record_video=True)
+    eval_envs_raw = _make_envs(env_id, num_envs, run_name, record_video=False)
 
     if normalize_observations:
         training_envs = NormalizeObservation(training_envs)
